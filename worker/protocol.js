@@ -9,7 +9,7 @@ export function normalize(frame, role) {
     throw new Error("invalid_frame");
   }
   const kind = frame.kind ?? (role === "user" ? "task" : "result");
-  if (role === "user" && (kind !== "task" || frame.reply_to !== undefined || frame.id.length > 96 || frame.id.startsWith("cancel:"))) {
+  if (role === "user" && (kind !== "task" || frame.reply_to !== undefined || frame.id.length > 96 || frame.id.startsWith("cancel:") || [".", ".."].includes(frame.id))) {
     throw new Error("invalid_frame");
   }
   if (role === "muse" && (!["progress", "result"].includes(kind) ||

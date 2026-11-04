@@ -19,7 +19,7 @@ class ChannelError(RuntimeError):
 
 def task_id(value: str) -> str:
     """Require a stable caller-chosen ID so retries cannot create new tasks."""
-    if not isinstance(value, str) or not ID.fullmatch(value) or value.startswith('cancel:'):
+    if not isinstance(value, str) or not ID.fullmatch(value) or value.startswith('cancel:') or value in ('.', '..'):
         raise ChannelError('invalid_task_id')
     return value
 

@@ -63,7 +63,7 @@ async def main():
                 await wait_health(base, worker_process)
                 adapter = subprocess.Popen([sys.executable, '-m', 'muse_adapter', '--config', str(config), 'run'],
                     cwd=ROOT, env=environment, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-                params = StdioServerParameters(command=sys.executable, args=['-m', 'cf_mcp'], cwd=str(ROOT), env=environment)
+                params = StdioServerParameters(command=sys.executable, args=[str(ROOT / 'scripts/run_mcp.py')], cwd=str(folder), env=environment)
                 async with stdio_client(params, errlog=output) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()

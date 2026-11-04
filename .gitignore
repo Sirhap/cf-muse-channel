@@ -20,3 +20,5 @@ muse-connection.json
 .env.*
 *.pem
 node_modules
+
+mcp.json

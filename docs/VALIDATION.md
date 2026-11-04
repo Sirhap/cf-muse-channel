@@ -1,8 +1,8 @@
 # 交付验证记录 · 2026-11-04
 
-## 0.2.0 公开仓库验证
+## 0.2.0 公开仓库初始发布验证（22ad51e）
 
-公开源码与已部署 Worker 源文件逐项一致。隔离发布副本完成：JavaScript 11项、Python接入器/部署30项、MCP HTTP客户端8项、真实本地Worker与接入器24项集成检查，均通过；`wrangler deploy --dry-run` 通过。配置示例只有占位符，发布前对照本机实际角色密钥逐文件检查，无匹配。真实 Muse 平台 hook 与AI执行仍由部署环境验收。
+初始发布时记录：公开源码与当时已部署 Worker 源文件逐项一致。隔离发布副本完成：JavaScript 11项、Python接入器/部署30项、MCP HTTP客户端8项、真实本地Worker与接入器24项集成检查，均通过；`wrangler deploy --dry-run` 通过。配置示例只有占位符，发布前对照本机实际角色密钥逐文件检查，无匹配。真实 Muse 平台 hook 与AI执行仍由部署环境验收。
 
 ## 0.1.0 历史验证
 
@@ -36,3 +36,17 @@ npm run build
 ```
 
 真实 Muse 部署还必须核对平台 hook schema、delivery 会话、HATCH_HOOK_RUNTIME、后台进程管理和出站代理环境。文件脚本能生成待注册定义，不意味着已经注册或唤醒真实 AI。
+
+
+## 0.2.0 MCP 补充验证
+
+以下为本次本地 stdio MCP 与 CF HTTPS API 的补充验证；本次没有执行线上部署，推送后的源码不代表线上 Worker 已更新。官方 SDK `mcp==1.26.0` 实际完成 initialize、tools/list 和 tools/call，四个工具均经过真实调用；测试环境为独立临时 Python 环境，复用已有只读测试依赖，不改变 Muse 环境。
+
+- 基础 Python 状态、取消与安装测试：30 项通过。
+- MCP HTTP 客户端验证：8 项通过，覆盖幂等、重定向拒绝、错误脱敏、参数边界及私有配置。
+- JavaScript 协议回归：11 项通过。
+- Worker + 实际 Python 接入器集成：30 项通过，新增 HTTP 身份隔离和请求大小／分页参数边界。
+- 官方 SDK stdio MCP → Worker → 接入器：16 项通过，覆盖四工具、网页并用、分页游标、原消息不ACK、真实取消控制落盘，以及任意工作目录启动。
+- Worker打包 dry-run通过；无Cloudflare云端或真实Muse AI执行证明。最终仍按 ACCEPTANCE.md 记录线上验收。
+
+`get_task` 在没有正式结果时保留 execution_state=unknown；取消返回 stopped=false，不会把“接收请求”当作“执行已停止”。MCP 读取不改变浏览器消息接收状态。

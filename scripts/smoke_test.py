@@ -180,6 +180,25 @@ async def protocol_checks(base, user_token, muse_token):
             check('result cannot refer to an unknown task', (await event(muse, 'error')).get('code') == 'unknown_task')
             await muse.send(json.dumps({'type': 'received', 'id': 'batch-0', 'source': 'muse'}))
             check('receiver cannot acknowledge its own role', (await event(muse, 'error')).get('code') == 'invalid_receipt')
+    def api_security():
+        """Verify the new API never falls through to public assets or accepts Muse keys."""
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        cases = [('/api/rooms/main/messages', None, None, 401),
+                 ('/api/rooms/main/messages', muse_token, None, 401),
+                 ('/api/rooms/other/messages', user_token, None, 401),
+                 ('/api/rooms/main/messages?after=-1', user_token, None, 400),
+                 ('/api/rooms/main/messages?limit=51', user_token, None, 400),
+                 ('/api/rooms/main/tasks', user_token, b'x' * 65537, 400)]
+        for index, (path, token, payload, expected) in enumerate(cases):
+            headers = {'Authorization': 'Bearer ' + token} if token else {}
+            request = urllib.request.Request(base + path, data=payload, headers=headers)
+            try:
+                with opener.open(request, timeout=5) as response:
+                    code = response.status
+            except urllib.error.HTTPError as error:
+                code = error.code
+            check('HTTP API authorization and bounds ' + str(index + 1), code == expected)
+    await asyncio.to_thread(api_security)
     return None
 
 

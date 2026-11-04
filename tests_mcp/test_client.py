@@ -40,7 +40,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         def forbidden(request):
             raise AssertionError('invalid input reached transport')
         client = self.client(forbidden)
-        for identifier in ('', '../other', 'x' * 97, 'cancel:reserved'):
+        for identifier in ('', '.', '..', '../other', 'x' * 97, 'cancel:reserved'):
             with self.subTest(identifier=identifier), self.assertRaises(ChannelError):
                 await client.send_message(identifier, 'text')
         with self.assertRaises(ChannelError):
