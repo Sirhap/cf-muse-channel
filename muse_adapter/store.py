@@ -83,11 +83,16 @@ class Store:
                                 (self.room, frame['id'], frame['content'], time.time(), time.time()))
 
     def poll(self):
-        """Claim one task; uncertain execution deliberately blocks redispatch."""
+        """Claim one queued task; tasks in the same room run concurrently.
+
+        A running task no longer blocks later tasks: each new message is
+        dispatched on the next poll instead of waiting behind a long task.
+        A single task is still claimed exactly once (queued -> dispatched in
+        this transaction), and a second wake for the same task cannot take it
+        over (see start()). Uncertain execution of one task therefore blocks
+        only redispatch of that same task, never dispatch of other tasks.
+        """
         with self.transaction():
-            active = self.db.execute("SELECT id FROM tasks WHERE room=? AND status IN ('dispatched','running','replying') LIMIT 1", (self.room,)).fetchone()
-            if active:
-                return {'count': 0, 'messages': [], 'blocked_task': active['id'], 'reason': 'execution_or_delivery_pending'}
             row = self.db.execute("SELECT * FROM tasks WHERE room=? AND status='queued' ORDER BY created,id LIMIT 1", (self.room,)).fetchone()
             if not row:
                 return {'count': 0, 'messages': []}

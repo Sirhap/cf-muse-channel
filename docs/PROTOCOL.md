@@ -15,7 +15,7 @@
 
 ## 交付语义
 
-CF stored、Muse 接入器 received、平台 hook 启动、正式结果写入 CF、浏览器确认接收是不同阶段。任务以 room+id 在 Muse 本地 SQLite 中去重；result 用稳定 id。执行状态未知时阻塞并等待人工核对，不自动重新执行。
+CF stored、Muse 接入器 received、平台 hook 启动、正式结果写入 CF、浏览器确认接收是不同阶段。任务以 room+id 在 Muse 本地 SQLite 中去重；result 用稳定 id。执行状态未知时阻塞并等待人工核对，不自动重新执行。同 room 任务不串行：poll 每次认领一条排队任务，不因已有 running 任务而阻塞新任务；单条任务仍只认领一次，同一任务的二次唤醒不得接管。
 
 HTTP /health 只报告服务存活；不代表 Muse 接入器、平台执行或用户收发通过。现阶段只支持文字、进度和正式结果；附件、审批、多租户权限属于后续能力。
 

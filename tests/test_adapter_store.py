@@ -34,6 +34,18 @@ class StoreTests(unittest.TestCase):
         self.store.poll()
         self.store.start('one', 'run-test')
 
+    def test_queued_task_dispatches_while_another_task_runs(self):
+        """A long task must not serialise later messages in the same room."""
+        self.started()
+        self.receive('two', 'quick reply please')
+        claimed = self.store.poll()
+        self.assertEqual(claimed['count'], 1)
+        self.assertEqual(claimed['messages'][0]['msgid'], 'two')
+        self.assertEqual(self.store.task('two')['status'], 'dispatched')
+        self.assertEqual(self.store.start('two', 'run-two')['status'], 'running')
+        self.assertEqual(self.store.task('one')['status'], 'running')
+        self.assertEqual(self.store.poll()['count'], 0)
+
     def test_replay_never_resets_execution_state(self):
         self.started()
         self.receive()
