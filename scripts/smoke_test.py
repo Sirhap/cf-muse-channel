@@ -138,6 +138,40 @@ async def run_roundtrip(base: str, config: Path, user_token: str):
         check('delivery evidence distinguishes client reception', any(row['id'] == 'result:' + task_id and row['cf_stored'] and row['client_received'] for row in receipts['results']))
 
 
+async def media_roundtrip(base: str, config: Path, folder: Path, user_token: str):
+    """Upload bytes once via the Muse CLI, then download them natively as the user."""
+    import base64
+    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAwMCAO+ip1sAAAAASUVORK5CYII=")
+    media_file = folder / "smoke.png"
+    media_file.write_bytes(png)
+    os.environ["NO_PROXY"] = os.environ.get("NO_PROXY", "") + ",127.0.0.1,localhost"
+    headers = {"Authorization": "Bearer " + user_token}
+    async with connect(base.replace("http:", "ws:") + "/ws/main?role=user",
+                       additional_headers=headers, proxy=None, open_timeout=5, close_timeout=2) as user:
+        await event(user, "ready")
+        task_id = "smoke-media"
+        await user.send(json.dumps({"type": "message", "id": task_id, "kind": "task", "content": "media roundtrip check"}))
+        await event(user, "stored", message_id=task_id)
+        await event(user, "delivered", message_id=task_id)
+        await task_poll(config, task_id)
+        await asyncio.to_thread(cli, config, "start", "--msgid", task_id, "--run-id", "local-media-fixture")
+        result = await asyncio.to_thread(cli, config, "media", "--msgid", task_id, "--file", str(media_file), "--text", "media proof")
+        check("media CLI uploads and commits a formal result", result["media"]["filename"] == "smoke.png" and result["media"]["mime"] == "image/png")
+        frame = await event(user, "message")
+        check("media reference reaches user in the result frame", frame.get("kind") == "result" and frame.get("media", {}).get("filename") == "smoke.png")
+        def download():
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            request = urllib.request.Request(base + "/api/rooms/main/media/" + frame["media"]["id"], headers=headers)
+            with opener.open(request, timeout=5) as response:
+                return response.status, response.headers.get("Content-Type"), response.read()
+        status_code, mime, body = await asyncio.to_thread(download)
+        check("user downloads the exact uploaded bytes natively", status_code == 200 and mime == "image/png" and body == png)
+        await user.send(json.dumps({"type": "received", "id": frame["id"], "source": "muse"}))
+        await event(user, "acknowledged", message_id=frame["id"])
+        receipts = await asyncio.to_thread(cli, config, "results", "--msgid", task_id)
+        check("media result delivery evidence reconciles", any(row["id"] == "result:" + task_id and row["cf_stored"] and row["client_received"] for row in receipts["results"]))
+
+
 async def protocol_checks(base, user_token, muse_token):
     """Exercise authorization, browser handshakes and bounded replay on real sockets."""
     import base64
@@ -238,6 +272,7 @@ async def main() -> None:
                 adapter = subprocess.Popen([sys.executable, '-m', 'muse_adapter', '--config', str(config), 'run'],
                     cwd=ROOT, env=environment, stdout=adapter_log, stderr=subprocess.STDOUT, start_new_session=True)
                 await run_roundtrip(base, config, user_token)
+                await media_roundtrip(base, config, folder, user_token)
                 check('connector remains alive through receipt handling', adapter.poll() is None)
                 stop(adapter)
                 headers = {'Authorization': 'Bearer ' + user_token}

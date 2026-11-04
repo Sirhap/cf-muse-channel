@@ -22,6 +22,13 @@ class Config:
         """Bind the connection to the configured role without putting credentials in URLs."""
         return self.server_url + '/ws/' + self.room + '?role=muse'
 
+    @property
+    def api_url(self) -> str:
+        """Derive the HTTPS media endpoint from the WSS endpoint; the token travels in a header."""
+        parsed = urlsplit(self.server_url)
+        scheme = 'https' if parsed.scheme == 'wss' else 'http'
+        return scheme + '://' + parsed.netloc + '/api/rooms/' + self.room + '/media'
+
 
 def load_config(path: str | None = None) -> Config:
     """Reject insecure public endpoints and incomplete secrets before any connection."""

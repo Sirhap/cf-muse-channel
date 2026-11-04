@@ -28,7 +28,12 @@ export async function authorize(request, env) {
   const match = /^\/ws\/([A-Za-z0-9_-]{1,64})$/.exec(url.pathname) ||
     /^\/api\/rooms\/([A-Za-z0-9_-]{1,64})(?:\/.*)?$/.exec(url.pathname);
   const api = url.pathname.startsWith("/api/");
-  const role = api ? "user" : url.searchParams.get("role");
+  // Media bytes are the one HTTP exception to the user-only API: Muse uploads
+  // with MUSE_TOKEN, the browser downloads with USER_TOKEN. Every other API
+  // route stays user-only, so a Muse token still cannot read tasks or history.
+  const mediaRoute = /^\/api\/rooms\/[A-Za-z0-9_-]{1,64}\/media(?:\/.*)?$/.test(url.pathname);
+  const role = mediaRoute ? (request.method === "POST" ? "muse" : request.method === "GET" ? "user" : null)
+    : api ? "user" : url.searchParams.get("role");
   if (!match || match[1] !== env.ROOM_ID || !["user", "muse"].includes(role)) return null;
   const authorization = request.headers.get("Authorization");
   const protocolHeader = request.headers.get("Sec-WebSocket-Protocol");

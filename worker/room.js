@@ -22,6 +22,11 @@ export class ChannelRoom extends DurableObject {
       UNIQUE(source,id))`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS pending_messages ON messages(source,received,seq)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS peers (role TEXT PRIMARY KEY, generation TEXT NOT NULL)");
+    // Media bytes are stored once, base64-encoded, and referenced by message
+    // frames; frames themselves stay inside the 64 KiB protocol limit.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS media (
+      room TEXT NOT NULL, id TEXT NOT NULL, filename TEXT NOT NULL, mime TEXT NOT NULL,
+      size INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(room,id))`);
   }
 
   /** Reauthenticate and fence the previous transport before replaying pending rows. */

@@ -15,6 +15,15 @@ test("results require canonical task-bound ID", () => {
   assert.throws(() => normalize({ type: "message", id: "random", reply_to: "task1", kind: "result", content: "ok" }, "muse"));
   assert.equal(normalize({ type: "message", id: "result:task1", reply_to: "task1", kind: "result", content: "ok" }, "muse").source, "muse");
 });
+test("media references ride result frames without carrying bytes", () => {
+  const media = { id: "media-1", filename: "intro.mp4", mime: "video/mp4", size: 1172525 };
+  assert.deepEqual(normalize({ type: "message", id: "result:task1", reply_to: "task1", kind: "result", content: "视频已生成", media }, "muse").media, media);
+  for (const bad of [{ ...media, filename: "../intro.mp4" }, { ...media, mime: "application/octet-stream" }, { ...media, size: 11 * 1024 * 1024 }]) {
+    assert.throws(() => normalize({ type: "message", id: "result:task1", reply_to: "task1", kind: "result", content: "ok", media: bad }, "muse"));
+  }
+  assert.throws(() => normalize({ type: "message", id: "progress:1", reply_to: "task1", kind: "progress", content: "ok", media }, "muse"));
+  assert.throws(() => normalize({ type: "message", id: "task1", content: "ok", media }, "user"));
+});
 test("empty text and UTF-8 oversized payloads are rejected", () => {
   for (const content of [" ", "汉".repeat(22000), null]) assert.throws(() => normalize({ type: "message", id: "task1", content }, "user"));
 });

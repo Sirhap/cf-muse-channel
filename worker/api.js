@@ -1,5 +1,46 @@
-import { MAX_BYTES, normalize } from "./protocol.js";
+import { MAX_BYTES, MAX_MEDIA_BYTES, normalize, validMedia } from "./protocol.js";
 const TASK_ID = /^[A-Za-z0-9_.:-]{1,96}$/;
+const FILENAME = /^(?!.*[\\/])(?!\.{1,2}$)[^\x00-\x1f]{1,128}$/;
+const MIME = /^(video|image|audio)\/[a-z0-9.+-]+$|^application\/pdf$/;
+
+/** Encode binary to base64 without blowing the stack on multi-megabyte files. */
+function bytesToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/** Decode stored base64 back to binary for an authenticated download. */
+function base64ToBytes(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+/** Read a bounded binary body; oversize uploads are rejected before storage. */
+async function bodyBytes(request, limit) {
+  const reader = request.body?.getReader();
+  if (!reader) throw new Error("invalid_frame");
+  let bytes = 0;
+  const chunks = [];
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) { await reader.cancel(); return null; }
+      chunks.push(value);
+    }
+    const buffer = new Uint8Array(bytes);
+    let offset = 0;
+    for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.length; }
+    return buffer;
+  } finally { reader.releaseLock(); }
+}
 
 /** Return private JSON without caching task contents at an intermediary. */
 function reply(body, status = 200) {
@@ -60,6 +101,29 @@ export async function handleApi(room, request, auth) {
   const url = new URL(request.url);
   const path = url.pathname.slice(("/api/rooms/" + auth.room).length);
   try {
+    // Media: Muse uploads bytes once, the browser downloads them natively.
+    // The message frame only carries the media reference, never the bytes.
+    if (path === "/media" && request.method === "POST") {
+      if (auth.role !== "muse") return reply({ error: "unauthorized" }, 401);
+      const filename = request.headers.get("X-Filename") || "";
+      const mime = (request.headers.get("Content-Type") || "").split(";")[0].trim();
+      const body = await bodyBytes(request, MAX_MEDIA_BYTES);
+      if (body === null) return reply({ error: "media_too_large" }, 413);
+      const media = { id: "media-" + crypto.randomUUID(), filename, mime, size: body.byteLength };
+      if (!validMedia(media)) return reply({ error: "invalid_media" }, 400);
+      room.sql.exec("INSERT INTO media(room,id,filename,mime,size,data) VALUES (?,?,?,?,?,?)",
+        auth.room, media.id, filename, mime, body.byteLength, bytesToBase64(body));
+      return reply({ media_id: media.id, filename, mime, size: body.byteLength });
+    }
+    const mediaRoute = /^\/media\/([A-Za-z0-9_.-]{1,128})$/.exec(path);
+    if (mediaRoute && request.method === "GET") {
+      if (auth.role !== "user") return reply({ error: "unauthorized" }, 401);
+      const row = room.sql.exec("SELECT filename,mime,data FROM media WHERE room=? AND id=?", auth.room, mediaRoute[1]).toArray()[0];
+      if (!row) return reply({ error: "unknown_media" }, 404);
+      return new Response(base64ToBytes(row.data), { headers: {
+        "Content-Type": row.mime, "Content-Disposition": `inline; filename="${row.filename}"`,
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
+    }
     if (request.method === "POST" && path === "/tasks") {
       const input = await bodyJson(request);
       return store(room, normalize({ type: "message", id: input?.task_id, kind: "task", content: input?.content }, "user"));

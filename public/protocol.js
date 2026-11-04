@@ -23,6 +23,12 @@ export function channelUrl(origin, room) {
   return url.toString();
 }
 
+/** Build an authenticated media download URL; the token travels in a header, never in the URL. */
+export function mediaUrl(origin, room, mediaId) {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(room) || !IDENTIFIER.test(mediaId)) throw new Error("invalid_media");
+  return `${serverOrigin(origin)}/api/rooms/${room}/media/${mediaId}`;
+}
+
 /** Encode an in-memory user token into the handshake subprotocol only. */
 export function socketProtocols(token) {
   if (typeof token !== "string" || !token.trim() || token.length > 1024) throw new Error("invalid_token");
@@ -39,13 +45,23 @@ export function taskFrame(content, id = crypto.randomUUID()) {
   return frame;
 }
 
+/** Validate a media reference; bytes are fetched separately, never trusted from the frame. */
+export function isMedia(media) {
+  return media && typeof media === "object" && !Array.isArray(media) &&
+    typeof media.id === "string" && IDENTIFIER.test(media.id) &&
+    typeof media.filename === "string" && /^(?!.*[\\/])(?!\.{1,2}$)[^\x00-\x1f]{1,128}$/.test(media.filename) &&
+    typeof media.mime === "string" && (/^(video|image|audio)\/[a-z0-9.+-]+$/.test(media.mime) || media.mime === "application/pdf") &&
+    Number.isInteger(media.size) && media.size >= 1 && media.size <= 10 * 1024 * 1024;
+}
+
 /** Validate only Muse reply events; never render untrusted objects implicitly. */
 export function isReply(frame) {
   return frame && frame.type === "message" && frame.source === "muse" &&
     ["progress", "result"].includes(frame.kind) && typeof frame.id === "string" &&
     IDENTIFIER.test(frame.id) && typeof frame.reply_to === "string" && IDENTIFIER.test(frame.reply_to) &&
     typeof frame.content === "string" && frame.content.trim().length > 0 &&
-    (frame.kind !== "result" || frame.id === `result:${frame.reply_to}`);
+    (frame.kind !== "result" || frame.id === `result:${frame.reply_to}`) &&
+    (frame.media === undefined || (frame.kind === "result" && isMedia(frame.media)));
 }
 
 /** Translate allowlisted protocol errors without exposing upstream error text. */

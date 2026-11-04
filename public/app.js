@@ -1,4 +1,4 @@
-import { MAX_FRAME_BYTES, MAX_TASKS, channelUrl, errorText, isReply, serverOrigin, socketProtocols, taskFrame } from "./protocol.js";
+import { MAX_FRAME_BYTES, MAX_TASKS, channelUrl, errorText, isReply, mediaUrl, serverOrigin, socketProtocols, taskFrame } from "./protocol.js";
 
 const element = (id) => document.getElementById(id);
 const ui = Object.fromEntries(["server", "room", "token", "connect", "disconnect", "connection-status", "status-text", "notice", "messages", "empty-state", "message", "send"].map((id) => [id, element(id)]));
@@ -117,6 +117,30 @@ function renderReply(frame) {
         task.node.append(task.result);
       }
       task.result.querySelector(".reply-content").textContent = frame.content;
+      if (frame.media && !task.result.querySelector(".reply-media")) {
+        const mediaBox = document.createElement("div");
+        mediaBox.className = "reply-media";
+        const label = document.createElement("p");
+        label.className = "media-label";
+        label.textContent = `${frame.media.filename} · ${(frame.media.size / 1024).toFixed(0)} KiB · 正在加载…`;
+        mediaBox.append(label);
+        task.result.append(mediaBox);
+        // Native playback handles the rest; the token is a header, never a URL part.
+        fetch(mediaUrl(settings.server, settings.room, frame.media.id), { headers: { Authorization: "Bearer " + settings.token } })
+          .then((response) => { if (!response.ok) throw new Error("media_download_failed"); return response.blob(); })
+          .then((blob) => {
+            const url = URL.createObjectURL(new Blob([blob], { type: frame.media.mime }));
+            let element;
+            if (frame.media.mime.startsWith("video/")) { element = document.createElement("video"); element.controls = true; }
+            else if (frame.media.mime.startsWith("image/")) { element = document.createElement("img"); element.alt = frame.media.filename; }
+            else if (frame.media.mime.startsWith("audio/")) { element = document.createElement("audio"); element.controls = true; }
+            else { element = document.createElement("a"); element.href = url; element.download = frame.media.filename; element.textContent = "下载 " + frame.media.filename; }
+            if (element.tagName !== "A") element.src = url;
+            label.textContent = `${frame.media.filename} · ${(frame.media.size / 1024).toFixed(0)} KiB`;
+            mediaBox.append(element);
+          })
+          .catch(() => { label.textContent = `${frame.media.filename} · 媒体加载失败，请保持连接后重试`; });
+      }
       task.progress?.remove();
       task.progress = null;
       task.state.textContent = "已收到 Muse 的正式回复";

@@ -1,15 +1,46 @@
-"""Local Muse channel CLI; run is the only command that opens a network connection."""
+"""Local Muse channel CLI; run and media are the commands that open a network connection."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import mimetypes
 from pathlib import Path
+import re
 import sqlite3
 import sys
+import urllib.error
+import urllib.request
 
 from .config import load_config
 from .store import Store
+
+ALLOWED_MEDIA = re.compile(r'(video|image|audio)/[a-z0-9.+-]+|application/pdf')
+SAFE_FILENAME = re.compile(r'(?!.*[\\/])(?!\.{1,2}$)[^\x00-\x1f]{1,128}')
+
+
+def upload_media(config, path: Path):
+    """Upload file bytes once to Worker storage; return only the media reference."""
+    data = path.read_bytes()
+    if not 1 <= len(data) <= 10 * 1024 * 1024:
+        raise ValueError('media size out of range')
+    filename = path.name
+    if not SAFE_FILENAME.fullmatch(filename) or not filename.isascii():
+        raise ValueError('media filename must be a safe ASCII name')
+    mime, _ = mimetypes.guess_type(filename)
+    if not mime or not ALLOWED_MEDIA.fullmatch(mime):
+        raise ValueError('unsupported media type')
+    request = urllib.request.Request(config.api_url, data=data, method='POST', headers={
+        'Authorization': 'Bearer ' + config.muse_token,
+        'Content-Type': mime, 'X-Filename': filename})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as error:
+        raise ValueError('media upload failed') from error
+    if not isinstance(result, dict) or not result.get('media_id'):
+        raise ValueError('media upload failed')
+    return {'id': result['media_id'], 'filename': filename, 'mime': mime, 'size': len(data)}
 
 
 def parser():
@@ -32,6 +63,11 @@ def parser():
             command.add_argument('--cancelled', action='store_true')
         if name == 'recover':
             command.add_argument('--confirm-no-execution', action='store_true')
+    media = commands.add_parser('media')
+    media.add_argument('--msgid', required=True)
+    media.add_argument('--file', required=True, type=Path)
+    media.add_argument('--text')
+    media.add_argument('--text-file', type=Path)
     return root
 
 
@@ -54,6 +90,13 @@ def main(argv=None):
             text = args.text_file.read_text(encoding='utf-8') if args.text_file else args.text
             result = store.enqueue(args.msgid, text, 'result' if args.command == 'reply' else 'progress',
                                    getattr(args, 'cancelled', False))
+        elif args.command == 'media':
+            # Upload first, then commit the media reference as the formal result
+            # in the same local transaction semantics as a text reply.
+            media = upload_media(config, args.file)
+            text = args.text_file.read_text(encoding='utf-8') if args.text_file else (args.text or f'已发送文件：{args.file.name}')
+            result = store.enqueue(args.msgid, text, 'result', media=media)
+            result = {**result, 'media': media}
         elif args.command == 'cancelled':
             result = {'msgid': args.msgid, 'cancel_requested': bool(store.task(args.msgid)['cancel_requested'])}
         elif args.command == 'cancel':

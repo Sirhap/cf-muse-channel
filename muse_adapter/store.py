@@ -119,12 +119,27 @@ class Store:
             self.db.execute("UPDATE tasks SET status='running',run_id=?,updated=? WHERE room=? AND id=?", (run_id, time.time(), self.room, task_id))
         return {'msgid': task_id, 'status': 'running', 'run_id': run_id}
 
-    def enqueue(self, task_id, content, kind, cancelled=False):
-        """Commit task outcome and its stable formal message in one transaction."""
+    def enqueue(self, task_id, content, kind, cancelled=False, media=None):
+        """Commit task outcome and its stable formal message in one transaction.
+
+        Media is a reference only (id/filename/mime/size); the bytes were
+        uploaded to Worker storage first and are downloaded by the browser
+        natively, so the frame stays inside the protocol size limit.
+        """
         if not isinstance(content, str) or not content.strip():
             raise ValueError('empty message')
+        if media is not None:
+            if (kind != 'result' or not isinstance(media, dict)
+                    or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', str(media.get('id', '')))
+                    or not re.fullmatch(r'(?!.*[\\/])(?!\.{1,2}$)[^\x00-\x1f]{1,128}', str(media.get('filename', '')))
+                    or not re.fullmatch(r'(video|image|audio)/[a-z0-9.+-]+|application/pdf', str(media.get('mime', '')))
+                    or not isinstance(media.get('size'), int) or not 1 <= media['size'] <= 10 * 1024 * 1024):
+                raise ValueError('invalid media reference')
+            media = {'id': media['id'], 'filename': media['filename'], 'mime': media['mime'], 'size': media['size']}
         message_id = 'result:' + task_id if kind == 'result' else 'progress:' + uuid.uuid4().hex
         payload = {'type': 'message', 'id': message_id, 'kind': kind, 'content': content, 'reply_to': task_id}
+        if media is not None:
+            payload['media'] = media
         encoded = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
         if len(encoded.encode()) > 65000:
             raise ValueError('message too large')

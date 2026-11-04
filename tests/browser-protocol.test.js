@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { channelUrl, errorText, isReply, serverOrigin, socketProtocols, taskFrame } from "../public/protocol.js";
+import { channelUrl, errorText, isMedia, isReply, mediaUrl, serverOrigin, socketProtocols, taskFrame } from "../public/protocol.js";
 
 test("server input rejects credentials, URLs with paths and insecure public endpoints", () => {
   for (const value of ["http://example.com", "https://user:secret@example.com", "https://example.com/chat", "https://example.com?token=secret", "https://example.com/#secret", "wss://example.com"]) {
@@ -40,6 +40,17 @@ test("only bound Muse progress and canonical result IDs are valid", () => {
   assert.equal(isReply({ ...progress, source: "user" }), false);
   assert.equal(isReply({ ...progress, reply_to: undefined }), false);
   assert.equal(isReply({ ...progress, content: { html: "untrusted" } }), false);
+});
+
+test("media replies validate references and keep tokens out of download URLs", () => {
+  const media = { id: "media-1", filename: "intro.mp4", mime: "video/mp4", size: 1172525 };
+  const result = { type: "message", id: "result:task-1", source: "muse", kind: "result", content: "视频已生成", reply_to: "task-1", media };
+  assert.equal(isReply(result), true);
+  assert.equal(isMedia(media), true);
+  assert.equal(isReply({ ...result, media: { ...media, mime: "text/html" } }), false);
+  assert.equal(isReply({ ...result, kind: "progress", id: "progress:1" }), false);
+  assert.equal(mediaUrl("https://example.com", "main", "media-1"), "https://example.com/api/rooms/main/media/media-1");
+  assert.throws(() => mediaUrl("https://example.com", "main", "../other"));
 });
 
 test("unknown errors do not echo server-controlled content", () => {

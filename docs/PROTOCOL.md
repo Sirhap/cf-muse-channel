@@ -17,7 +17,14 @@
 
 CF stored、Muse 接入器 received、平台 hook 启动、正式结果写入 CF、浏览器确认接收是不同阶段。任务以 room+id 在 Muse 本地 SQLite 中去重；result 用稳定 id。执行状态未知时阻塞并等待人工核对，不自动重新执行。同 room 任务不串行：poll 每次认领一条排队任务，不因已有 running 任务而阻塞新任务；单条任务仍只认领一次，同一任务的二次唤醒不得接管。
 
-HTTP /health 只报告服务存活；不代表 Muse 接入器、平台执行或用户收发通过。现阶段只支持文字、进度和正式结果；附件、审批、多租户权限属于后续能力。
+HTTP /health 只报告服务存活；不代表 Muse 接入器、平台执行或用户收发通过。现阶段支持文字、进度、正式结果和媒体直发；审批、多租户权限属于后续能力。
+
+## 媒体直发
+
+- Muse 用 `cf-muse media --msgid <task> --file <文件> --text <说明>` 先把文件字节上传一次，再把媒体引用作为正式结果发出去；帧里只含 id、文件名、MIME、大小，不含字节，仍在 64 KiB 帧限内。
+- 上传：`POST /api/rooms/<ROOM>/media`，Muse 密钥 Bearer，`Content-Type` 为文件 MIME，`X-Filename` 为安全 ASCII 文件名，单文件上限 10 MiB，类型限视频、图片、音频、PDF，字节以 base64 存入 Durable Object。
+- 下载：`GET /api/rooms/<ROOM>/media/<media_id>`，用户密钥 Bearer，浏览器用原生 video/img/audio 标签播放或提供下载，播放、下载交给浏览器自己处理；密钥只在请求头里，不进 URL。
+- 媒体只能出现在 kind=result 的正式结果里，不能出现在进度或用户任务里；正式结果仍只有一个，媒体引用与文字说明在同一条结果里。
 
 
 ## v0.2 MCP HTTPS 接口

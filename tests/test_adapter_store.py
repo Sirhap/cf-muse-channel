@@ -46,6 +46,25 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.task('one')['status'], 'running')
         self.assertEqual(self.store.poll()['count'], 0)
 
+    def test_media_result_carries_reference_not_bytes(self):
+        self.started()
+        media = {'id': 'media-1', 'filename': 'intro.mp4', 'mime': 'video/mp4', 'size': 1172525}
+        result = self.store.enqueue('one', '视频已生成', 'result', media=media)
+        payload = json.loads(self.store.db.execute('SELECT payload FROM outbox WHERE id=?', (result['id'],)).fetchone()[0])
+        self.assertEqual(payload['media'], media)
+        self.assertEqual(self.store.task('one')['status'], 'replying')
+
+    def test_invalid_media_reference_rejected(self):
+        self.started()
+        for media in [{'id': 'media-1', 'filename': '../x.mp4', 'mime': 'video/mp4', 'size': 10},
+                      {'id': 'media-1', 'filename': 'x.mp4', 'mime': 'application/octet-stream', 'size': 10},
+                      {'id': 'media-1', 'filename': 'x.mp4', 'mime': 'video/mp4', 'size': 11 * 1024 * 1024}]:
+            with self.assertRaises(ValueError):
+                self.store.enqueue('one', 'bad media', 'result', media=media)
+        with self.assertRaises(ValueError):
+            self.store.enqueue('one', 'progress media', 'progress',
+                               media={'id': 'media-1', 'filename': 'x.mp4', 'mime': 'video/mp4', 'size': 10})
+
     def test_replay_never_resets_execution_state(self):
         self.started()
         self.receive()
