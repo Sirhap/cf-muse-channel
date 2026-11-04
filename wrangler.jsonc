@@ -1,0 +1,11 @@
+{
+  "name": "cf-muse-channel",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-06-16",
+  "workers_dev": true,
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  "vars": { "ROOM_ID": "main" },
+  "durable_objects": { "bindings": [{ "name": "CHANNEL_ROOMS", "class_name": "ChannelRoom" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChannelRoom"] }],
+  "observability": { "enabled": false }
+}

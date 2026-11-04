@@ -1,0 +1,6 @@
+{
+  "server_url": "wss://cf-muse-channel.YOUR-SUBDOMAIN.workers.dev",
+  "room": "main",
+  "muse_token": "REPLACE_WITH_PRIVATE_MUSE_TOKEN",
+  "state_dir": "/home/hatch/.local/state/cf-muse-channel"
+}

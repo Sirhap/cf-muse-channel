@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>Muse · 独立通信</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main class="workspace">
+    <aside class="sidebar" aria-label="连接设置">
+      <div class="wordmark"><span class="mark" aria-hidden="true">m.</span><span>MUSE CHANNEL<span class="edition">个人通信 / 01</span></span></div>
+      <div class="intro"><p class="eyebrow">DIRECT LINE</p><h1>把想法，<br>交给 Muse。</h1><p>一条独立的通信线路。<br>任务、进度和回复，都在这里。</p></div>
+      <form id="connection-form" class="connection-form" autocomplete="off">
+        <label for="server">服务器</label><input id="server" name="server" type="url" inputmode="url" spellcheck="false" required placeholder="https://your-worker.workers.dev">
+        <label for="room">房间</label><input id="room" name="room" type="text" value="main" spellcheck="false" maxlength="64" required>
+        <label for="token">用户密钥 <span>USER_TOKEN</span></label><input id="token" name="token" type="password" autocomplete="off" spellcheck="false" maxlength="1024" required placeholder="输入你的用户密钥">
+        <div class="connection-actions"><button id="connect" class="primary" type="submit">连接频道 <span aria-hidden="true">↗</span></button><button id="disconnect" class="secondary" type="button" disabled>断开</button></div>
+      </form>
+      <p class="privacy-note"><span aria-hidden="true">◌</span> 密钥与聊天仅保留在当前页面内存中。刷新会清空本页记录，断开会清除密钥。</p>
+      <div class="sidebar-foot"><span class="small-dot"></span> CLOUDFLARE ↔ MUSE</div>
+    </aside>
+    <section class="conversation" aria-label="Muse 对话">
+      <header class="conversation-head"><div><span class="eyebrow">YOUR WORKSPACE</span><h2>对话</h2></div><div id="connection-status" class="status" data-state="offline" role="status" aria-live="polite"><span class="status-dot"></span><span id="status-text">尚未连接</span></div></header>
+      <p id="notice" class="notice" role="alert" hidden></p>
+      <div id="messages" class="messages" role="log" aria-label="任务与回复" aria-live="polite" aria-relevant="additions text">
+        <div id="empty-state" class="empty-state"><span class="empty-symbol" aria-hidden="true">↗</span><p class="eyebrow">A LITTLE SPACE TO BEGIN</p><h3>下一件想完成的事？</h3><p>连接频道，然后发送一条任务。<br>Muse 的进度与正式回复会回到这里。</p></div>
+      </div>
+      <div class="composer-area"><form id="message-form" class="composer"><label class="sr-only" for="message">发给 Muse 的任务</label><textarea id="message" placeholder="写下要交给 Muse 的任务…" rows="2" disabled></textarea><div class="composer-bottom"><span>Enter 发送 <span aria-hidden="true">·</span> Shift + Enter 换行</span><button id="send" type="submit" class="send-button" disabled>发送 <span aria-hidden="true">↑</span></button></div></form><p class="delivery-note">“CF 已保存”和“接入器已接收”是通信回执；以 Muse 的正式回复确认任务结果。</p></div>
+    </section>
+  </main>
+</body>
+</html>

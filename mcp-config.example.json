@@ -1,0 +1,5 @@
+{
+  "server_url": "https://cf-muse-channel.YOUR-SUBDOMAIN.workers.dev",
+  "room": "main",
+  "user_token": "REPLACE_WITH_PRIVATE_USER_TOKEN"
+}
