@@ -49,5 +49,11 @@ async def cancel_task(task_id: str) -> dict:
     return await invoke('cancel_task', task_id)
 
 
+@server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+async def wait_for_task(task_id: str, timeout_seconds: float = 60.0, poll_interval: float = 2.0) -> dict:
+    """Wait for a task to reach completion or cancellation via non-blocking polling. Returns early when result/cancel is observed, or returns latest snapshot on timeout without failing."""
+    return await invoke('wait_for_task', task_id, timeout_seconds, poll_interval)
+
+
 if __name__ == '__main__':
     server.run(transport='stdio')

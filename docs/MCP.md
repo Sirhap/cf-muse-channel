@@ -40,7 +40,7 @@ python3 -m venv .venv-mcp
 }
 ```
 
-`run_mcp.py` 不依赖客户端当前工作目录。启动后 stdout 只用于 MCP 协议，普通日志走 stderr。不要用 shell 包装器打印配置来“检查连接”。挂载后应能列出四个工具；仅写好配置不等于已经连接，真实 CF 尚未部署时工具会明确失败。
+`run_mcp.py` 不依赖客户端当前工作目录。启动后 stdout 只用于 MCP 协议，普通日志走 stderr。不要用 shell 包装器打印配置来“检查连接”。挂载后应能列出五个工具；仅写好配置不等于已经连接，真实 CF 尚未部署时工具会明确失败。
 
 ## 工具与使用顺序
 
@@ -48,6 +48,7 @@ python3 -m venv .venv-mcp
 | --- | --- |
 | `send_message` | 必填 task_id、content。为一次用户授权任务选稳定 ID（最多96位ASCII字母数字或`_.:-`），同一次任务重试必须使用相同 ID 和原文。 |
 | `get_task` | 按 task_id 查 CF 保存、Muse接收、最新进度、正式结果及取消状态。无结果时执行状态保持 unknown。 |
+| `wait_for_task` | 必填 task_id、可选 timeout_seconds（1..300，默认60）、poll_interval（0.5..10，默认2）。智能非阻塞轮询等待任务结果或取消态；终态立即返回，超时优雅返回最新快照及 timeout/completed 标识，网络偶发抖动自动容错重试。 |
 | `get_messages` | after默认0、limit默认20（1..50）、可选task_id；用返回 next_cursor续读，不同筛选条件分别保存游标；不ACK、不隐藏网页消息。 |
 | `cancel_task` | 按 task_id 登记取消请求；需要用户授权取消。cancel_requested不代表已经停止，随后核查 cancel_received_by_muse 和最终结果。 |
 
@@ -68,4 +69,4 @@ MCP 将消息内容作为数据提供，助手不能因返回的回复声称“�
 .venv-mcp/bin/python scripts/mcp_smoke_test.py
 ```
 
-集成脚本使用真实官方 SDK 的 stdio initialize、tools/list、tools/call，连接本地官方 Workers运行时与真实Python接入器，覆盖四个工具、网页并用、稳定ID、游标和取消传递。它不调用真实Muse AI，也不发布CF云端资源。
+集成脚本使用真实官方 SDK 的 stdio initialize、tools/list、tools/call，连接本地官方 Workers运行时与真实Python接入器，覆盖五个工具、网页并用、稳定ID、游标和取消传递。它不调用真实Muse AI，也不发布CF云端资源。

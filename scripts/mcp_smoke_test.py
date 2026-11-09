@@ -68,9 +68,11 @@ async def main():
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         names = {tool.name for tool in (await session.list_tools()).tools}
-                        check('official SDK stdio handshake exposes four tools', names == {'send_message', 'get_task', 'get_messages', 'cancel_task'})
+                        check('official SDK stdio handshake exposes five tools', names == {'send_message', 'get_task', 'get_messages', 'cancel_task', 'wait_for_task'})
                         invalid = await session.call_tool('send_message', {'task_id': '../bad', 'content': 'text'})
                         check('invalid tool arguments return an MCP error', invalid.isError)
+                        invalid_wait = await session.call_tool('wait_for_task', {'task_id': '../bad'})
+                        check('wait_for_task invalid argument returns an MCP error', invalid_wait.isError)
                         async with connect(base.replace('http:', 'ws:') + '/ws/main?role=user',
                                            additional_headers={'Authorization': 'Bearer ' + user_token}, proxy=None) as user:
                             await event(user, 'ready')
@@ -87,10 +89,14 @@ async def main():
                             await asyncio.to_thread(cli, config, 'start', '--msgid', 'mcp-one', '--run-id', 'local-mcp-smoke-fixture')
                             await asyncio.to_thread(cli, config, 'update', '--msgid', 'mcp-one', '--text', 'MCP progress')
                             await event(user, 'message')
+                            snap = await call(session, 'wait_for_task', {'task_id': 'mcp-one', 'timeout_seconds': 1.0, 'poll_interval': 0.5})
+                            check('wait_for_task returns snapshot on timeout', snap.get('timeout') is True and snap.get('completed') is False and snap.get('task_id') == 'mcp-one')
                             await asyncio.to_thread(cli, config, 'reply', '--msgid', 'mcp-one', '--text', 'MCP final result')
                             await event(user, 'message')
-                            task = await call(session, 'get_task', {'task_id': 'mcp-one'})
-                            check('get_task returns actual formal result and receipt evidence', task['result']['content'] == 'MCP final result' and task['muse_received'])
+                            task = await call(session, 'wait_for_task', {'task_id': 'mcp-one', 'timeout_seconds': 5.0, 'poll_interval': 0.5})
+                            check('wait_for_task returns actual formal result and receipt evidence', task['result']['content'] == 'MCP final result' and task['muse_received'] and not task.get('timeout'))
+                            task_get = await call(session, 'get_task', {'task_id': 'mcp-one'})
+                            check('get_task returns actual formal result and receipt evidence', task_get['result']['content'] == 'MCP final result' and task_get['muse_received'])
                             page = await call(session, 'get_messages', {'after': 0, 'limit': 1, 'task_id': 'mcp-one'})
                             check('message pagination is bounded and read-only', len(page['messages']) == 1 and page['has_more'] and not page['receipt_changed'])
                             more = await call(session, 'get_messages', {'after': page['next_cursor'], 'limit': 1, 'task_id': 'mcp-one'})
@@ -105,6 +111,8 @@ async def main():
                         await asyncio.to_thread(cli, config, 'start', '--msgid', 'mcp-cancel', '--run-id', 'local-cancel-fixture')
                         cancel = await call(session, 'cancel_task', {'task_id': 'mcp-cancel'})
                         check('cancel_task only registers a durable request', cancel['cancel_requested'] and not cancel['stopped'])
+                        cancel_wait = await call(session, 'wait_for_task', {'task_id': 'mcp-cancel', 'timeout_seconds': 5.0, 'poll_interval': 0.5})
+                        check('wait_for_task returns promptly on cancellation', cancel_wait['cancel_requested'] and not cancel_wait.get('timeout'))
                         for _ in range(60):
                             state = await asyncio.to_thread(cli, config, 'cancelled', '--msgid', 'mcp-cancel')
                             if state['cancel_requested']:
