@@ -9,7 +9,7 @@ export function parsePolicy(value: string | undefined): ApprovalRule[] {
     const rule = item as Record<string, unknown>;
     if (!rule || typeof rule.host !== 'string' || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(rule.host)
       || rule.host.includes('..') || rule.host.length > 253 || rule.port !== 443 || rule.scheme !== 'https'
-      || !Array.isArray(rule.methods) || !rule.methods.length || rule.methods.some((m) => !['GET', 'HEAD', 'CONNECT'].includes(m))
+      || !Array.isArray(rule.methods) || !rule.methods.length || rule.methods.some((m) => !['GET', 'HEAD', 'CONNECT', 'POST'].includes(m))
       || (rule.thread_ids !== undefined && (!Array.isArray(rule.thread_ids) || !rule.thread_ids.length || rule.thread_ids.some((id) => typeof id !== 'string' || !id)))) {
       throw new Error('invalid_approval_policy');
     }

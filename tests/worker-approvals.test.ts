@@ -18,6 +18,12 @@ it('allows secure WebSocket approval for the exact relay host while holding plai
   expect(approvalMatch(record({host:'muse-demo.sirhao.top',scheme:'wss',method:'GET',...extra}),relayRules)).toBe(false);
  }
 });
+it('allows POST only when the exact host policy explicitly authorizes it', () => {
+ const relayRules=parsePolicy(JSON.stringify({rules:[{host:'muse-demo.sirhao.top',port:443,scheme:'https',methods:['POST']}]}));
+ expect(approvalMatch(record({host:'muse-demo.sirhao.top',scheme:'https',method:'POST'}),relayRules)).toBe(true);
+ expect(approvalMatch(record({scheme:'https',method:'POST'}),relayRules)).toBe(false);
+ expect(approvalMatch(record({host:'muse-demo.sirhao.top',scheme:'https',method:'DELETE'}),relayRules)).toBe(false);
+});
 it('persists unknown before sending a Worker-owned approval and never replays it', async () => {
  const states=new Map<string,string>();
  const call=vi.fn(async (path:string,_service?:number,method?:string,body?:unknown) => {

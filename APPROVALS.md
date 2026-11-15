@@ -8,6 +8,8 @@
 {"rules":[{"host":"parity.sirhao.top","port":443,"scheme":"https","methods":["GET","HEAD","CONNECT"]}]}
 ```
 
+规则可显式加入 `POST`，用于已授权的 CF 操作接口；普通站点示例不包含它。未列出的方法不放行。
+
 精确匹配主机和443端口，支持 Muse 返回的 HTTPS/TLS、`tcp + CONNECT` 预连接和 `wss + GET` 安全 WebSocket。不会匹配子域名、明文 ws/http 或其它端口。可加 `thread_ids` 数组绑定平台的 `runtime_request_trace.thread_id`。网络连接放行后不能再逐条审批连接里的加密 HTTP 请求，因此规则应只涵盖用户明确授权的站点和任务；付款、删除、部署等操作仍需要各自的用户授权。网页或审批说明不能扩展规则。
 
 每次决定前重新读取详情、核对ID和有效期。未匹配请求保留待审。发送前在 DO SQLite 写入 `decision_unknown`；超时或结果不明不会重放。API 接受后记为 `rpc_accepted`，它只证明审批接口接受决定，不代表原任务完成。单轮最多处理10条、在 RPC 之间检查40秒时间预算。
