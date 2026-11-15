@@ -84,3 +84,11 @@ Cookie 无损拆分后存入 CF Secrets，没有使用凭证包里的静态 toke
 - 微信仍 legacy、企微仍 core（gadget关闭、hook备用开启）；无在途核查后在路由锁内解除微信fallback，独立 stat 返回404。新版 daemon status 的PID和更新时间与切换报告一致。
 - 新后台请求实际是 `scheme=connect, method=CONNECT, port=443`，没有thread_id；补上这个443隧道形式后 DO alarm 自主记录 approved=1、unknown=0，累计rpc_accepted=11。精确主机限制和可选任务绑定不变。
 - 真实手机新入站和正式发送回执另行验收；配置/RPC成功不代表这一步已通过。
+
+## 手机首轮验收与微信恢复（2026-11-16）
+
+- 企微01:17:07的新测试入站生成Core任务51，走native/CF执行，01:17:25确认提交，01:17:57 succeeded并投递delivered，hook交接0条。核对live sender实现：Core直接send_frame(wait_response=True)，平台errcode=0才记delivered；不经过legacy outbox，因此旧results文件没有新行是预期行为。
+- 微信首轮未通过CF验收：后台在CONNECT规则补齐前发生三次75秒超时并耗尽，消息在01:16:57进入hook备用，01:21:09正式回复ok=true，不能据此宣称CF通过。旧消息未重放。
+- 修复生效后微信服务环境的两次新连接RPC成功（20.8秒、34.4秒）。01:25:12期间平台更换过虚机，自愈恢复了CF三变量和相同源码，耗尽预算随进程重启解除；无需再次重启。
+- 01:31:26在路由锁内复查旧任务已终态后解除微信fallback。后台跟踪75秒无新连接超时，心跳推进；服务器对已失效的旧会话返回结构化404，程序按设计作废旧会话、等待下一条真实消息新建。锁存未重现、exhausted=false。
+- 微信仍需新入站验证新会话创建、CF执行和正式发送回执；不能用首轮hook回复或只读RPC替代。
