@@ -1,0 +1,9 @@
+# Copy to .dev.vars; provide a random key with at least 32 characters.
+DEMO_KEY=""
+# A Cookie request header, not an entire exported cookie file.
+MUSE_COOKIE=""
+# Long Cookie headers can use two Secrets instead of MUSE_COOKIE.
+MUSE_COOKIE_PART_1=""
+MUSE_COOKIE_PART_2=""
+# Optional: leave empty to let Muse discover the VM from the Cookie.
+MUSE_VM_ID=""
