@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "rules": [
+    { "host": "parity.sirhao.top", "port": 443, "scheme": "https", "methods": ["GET", "HEAD", "CONNECT"] }
+  ]
+}

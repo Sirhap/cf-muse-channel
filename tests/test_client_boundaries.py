@@ -109,6 +109,50 @@ class ClientBoundaryTests(unittest.TestCase):
         ])
         self.assertEqual(result["state"], "result_unknown")
 
+    def test_long_task_completed_progress_waits_for_recorded_completion_marker(self):
+        self.seed(completion_marker="LONGRUN_FINISHED:fixture")
+        result = self.poll_once([
+            {"seq": 11, "event_name": "message.user"},
+            {"seq": 12, "event_name": "message.assistant", "payload": {
+                "status": "completed", "display_text": "已启动，仍在运行"}},
+        ])
+        self.assertEqual(result["state"], "result_unknown")
+        self.assertNotIn("text", result)
+        self.client._open.assert_not_called()
+
+    def test_long_task_marker_allows_final_reply_without_replaying_progress(self):
+        self.seed(completion_marker="LONGRUN_FINISHED:fixture", anchor_seq=11)
+        result = self.poll_once([
+            {"seq": 12, "event_name": "message.assistant", "payload": {
+                "status": "completed", "display_text": "已运行120秒"}},
+            {"seq": 13, "event_name": "message.assistant", "payload": {
+                "status": "completed", "display_text": "LONGRUN_FINISHED:fixture\n报告已生成"}},
+        ])
+        self.assertEqual(result["state"], "succeeded")
+        self.assertIn("报告已生成", result["text"])
+        self.assertTrue(result["completion_marker_observed"])
+        self.client._open.assert_not_called()
+
+    def test_progress_quoting_a_future_marker_is_not_a_final_result(self):
+        self.seed(completion_marker="LONGRUN_FINISHED:fixture")
+        result = self.poll_once([
+            {"seq": 11, "event_name": "message.user"},
+            {"seq": 12, "event_name": "message.assistant", "payload": {
+                "status": "completed", "display_text": "完成后会输出 LONGRUN_FINISHED:fixture，目前仍在运行。"}},
+        ])
+        self.assertEqual(result["state"], "result_unknown")
+
+    def test_marker_in_an_older_reply_cannot_override_a_later_progress_update(self):
+        self.seed(completion_marker="LONGRUN_FINISHED:fixture")
+        result = self.poll_once([
+            {"seq": 11, "event_name": "message.user"},
+            {"seq": 12, "event_name": "message.assistant", "payload": {
+                "status": "completed", "display_text": "LONGRUN_FINISHED:fixture"}},
+            {"seq": 13, "event_name": "message.assistant", "payload": {
+                "status": "completed", "display_text": "还未完成，继续运行。"}},
+        ])
+        self.assertEqual(result["state"], "result_unknown")
+
     def test_explicit_failed_or_cancelled_result_is_not_reported_as_timeout(self):
         for status in ("failed", "cancelled"):
             with self.subTest(status=status):
@@ -160,7 +204,7 @@ class CliBoundaryTests(unittest.TestCase):
 
     def test_timeout_limits_are_checked_before_network_access(self):
         with patch.object(probe.requests, "request") as request:
-            for timeout in ("0", "-1", "601"):
+            for timeout in ("0", "-1", "3601"):
                 with self.subTest(timeout=timeout), self.assertRaises(SystemExit):
                     self.invoke("status", "--url", "https://demo.test", "--timeout", timeout)
             request.assert_not_called()

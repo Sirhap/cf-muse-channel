@@ -59,7 +59,7 @@ class RelayGateway(Gateway):
         self.ws = WebSocket()
         try:
             self.ws.connect(url, headers={"Authorization": f"Bearer {demo_key}"},
-                            impersonate="chrome", timeout=20, verify=True)
+                            impersonate="chrome", timeout=75, verify=True)
             self.noise = NoiseConnection.from_name(b"Noise_XX_25519_AESGCM_SHA256")
             self.noise.set_as_initiator()
             self.noise.set_keypair_from_private_bytes(Keypair.STATIC, os.urandom(32))
@@ -111,6 +111,10 @@ def wait_result(client: RelayGateway, timeout: int, receipt_path: Path) -> dict:
     anchor_seq = receipt.get("anchor_seq")
     if anchor_seq is not None and (type(anchor_seq) is not int or anchor_seq <= baseline):
         raise ValueError("Invalid receipt anchor")
+    marker = receipt.get("completion_marker")
+    if marker is not None and (not isinstance(marker, str) or not marker or len(marker) > 128
+                               or any(char.isspace() for char in marker)):
+        raise ValueError("Invalid completion marker")
     while time.monotonic() < deadline:
         history = client.call_json("chat.history", body={"session_id": session_id, "limit": 100}, timeout=15)
         events = history_events(history)
@@ -148,8 +152,14 @@ def wait_result(client: RelayGateway, timeout: int, receipt_path: Path) -> dict:
                 text = payload.get("display_text")
                 if payload.get("status") in ("completed", "complete", "succeeded") and isinstance(text, str) and text.strip():
                     parts.append(text)
-            if parts:
-                receipt.update(state="succeeded", text="\n".join(parts))
+            text = "\n".join(parts)
+            final_text = (replies[-1].get("payload") or {}).get("display_text", "") if replies else ""
+            marker_seen = (isinstance(final_text, str) and marker is not None
+                           and marker in {line.strip() for line in final_text.splitlines()})
+            if parts and (marker is None or marker_seen):
+                receipt.update(state="succeeded", text=text)
+                if marker is not None:
+                    receipt["completion_marker_observed"] = True
                 write_receipt(receipt_path, receipt)
                 return receipt
         time.sleep(2)
@@ -158,10 +168,14 @@ def wait_result(client: RelayGateway, timeout: int, receipt_path: Path) -> dict:
     return receipt
 
 
-def chat_once(client: RelayGateway, message: str, timeout: int, receipt_path: Path) -> dict:
+def chat_once(client: RelayGateway, message: str, timeout: int, receipt_path: Path,
+              completion_marker: str | None = None) -> dict:
     """Create a dedicated demo session, submit once, and poll that session only."""
     if not isinstance(message, str) or not message.strip():
         raise ValueError("Chat message must not be empty")
+    if completion_marker is not None and (not isinstance(completion_marker, str) or not completion_marker
+            or len(completion_marker) > 128 or any(char.isspace() for char in completion_marker)):
+        raise ValueError("Invalid completion marker")
     receipt_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         descriptor = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -180,6 +194,8 @@ def chat_once(client: RelayGateway, message: str, timeout: int, receipt_path: Pa
     baseline = max((event["seq"] for event in history_events(history)), default=0)
     receipt = {"session_id": session_id, "state": "submission_unknown", "retry_safe": False,
                "baseline_seq": baseline, "submission_confirmed": False}
+    if completion_marker is not None:
+        receipt["completion_marker"] = completion_marker
     write_receipt(receipt_path, receipt)
     # Persist uncertainty BEFORE sending. No automatic fallback, reconnect or resend.
     client._open("chat.stream", body={
@@ -197,6 +213,7 @@ def main() -> int:
     parser.add_argument("--url", required=True, help="Worker origin, or http://127.0.0.1:8787 locally")
     parser.add_argument("--message", default="请只回复：CF Cookie demo 连接成功。不要执行任何其他操作。")
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--completion-marker", help="For a controlled long task, require its unique final marker; does not prove the work itself succeeded")
     parser.add_argument("--receipt", type=Path, default=Path(".local/chat-receipt.json"))
     args = parser.parse_args()
     key = os.environ.get("DEMO_KEY", "")
@@ -206,8 +223,8 @@ def main() -> int:
         worker_origin(args.url)
     except ValueError:
         parser.error("Use a plain HTTPS Worker origin; HTTP is allowed only for localhost")
-    if not 1 <= args.timeout <= 600:
-        parser.error("timeout must be between 1 and 600 seconds")
+    if not 1 <= args.timeout <= 3600:
+        parser.error("timeout must be between 1 and 3600 seconds")
     try:
         if args.operation in ("network", "cookie", "renew", "status"):
             path = {"network": "/probe/network", "cookie": "/probe/cookie",
@@ -229,7 +246,7 @@ def main() -> int:
             elif args.operation == "result":
                 result = wait_result(client, args.timeout, args.receipt)
             else:
-                result = chat_once(client, args.message, args.timeout, args.receipt)
+                result = chat_once(client, args.message, args.timeout, args.receipt, args.completion_marker)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return int(result.get("state", "succeeded") != "succeeded")
         finally:

@@ -41,7 +41,7 @@ npm run build
 npm run dev
 ```
 
-完整自动化回归使用 `npm run test:all`（142 项测试，含本地运行时重启与实际 scheduled 事件）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
+完整自动化回归使用 `npm run test:all`（当前 158 项测试，含本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
 
 默认使用 `http://127.0.0.1:8787`。本地运行时的出站来自本机，不证明 CF 云端出站可用。
 
@@ -143,3 +143,10 @@ npx wrangler secret bulk .local/worker-secrets.json --config wrangler.production
 测试结束后，可确认账号及 Worker 名称再删除自己新建的测试 Worker；Muse 测试侧会话需另行归档。项目不申请容器或其它付费产品。
 
 协议依赖：[muse-cli 固定版本](https://github.com/nikships/muse-cli/tree/2e42aeccbef71437f4ccd4faa626414f2461be7b)，MIT；[Cloudflare WebSocket 客户端](https://developers.cloudflare.com/workers/examples/websockets/#connect-to-a-websocket-server)。
+
+
+## 长任务与网络审批
+
+Muse 的进度消息也可能标为 `completed`，默认短回复模式不能据此认定后台任务已经结束。受控长任务可传 `--completion-marker LONGRUN_FINISHED:唯一编号`，并在任务要求里约定最终回复以该标记独占一行；回执会保存它，`result` 重连查询继续等待。客户端只在最新完成消息中找到独占行标记时结束，不接受进度文本中引用未来标记。标记仅用于等待结束，任务是否成功仍要独立核查文件、运行时间、检查点和错误数。等待上限支持3600秒，超时不重发或取消远程任务。
+
+自动审批支持见 [APPROVALS.md](APPROVALS.md)：通过 CF 读取 Muse 网络审批，按用户授权的精确站点/端口/任务来源规则提交 `allow_once`，审计先落盘、超时不重放。此版本提供客户端监听器，没有静默安装后台服务或全局永久放行。

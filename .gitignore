@@ -27,3 +27,5 @@ muse-connection.json
 muse-credentials*.zip
 *.pem
 *.key
+
+.playwright-cli/
