@@ -17,7 +17,7 @@ function runtime(folder, outbound, cookie = "hatch_sess=seed") {
   return new Miniflare({
     name: "credential-restart-fixture", modules: true, scriptPath,
     compatibilityDate: "2026-07-01", compatibilityFlags: ["nodejs_compat"], cf: false,
-    bindings: { DEMO_KEY: key, MUSE_COOKIE: cookie, MUSE_VM_ID: "vm-test", MUSE_COOKIE_PART_1: "", MUSE_COOKIE_PART_2: "" },
+    bindings: { DEMO_KEY: key, MUSE_COOKIE: cookie, MUSE_VM_ID: "vm-test", MUSE_COOKIE_PART_1: "", MUSE_COOKIE_PART_2: "", AUTO_APPROVAL_ENABLED: "false", AUTO_APPROVAL_POLICY_JSON: "" },
     durableObjects: { CREDENTIALS: { className: "MuseCredentials", useSQLite: true } },
     durableObjectsPersist: folder,
     outboundService: async (request) => {

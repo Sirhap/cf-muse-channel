@@ -57,3 +57,18 @@ Cookie 无损拆分后存入 CF Secrets，没有使用凭证包里的静态 toke
 ## 扩充全面测试（2026-11-15）
 
 后续将自动化测试从 34 项扩充至 142 项（91 Workers/DO + 48 Python + 3 完整运行时重启/Cron），并完成 17 项真实线上检查。新增测试复现并修复了 Cookie 解析、凭证原子写入、URL/历史校验、回复聚合与错误脱敏问题。详细矩阵和首轮回显文案导致的失败记录见 [TESTING.md](TESTING.md)。本轮修复未自动部署，线上结果仍对应上一节的部署版本。
+
+## Worker 自主审批与真实 Cron（2026-11-16）
+
+本轮把审批移入 Worker：WebCrypto/Noise RPC、DO alarm、SQLite 决策审计共同运行，不依赖本机审批监听器。生产部署在原 `muse-cf-cookie-demo`，自定义域名不变；保留现有 Secrets 和已轮换 Cookie。
+
+- 最新部署版本：`dc35a326-7993-4001-acd6-80135a9dd5b3`。
+- `POST /probe/worker-rpc` 在生产返回200、`stage=worker_owned_noise_rpc`，由 Worker 自己执行真实 sessions.list。
+- 接入任务访问 `muse-demo.sirhao.top:443` 时，实际审批形态为 `scheme=wss, method=GET`；补上该安全 WebSocket 匹配后，DO 自主 alarm 记录 `pending=1, approved=1, unknown=0`，来源为 `durable_object_alarm`。
+- 独立只读查询 Muse 审批详情确认 `status=approved, decision=allow_once`。没有调用本机 apply/watch 或手动 `/approvals/poll` 完成这一条决定。后续 alarm 继续自动推进。
+- 生产规则限已授权的 `parity.sirhao.top`、`catfk.com`、`muse-demo.sirhao.top` 的443安全连接；其它目标保留待审，没有永久放行。
+- 临时增加一分钟 Cron，Cloudflare 真正触发 scheduled 并成功续期；审计保留 `cron="* * * * *"`、scheduled_time 和 `result.ok=true`。该临时 Cron 已删除，最终部署只保留 `54 20 * * *`。
+- 每日北京时间04:54的首次实际触发在本次核对时尚未到来，不能宣布每日触发已验收。之后需读取 `/renewal/scheduled-status`，确认 `last_event.cron="54 20 * * *"`、预期日期的 scheduled_time 及 `result.ok=true`；手动 refresh、审批 alarm 和临时分钟 Cron 都不能替代这一证据。
+- 自动化：100项 Workers/DO、71项 Python、3项完整运行时重启/Cron，共174项通过，TypeScript通过。新增测试包含 Python/Worker Noise双向互通、握手篡改拒绝、WSS规则、未知决定不重放、真实scheduled来源审计、私有渠道配置和最小补丁。
+
+微信/企微本轮部署状态和真实手机收发证据另行记录；Worker RPC与审批通过不代表渠道收发已经完成。新增适配器不修改原任务状态机，见 [CHANNEL_INTEGRATION.md](CHANNEL_INTEGRATION.md)。

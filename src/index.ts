@@ -38,8 +38,8 @@ export async function handleRequest(request: Request, env: Env,
       && request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
     return json({ error: "websocket_upgrade_required" }, 426);
   }
-  const allowed = (request.method === "POST" && ["/probe/cookie", "/credentials/refresh"].includes(url.pathname))
-    || (request.method === "GET" && ["/ws", "/credentials/status"].includes(url.pathname));
+  const allowed = (request.method === "POST" && ["/probe/cookie", "/credentials/refresh", "/approvals/poll", "/probe/worker-rpc"].includes(url.pathname))
+    || (request.method === "GET" && ["/ws", "/credentials/status", "/approvals/status", "/renewal/scheduled-status"].includes(url.pathname));
   if (!allowed) return json({ error: "not_found" }, 404);
   try {
     return await dispatch(request);
@@ -52,8 +52,8 @@ export default {
   fetch(request: Request, env: Env): Promise<Response> {
     return handleRequest(request, env, (forwarded) => env.CREDENTIALS.getByName("primary-account").fetch(forwarded));
   },
-  async scheduled(_event: ScheduledController, env: Env): Promise<void> {
-    const status = await env.CREDENTIALS.getByName("primary-account").refresh();
+  async scheduled(event: ScheduledController, env: Env): Promise<void> {
+    const status = await env.CREDENTIALS.getByName("primary-account").scheduledRenewal(event.scheduledTime, event.cron);
     if (!status.ok) console.warn(JSON.stringify({ event: "cookie_refresh_failed", error: status.last_error }));
   },
 } satisfies ExportedHandler<Env>;

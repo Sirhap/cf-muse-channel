@@ -1,4 +1,5 @@
-The Noise handshake in `client/probe.py` is adapted from nikships/muse-cli,
+The Noise handshake in `client/probe.py` and pinned protocol envelope mapping
+used by `src/noise.ts` are adapted from nikships/muse-cli,
 commit 2e42aeccbef71437f4ccd4faa626414f2461be7b.
 
 MIT License
@@ -22,3 +23,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+The Worker uses @noble/curves 1.9.7 and @noble/hashes 1.8.0 (MIT). Their
+license notices are included with the installed packages and bundled distribution.
+The deterministic Noise fixture uses synthetic test keys only.

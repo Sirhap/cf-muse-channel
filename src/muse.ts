@@ -1,4 +1,5 @@
 import { json } from "./http";
+import { MuseRpc } from "./noise";
 import { applySetCookies, initialCookies, cookieHeader, type CookieJar } from "./cookies";
 
 const MUSE_ORIGIN = "https://muse.ai";
@@ -131,6 +132,24 @@ export class CookieController {
           last_verified_at: null, last_rotated_at: null,
           last_error: { stage: failure.stage, error: failure.code } };
       }
+    });
+  }
+
+  /** Worker-owned RPC shares the same serialized Cookie rotation boundary. */
+  useRpc<T>(operation: (rpc: MuseRpc) => Promise<T>): Promise<T> {
+    return this.exclusive(async () => {
+      const state = await this.state();
+      if (state.needsLogin) throw new ProbeError("configuration", "cookie_requires_login");
+      state.lastCheckedAt = Date.now(); this.persist(state);
+      let rpc: MuseRpc | undefined;
+      try {
+        const upstream = await connectMuse(this.session(state), this.env);
+        rpc = await MuseRpc.connect(upstream.webSocket!);
+        return await operation(rpc);
+      } catch (error) {
+        this.failed(state, this.failure(error));
+        throw new Error("worker_rpc_failed");
+      } finally { rpc?.close(); }
     });
   }
 

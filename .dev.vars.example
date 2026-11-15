@@ -7,3 +7,6 @@ MUSE_COOKIE_PART_1=""
 MUSE_COOKIE_PART_2=""
 # Optional: leave empty to let Muse discover the VM from the Cookie.
 MUSE_VM_ID=""
+
+AUTO_APPROVAL_ENABLED="false"
+AUTO_APPROVAL_POLICY_JSON=""

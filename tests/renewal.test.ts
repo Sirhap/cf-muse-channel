@@ -166,7 +166,7 @@ describe("durable Cookie renewal", () => {
 
   it("the scheduled handler renews credentials without calling a chat endpoint", async () => {
     const refresh = vi.fn(async () => ({ ok: true, last_error: null }));
-    const getByName = vi.fn(() => ({ refresh }));
+    const getByName = vi.fn(() => ({ scheduledRenewal: refresh }));
     const cronEnv = { CREDENTIALS: { getByName } } as Env;
     await worker.scheduled({} as ScheduledController, cronEnv);
     expect(getByName).toHaveBeenCalledWith("primary-account");

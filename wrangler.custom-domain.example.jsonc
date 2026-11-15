@@ -38,5 +38,9 @@
     "crons": [
       "54 20 * * *"
     ]
+  },
+  "vars": {
+    "AUTO_APPROVAL_ENABLED": "false",
+    "AUTO_APPROVAL_POLICY_JSON": "{\"rules\":[]}"
   }
 }

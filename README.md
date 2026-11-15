@@ -7,9 +7,9 @@ Python 客户端 ── HTTPS / WSS ── CF Worker ── Cookie 换证 / WSS 
        └──────────────── Noise 加密协议 ────────────────────────┘
 ```
 
-CF 负责 Cookie 认证和 WebSocket 中转，Python 客户端处理 Noise、会话与结果查询。Cookie 放在 CF Secret，客户端使用独立 `DEMO_KEY`，只连接配置好的 Worker。
+CF 负责 Cookie 认证、WebSocket 中转和自主网络审批，Python 客户端处理渠道连接、会话与结果查询。Cookie 放在 CF Secret，客户端使用独立 `DEMO_KEY`，只连接配置好的 Worker。
 
-当前版本是已验证连接方式的最小实现，尚未接入微信、企业微信，也不包含聊天网页。Worker 会接收服务端返回的新 Cookie，并自动续期；会话被服务端撤销或已失效时仍需重新登录导入。长连接断开或结果未知时不会自动重发任务。
+当前版本提供微信、企业微信的连接适配器和最小接入补丁，见 [CHANNEL_INTEGRATION.md](CHANNEL_INTEGRATION.md)；实际部署与手机收发验收分别记录，不包含聊天网页。Worker 会接收服务端返回的新 Cookie，并自动续期；会话被服务端撤销或已失效时仍需重新登录导入。长连接断开或结果未知时不会自动重发任务。
 
 ## 快速开始
 
@@ -41,7 +41,7 @@ npm run build
 npm run dev
 ```
 
-完整自动化回归使用 `npm run test:all`（当前 160 项测试，含本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
+完整自动化回归使用 `npm run test:all`（当前 174 项测试，含本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
 
 默认使用 `http://127.0.0.1:8787`。本地运行时的出站来自本机，不证明 CF 云端出站可用。
 
@@ -91,7 +91,7 @@ export DEMO_KEY
 
 同一账号的续期和建连串行执行，避免并发覆盖；Worker 重启后从持久化状态读取最新值，不回退到旧 Secret。更新导入的 Cookie 或 VM ID 后，种子指纹变化会触发重新初始化。
 
-默认 Cron 为 `54 20 * * *`（UTC），即每天北京时间 04:54。连接 Muse 时同样会执行认证和保存轮换；定时任务不创建会话或发送用户消息。有效期遵循服务端返回值，不承诺永久有效。
+默认 Cron 为 `54 20 * * *`（UTC），即每天北京时间 04:54。连接 Muse 时同样会执行认证和保存轮换；定时任务不创建会话或发送用户消息。`GET /renewal/scheduled-status` 单独记录真正的 Cloudflare scheduled 调用，手动续期不会覆盖该记录；临时分钟级 Cron 成功不能当作每日 04:54 已经触发。有效期遵循服务端返回值，不承诺永久有效。
 
 ```sh
 .venv/bin/python client/probe.py status --url https://your-worker.example.com
@@ -132,6 +132,7 @@ npx wrangler secret bulk .local/worker-secrets.json --config wrangler.production
 - `GET /health`：公开健康信息，只证明 Worker 能响应。
 - `POST /probe/network`、`POST /probe/cookie`：需要 `Authorization: Bearer <DEMO_KEY>`。
 - `GET /credentials/status`、`POST /credentials/refresh`：需要相同鉴权，提供脱敏状态与手动续期。
+- `GET /approvals/status`、`POST /approvals/poll`、`POST /probe/worker-rpc`、`GET /renewal/scheduled-status`：同样鉴权，分别提供自主审批审计、手动轮询、Worker 自己执行的 Noise RPC 和 Cron 触发记录。
 - `GET /ws`：需要相同鉴权和 WebSocket Upgrade，固定连接 Muse，不接受自定义目标或 URL 凭证。
 - Cookie 换证保持与固定 SDK 一致的请求头；拒绝跨站重定向，认证 JSON 限制大小。
 - 上游原始响应和可能包含 token 的异常不返回、不记录，错误只给阶段、HTTP 状态和固定代码。
@@ -149,4 +150,4 @@ npx wrangler secret bulk .local/worker-secrets.json --config wrangler.production
 
 Muse 的进度消息也可能标为 `completed`，默认短回复模式不能据此认定后台任务已经结束。受控长任务可传 `--completion-marker LONGRUN_FINISHED:唯一编号`，并在任务要求里约定最终回复以该标记独占一行；回执会保存它，`result` 重连查询继续等待。客户端只在最新完成消息中找到独占行标记时结束，不接受进度文本中引用未来标记。标记仅用于等待结束，任务是否成功仍要独立核查文件、运行时间、检查点和错误数。等待上限支持3600秒，超时不重发或取消远程任务。
 
-自动审批支持见 [APPROVALS.md](APPROVALS.md)：通过 CF 读取 Muse 网络审批，按用户授权的精确站点/端口/任务来源规则提交 `allow_once`，审计先落盘、超时不重放。此版本提供客户端监听器，没有静默安装后台服务或全局永久放行。
+自动审批支持见 [APPROVALS.md](APPROVALS.md)：通过 CF 读取 Muse 网络审批，按用户授权的精确站点/端口/任务来源规则提交 `allow_once`，审计先落盘、超时不重放。生产运行由 Worker 的 Durable Object alarm 自主完成，不依赖本机监听器。仓库默认关闭，按用户授权配置精确规则；未匹配的请求继续待审。
