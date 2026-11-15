@@ -146,3 +146,33 @@ class NoiseTests(unittest.TestCase):
         client = self.gateway(peer, "http://127.0.0.1:8787")
         self.assertEqual(peer.connected[0], "ws://127.0.0.1:8787/ws")
         client.close()
+
+    def test_a_timeout_after_http_200_never_returns_a_partial_file(self):
+        peer = NoisePeer()
+        client = self.gateway(peer)
+        frame = ServiceFrame(stream_id=1)
+        frame.response.status = 200
+        frame.response.body = b"partial file bytes"
+        frame.response.end_body = False
+        try:
+            with patch.object(client, "_open", return_value=1), patch.object(client, "_read_frame", return_value=frame), \
+                    patch.object(probe.time, "monotonic", side_effect=[0, 0, 2]):
+                with self.assertRaises(TimeoutError):
+                    client.request("sessions.list", timeout=1)
+        finally:
+            client.close()
+
+    def test_a_complete_body_chunk_joins_the_initial_response(self):
+        peer = NoisePeer()
+        client = self.gateway(peer)
+        first = ServiceFrame(stream_id=1)
+        first.response.status = 200
+        first.response.body = b"first-"
+        final = ServiceFrame(stream_id=1)
+        final.body_chunk.data = b"last"
+        final.body_chunk.end_body = True
+        try:
+            with patch.object(client, "_open", return_value=1), patch.object(client, "_read_frame", side_effect=[first, final]):
+                self.assertEqual(client.request("sessions.list"), b"first-last")
+        finally:
+            client.close()

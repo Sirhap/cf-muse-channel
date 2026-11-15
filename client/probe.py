@@ -19,7 +19,7 @@ import uuid
 
 from curl_cffi import requests
 from curl_cffi.requests import WebSocket
-from muse_cli.gateway import Gateway
+from muse_cli.gateway import Gateway, GatewayError, ROUTES
 from noise.connection import Keypair, NoiseConnection
 
 
@@ -77,6 +77,38 @@ class RelayGateway(Gateway):
         self._send_lock = threading.Lock()
         self._recv_lock = threading.Lock()
         self._chunks = {}
+
+    def request(self, method, path_params=None, body=None, query=None, timeout=30, route=None):
+        """Require an explicit end-of-body; a timed-out HTTP 200 is not a complete artifact."""
+        route = route or ROUTES[method]
+        if route["http"] == "GET" and body is not None and query is None:
+            query, body = body, None
+        stream = self._open(method, path_params, body, query, route=route)
+        status, chunks, complete = None, [], False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = self._read_frame()
+            if frame.stream_id != stream:
+                continue
+            kind = frame.WhichOneof("kind")
+            if kind == "response":
+                status = frame.response.status
+                if frame.response.body:
+                    chunks.append(bytes(frame.response.body))
+                complete = frame.response.end_body
+            elif kind == "body_chunk":
+                chunks.append(bytes(frame.body_chunk.data))
+                complete = frame.body_chunk.end_body
+            elif kind == "reset":
+                raise GatewayError(-1, "stream reset before complete response")
+            if complete:
+                break
+        if status is None or not complete:
+            raise TimeoutError("response body incomplete; no automatic retry")
+        payload = b"".join(chunks)
+        if not 200 <= status < 300:
+            raise GatewayError(status, payload[:500].decode("utf-8", "replace"))
+        return payload
 
 
 def write_receipt(path: Path, receipt: dict) -> None:
