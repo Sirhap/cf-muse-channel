@@ -41,7 +41,7 @@ npm run build
 npm run dev
 ```
 
-完整自动化回归使用 `npm run test:all`（当前 176 项测试，含本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
+完整自动化回归使用 `npm run test:all`（当前 177 项测试，含本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
 
 默认使用 `http://127.0.0.1:8787`。本地运行时的出站来自本机，不证明 CF 云端出站可用。
 

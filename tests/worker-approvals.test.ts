@@ -24,6 +24,14 @@ it('allows POST only when the exact host policy explicitly authorizes it', () =>
  expect(approvalMatch(record({scheme:'https',method:'POST'}),relayRules)).toBe(false);
  expect(approvalMatch(record({host:'muse-demo.sirhao.top',scheme:'https',method:'DELETE'}),relayRules)).toBe(false);
 });
+it('handles service-process CONNECT approvals without relaxing host, port or task scope', () => {
+ const relayRules=parsePolicy(JSON.stringify({rules:[{host:'muse-demo.sirhao.top',port:443,scheme:'https',methods:['CONNECT']}]}));
+ const serviceRequest=record({host:'muse-demo.sirhao.top',scheme:'connect',runtime_request_trace:undefined});
+ expect(approvalMatch(serviceRequest,relayRules)).toBe(true);
+ expect(approvalMatch({...serviceRequest,method:'GET'},relayRules)).toBe(false);
+ expect(approvalMatch({...serviceRequest,port:80},relayRules)).toBe(false);
+ expect(approvalMatch(record({scheme:'connect',runtime_request_trace:undefined}),rules)).toBe(false);
+});
 it('persists unknown before sending a Worker-owned approval and never replays it', async () => {
  const states=new Map<string,string>();
  const call=vi.fn(async (path:string,_service?:number,method?:string,body?:unknown) => {

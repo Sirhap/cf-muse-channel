@@ -62,7 +62,7 @@ Cookie 无损拆分后存入 CF Secrets，没有使用凭证包里的静态 toke
 
 本轮把审批移入 Worker：WebCrypto/Noise RPC、DO alarm、SQLite 决策审计共同运行，不依赖本机审批监听器。生产部署在原 `muse-cf-cookie-demo`，自定义域名不变；保留现有 Secrets 和已轮换 Cookie。
 
-- 最新部署版本：`97595978-5137-45e0-bc39-0d73a9c6069a`（补上自有 CF 域名的显式 POST 规则）；WSS 自主审批首次验证版本为 `dc35a326-7993-4001-acd6-80135a9dd5b3`。
+- 最新部署版本：`38ac307d-fa51-494b-8e70-63915e10eea6`（补上后台服务的 connect/CONNECT 审批形式）；POST 规则部署版本为 `97595978-5137-45e0-bc39-0d73a9c6069a`；WSS 自主审批首次验证版本为 `dc35a326-7993-4001-acd6-80135a9dd5b3`。
 - `POST /probe/worker-rpc` 在生产返回200、`stage=worker_owned_noise_rpc`，由 Worker 自己执行真实 sessions.list。
 - 接入任务访问 `muse-demo.sirhao.top:443` 时，实际审批形态为 `scheme=wss, method=GET`；补上该安全 WebSocket 匹配后，DO 自主 alarm 记录 `pending=1, approved=1, unknown=0`，来源为 `durable_object_alarm`。
 - 后续两条自有 CF 域名的 HTTPS POST 也由 Worker 自主批准，SQLite 累计 `rpc_accepted=3`，当前待审为0；逐条独立查询 Muse 均为 `approved/allow_once`。
@@ -70,6 +70,17 @@ Cookie 无损拆分后存入 CF Secrets，没有使用凭证包里的静态 toke
 - 生产规则限已授权的 `parity.sirhao.top`、`catfk.com`、`muse-demo.sirhao.top` 的443安全连接；仅自有 CF 域名额外允许已授权探测接口需要的 POST，普通站点不允许 POST。其它目标保留待审，没有永久放行。
 - 临时增加一分钟 Cron，Cloudflare 真正触发 scheduled 并成功续期；审计保留 `cron="* * * * *"`、scheduled_time 和 `result.ok=true`。该临时 Cron 已删除，最终部署只保留 `54 20 * * *`。
 - 每日北京时间04:54的首次实际触发在本次核对时尚未到来，不能宣布每日触发已验收。之后需读取 `/renewal/scheduled-status`，确认 `last_event.cron="54 20 * * *"`、预期日期的 scheduled_time 及 `result.ok=true`；手动 refresh、审批 alarm 和临时分钟 Cron 都不能替代这一证据。
-- 自动化：101项 Workers/DO、72项 Python、3项完整运行时重启/Cron，共176项通过，TypeScript通过。新增测试包含 Python/Worker Noise双向互通、握手篡改拒绝、WSS规则、未知决定不重放、真实scheduled来源审计、私有渠道配置和最小补丁。
+- 自动化：102项 Workers/DO、72项 Python、3项完整运行时重启/Cron，共177项通过，TypeScript通过。新增测试包含 Python/Worker Noise双向互通、握手篡改拒绝、WSS规则、未知决定不重放、真实scheduled来源审计、私有渠道配置和最小补丁。
 
 微信/企微本轮部署状态和真实手机收发证据另行记录；Worker RPC与审批通过不代表渠道收发已经完成。新增适配器不修改原任务状态机，见 [CHANNEL_INTEGRATION.md](CHANNEL_INTEGRATION.md)。
+
+## 微信、企微切换（2026-11-16 01:11 CST）
+
+虚机初次验证发现旧 SDK 0.3.2 不支持 route 参数且缺少分片重组，CF 早返回又跳过了 SDK 路径准备；旧 curl_cffi 默认 HTTP/2 时还会出现101后 Invalid active socket。已补 SDK 准备、固定 muse-cli 0.3.10，并显式使用 HTTP/1.1；没有禁用 TLS 校验。
+
+- 虚机干净服务环境的 staged RPC 29.0秒、实际生产 native_bridge.connect 路径21.4秒，均完成 sessions.list、正常关闭。
+- 原 native_bridge.py 仅新增12行 CF 分支；独立文件读取确认生产源码 SHA256 为 `16f25713a7cf23f0b2a0265ad58f042a26da28d55a1525025799a1deb31becf1`，与执行报告一致。
+- 两个工作区 unit 和已安装 unit 设置 CF 私有配置路径、适配器路径、固定 SDK 路径；执行端校验 render_unit 一致，完成 daemon-reload 和仅两个执行服务的重启。独立读取工作区 unit 确认 CF 环境配置已写入。
+- 微信仍 legacy、企微仍 core（gadget关闭、hook备用开启）；无在途核查后在路由锁内解除微信fallback，独立 stat 返回404。新版 daemon status 的PID和更新时间与切换报告一致。
+- 新后台请求实际是 `scheme=connect, method=CONNECT, port=443`，没有thread_id；补上这个443隧道形式后 DO alarm 自主记录 approved=1、unknown=0，累计rpc_accepted=11。精确主机限制和可选任务绑定不变。
+- 真实手机新入站和正式发送回执另行验收；配置/RPC成功不代表这一步已通过。

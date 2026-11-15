@@ -31,7 +31,8 @@ export function approvalMatch(record: Record<string, unknown>, rules: ApprovalRu
   const port = typeof record.port === 'string' && /^\d+$/.test(record.port) ? Number(record.port) : record.port;
   const scheme = typeof record.scheme === 'string' ? record.scheme.toLowerCase() : '';
   const method = typeof record.method === 'string' ? record.method.toUpperCase() : '';
-  if (!(scheme === 'https' || scheme === 'wss' || scheme === 'tls' || (scheme === 'tcp' && method === 'CONNECT' && port === 443))) return false;
+  if (!(scheme === 'https' || scheme === 'wss' || scheme === 'tls'
+    || (['tcp', 'connect'].includes(scheme) && method === 'CONNECT' && port === 443))) return false;
   const trace = record.runtime_request_trace as { thread_id?: unknown } | undefined;
   return rules.some((rule) => host === rule.host && port === rule.port && rule.methods.includes(method)
     && (!rule.thread_ids || (typeof trace?.thread_id === 'string' && rule.thread_ids.includes(trace.thread_id))));
