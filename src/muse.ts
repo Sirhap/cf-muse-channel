@@ -39,6 +39,15 @@ export class CookieController {
     return result;
   }
 
+  private persist(state: CredentialState): void {
+    try {
+      this.store.save(state);
+    } catch {
+      // SQLite/adapter errors may include bound credential values.
+      throw new ProbeError("storage", "persistence_failed");
+    }
+  }
+
   private async state(): Promise<CredentialState> {
     const hasParts = Boolean(this.env.MUSE_COOKIE_PART_1);
     if (hasParts && typeof this.env.MUSE_COOKIE_PART_2 !== "string") {
@@ -56,7 +65,7 @@ export class CookieController {
       seed, cookies: initialCookies(cookie), lastCheckedAt: null, lastVerifiedAt: null,
       lastRotatedAt: null, lastError: null, needsLogin: false,
     };
-    this.store.save(state);
+    this.persist(state);
     return state;
   }
 
@@ -67,12 +76,12 @@ export class CookieController {
         const cookies = applySetCookies(state.cookies, headers);
         if (JSON.stringify(cookies) === JSON.stringify(state.cookies)) return;
         const next = { ...state, cookies, lastRotatedAt: Date.now() };
-        this.store.save(next);
+        this.persist(next);
         Object.assign(state, next);
       },
       verified: () => {
         const next = { ...state, lastVerifiedAt: Date.now(), lastError: null, needsLogin: false };
-        this.store.save(next);
+        this.persist(next);
         Object.assign(state, next);
       },
     };
@@ -95,7 +104,7 @@ export class CookieController {
     state.lastError = { stage: failure.stage, error: failure.code, upstream_status: failure.upstreamStatus };
     // A generic 403 can be an origin/proxy denial; do not mislabel it as expired credentials.
     state.needsLogin = state.needsLogin || (failure.stage === "/api/auth/check" && failure.upstreamStatus === 401);
-    this.store.save(state);
+    this.persist(state);
   }
 
   /** Daily renewal and authenticated manual checks share the exact rotation path. */
@@ -106,7 +115,7 @@ export class CookieController {
         state = await this.state();
         if (state.needsLogin) return this.status(state);
         state.lastCheckedAt = Date.now();
-        this.store.save(state);
+        this.persist(state);
         const session = this.session(state);
         const result = await authJson("/api/auth/check", session, { method: "POST", body: "" });
         requiredString(result, "access_token", "/api/auth/check");
@@ -136,7 +145,7 @@ export class CookieController {
         if (new URL(request.url).pathname === "/credentials/status") return json(this.status(state));
         if (state.needsLogin) return json({ ok: false, error: "cookie_requires_login", needs_login: true }, 503);
         state.lastCheckedAt = Date.now();
-        this.store.save(state);
+        this.persist(state);
         const upstream = await connectMuse(this.session(state), this.env);
         if (new URL(request.url).pathname === "/probe/cookie") {
           upstream.webSocket!.accept();

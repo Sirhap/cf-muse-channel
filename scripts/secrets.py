@@ -5,15 +5,22 @@ import json
 import os
 from pathlib import Path
 import secrets
+import tempfile
 import zipfile
 
 
 def private_write(path: Path, text: str) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w") as output:
-        output.write(text)
+    fd, name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load_vars(path: Path) -> dict:
@@ -31,7 +38,8 @@ def load_vars(path: Path) -> dict:
 
 def split_cookie(cookie: str) -> tuple[str, str]:
     """Preserve the complete header while keeping each Secret below 5 KiB."""
-    if not cookie.strip() or "\r" in cookie or "\n" in cookie:
+    if (not isinstance(cookie, str) or not cookie.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in cookie)):
         raise ValueError("Expected a single-line Cookie request header")
     pieces = ["", ""]
     index = 0
@@ -46,7 +54,14 @@ def split_cookie(cookie: str) -> tuple[str, str]:
 
 def import_archive(archive: Path, values: dict) -> dict:
     with zipfile.ZipFile(archive) as source:
-        entries = {Path(item.filename).name: item for item in source.infolist() if not item.is_dir()}
+        entries = {}
+        for item in source.infolist():
+            if item.is_dir():
+                continue
+            name = Path(item.filename).name
+            if name in ("cookies.txt", "vm_id.txt") and name in entries:
+                raise ValueError("Ambiguous duplicate credential entry")
+            entries[name] = item
         if any(name not in entries or entries[name].file_size > 1024 * 1024
                for name in ("cookies.txt", "vm_id.txt")):
             raise ValueError("Expected cookies.txt and vm_id.txt, each below 1 MiB")
@@ -64,7 +79,7 @@ def import_archive(archive: Path, values: dict) -> dict:
                 if not line or line.startswith("#"):
                     continue
                 columns = line.split("\t")
-                if len(columns) >= 7 and (columns[0].lstrip(".") == "muse.ai" or columns[0].endswith(".muse.ai")):
+                if len(columns) >= 7 and columns[0].lstrip(".").lower() == "muse.ai" and columns[2] == "/":
                     fields.append(f"{columns[5]}={columns[6]}")
             cookie = "; ".join(fields)
         else:

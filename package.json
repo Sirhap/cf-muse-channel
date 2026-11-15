@@ -10,13 +10,17 @@
     "test": "vitest run",
     "build": "wrangler deploy --dry-run --outdir dist",
     "deploy": "wrangler deploy",
-    "test:python": "python3 -m unittest discover -s tests -p \"test_*.py\""
+    "test:python": ".venv/bin/python -m unittest discover -s tests -p \"test_*.py\"",
+    "test:restart": "node --test tests/runtime-restart.test.mjs",
+    "test:all": "npm run check && npm test && npm run test:python && npm run test:restart"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.18.0",
     "typescript": "5.9.3",
     "vitest": "4.1.0",
-    "wrangler": "4.107.0"
+    "wrangler": "4.107.0",
+    "miniflare": "4.20260701.0",
+    "esbuild": "0.28.1"
   },
   "engines": {
     "node": ">=22"

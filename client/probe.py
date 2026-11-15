@@ -23,15 +23,38 @@ from muse_cli.gateway import Gateway
 from noise.connection import Keypair, NoiseConnection
 
 
+def worker_origin(base_url: str):
+    """Reject credentials, paths and malformed ports before any network activity."""
+    if not isinstance(base_url, str) or any(ord(char) <= 32 or ord(char) == 127 for char in base_url):
+        raise ValueError("Expected a plain Worker HTTP(S) origin")
+    target = urlsplit(base_url)
+    port = target.port  # Force validation: urlsplit itself accepts malformed/out-of-range ports.
+    if (target.scheme not in ("http", "https") or not target.hostname or target.query or target.fragment
+            or target.username is not None or target.password is not None or target.path not in ("", "/")
+            or (port is not None and port < 1)):
+        raise ValueError("Expected a plain Worker HTTP(S) origin")
+    if target.scheme == "http" and target.hostname not in ("localhost", "127.0.0.1"):
+        raise ValueError("Remote connections require HTTPS")
+    return target
+
+
+def history_events(history: object) -> list[dict]:
+    """Validate the correlation baseline before sending or trusting a result."""
+    if not isinstance(history, dict) or not isinstance(history.get("chat_events", []), list):
+        raise ValueError("Invalid history response")
+    events = history.get("chat_events", [])
+    for event in events:
+        if (not isinstance(event, dict) or type(event.get("seq")) is not int or event["seq"] < 0
+                or (event.get("payload") is not None and not isinstance(event["payload"], dict))):
+            raise ValueError("Invalid history event")
+    return sorted(events, key=lambda event: event["seq"])
+
+
 class RelayGateway(Gateway):
     """Use the pinned SDK's framing/RPC over a Worker-authenticated WebSocket."""
 
     def __init__(self, base_url: str, demo_key: str):
-        target = urlsplit(base_url)
-        if target.scheme not in ("http", "https") or target.query or target.fragment or target.username:
-            raise ValueError("Expected a plain Worker HTTP(S) origin")
-        if target.scheme == "http" and target.hostname not in ("localhost", "127.0.0.1"):
-            raise ValueError("Remote connections require HTTPS")
+        target = worker_origin(base_url)
         url = urlunsplit(("wss" if target.scheme == "https" else "ws", target.netloc, "/ws", "", ""))
         self.ws = WebSocket()
         try:
@@ -76,7 +99,7 @@ def wait_result(client: RelayGateway, timeout: int, receipt_path: Path) -> dict:
     receipt = json.loads(receipt_path.read_text())
     if not isinstance(receipt, dict):
         raise ValueError("Invalid receipt")
-    if receipt.get("state") == "succeeded":
+    if receipt.get("state") in ("succeeded", "failed", "cancelled"):
         return receipt
     session_id = receipt.get("session_id")
     baseline = receipt.get("baseline_seq")
@@ -90,24 +113,43 @@ def wait_result(client: RelayGateway, timeout: int, receipt_path: Path) -> dict:
         raise ValueError("Invalid receipt anchor")
     while time.monotonic() < deadline:
         history = client.call_json("chat.history", body={"session_id": session_id, "limit": 100}, timeout=15)
-        events = sorted(history.get("chat_events", []), key=lambda event: event.get("seq", 0))
+        events = history_events(history)
         if anchor_seq is None:
             anchor_seq = next((event.get("seq") for event in events
                                if event.get("event_name") == "message.user" and event.get("seq", 0) > baseline), None)
             if anchor_seq is not None:
                 receipt.update(submission_confirmed=True, anchor_seq=anchor_seq)
                 write_receipt(receipt_path, receipt)
+        latest = {}
         for event in events:
             if anchor_seq is None or event.get("seq", 0) <= anchor_seq:
                 continue
             if event.get("event_name") != "message.assistant":
                 continue
             payload = event.get("payload") or {}
-            if payload.get("status") not in ("completed", "complete", "succeeded"):
-                continue
-            text = payload.get("display_text")
-            if isinstance(text, str) and text.strip():
-                receipt.update(state="succeeded", text=text)
+            identity = event.get("message_id") or payload.get("message_id") or event["seq"]
+            if not isinstance(identity, (str, int)):
+                raise ValueError("Invalid assistant message identity")
+            latest[identity] = event
+        replies = sorted(latest.values(), key=lambda event: event["seq"])
+        active = any((event.get("payload") or {}).get("status") in (
+            "running", "pending", "in_progress", "streaming", "generating")
+            or (event.get("payload") or {}).get("display_text_ready") is False for event in replies)
+        if replies and not active:
+            terminal = (replies[-1].get("payload") or {}).get("status")
+            if terminal in ("failed", "cancelled", "canceled", "error"):
+                receipt.update(state="cancelled" if terminal in ("cancelled", "canceled") else "failed",
+                               evidence="assistant_terminal_state")
+                write_receipt(receipt_path, receipt)
+                return receipt
+            parts = []
+            for event in replies:
+                payload = event.get("payload") or {}
+                text = payload.get("display_text")
+                if payload.get("status") in ("completed", "complete", "succeeded") and isinstance(text, str) and text.strip():
+                    parts.append(text)
+            if parts:
+                receipt.update(state="succeeded", text="\n".join(parts))
                 write_receipt(receipt_path, receipt)
                 return receipt
         time.sleep(2)
@@ -118,6 +160,8 @@ def wait_result(client: RelayGateway, timeout: int, receipt_path: Path) -> dict:
 
 def chat_once(client: RelayGateway, message: str, timeout: int, receipt_path: Path) -> dict:
     """Create a dedicated demo session, submit once, and poll that session only."""
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("Chat message must not be empty")
     receipt_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         descriptor = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -129,11 +173,11 @@ def chat_once(client: RelayGateway, message: str, timeout: int, receipt_path: Pa
         "method": "/api/session/start",
         "params": {"origin": "fresh", "lifecycle": "persistent", "title": f"CF demo {uuid.uuid4().hex[:8]}"},
     }, timeout=15)
-    session_id = response.get("session_id")
+    session_id = response.get("session_id") if isinstance(response, dict) else None
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("No session ID returned")
     history = client.call_json("chat.history", body={"session_id": session_id, "limit": 100}, timeout=15)
-    baseline = max((event.get("seq", 0) for event in history.get("chat_events", [])), default=0)
+    baseline = max((event["seq"] for event in history_events(history)), default=0)
     receipt = {"session_id": session_id, "state": "submission_unknown", "retry_safe": False,
                "baseline_seq": baseline, "submission_confirmed": False}
     write_receipt(receipt_path, receipt)
@@ -158,10 +202,9 @@ def main() -> int:
     key = os.environ.get("DEMO_KEY", "")
     if not 32 <= len(key) <= 512 or any(char.isspace() for char in key):
         parser.error("Set DEMO_KEY to 32..512 non-whitespace characters")
-    target = urlsplit(args.url)
-    if (target.scheme not in ("https", "http") or not target.hostname or target.query
-            or target.fragment or target.username or target.path not in ("", "/")
-            or (target.scheme == "http" and target.hostname not in ("127.0.0.1", "localhost"))):
+    try:
+        worker_origin(args.url)
+    except ValueError:
         parser.error("Use a plain HTTPS Worker origin; HTTP is allowed only for localhost")
     if not 1 <= args.timeout <= 600:
         parser.error("timeout must be between 1 and 600 seconds")
