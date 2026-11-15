@@ -65,6 +65,7 @@ Cookie 无损拆分后存入 CF Secrets，没有使用凭证包里的静态 toke
 - 最新部署版本：`97595978-5137-45e0-bc39-0d73a9c6069a`（补上自有 CF 域名的显式 POST 规则）；WSS 自主审批首次验证版本为 `dc35a326-7993-4001-acd6-80135a9dd5b3`。
 - `POST /probe/worker-rpc` 在生产返回200、`stage=worker_owned_noise_rpc`，由 Worker 自己执行真实 sessions.list。
 - 接入任务访问 `muse-demo.sirhao.top:443` 时，实际审批形态为 `scheme=wss, method=GET`；补上该安全 WebSocket 匹配后，DO 自主 alarm 记录 `pending=1, approved=1, unknown=0`，来源为 `durable_object_alarm`。
+- 后续两条自有 CF 域名的 HTTPS POST 也由 Worker 自主批准，SQLite 累计 `rpc_accepted=3`，当前待审为0；逐条独立查询 Muse 均为 `approved/allow_once`。
 - 独立只读查询 Muse 审批详情确认 `status=approved, decision=allow_once`。没有调用本机 apply/watch 或手动 `/approvals/poll` 完成这一条决定。后续 alarm 继续自动推进。
 - 生产规则限已授权的 `parity.sirhao.top`、`catfk.com`、`muse-demo.sirhao.top` 的443安全连接；仅自有 CF 域名额外允许已授权探测接口需要的 POST，普通站点不允许 POST。其它目标保留待审，没有永久放行。
 - 临时增加一分钟 Cron，Cloudflare 真正触发 scheduled 并成功续期；审计保留 `cron="* * * * *"`、scheduled_time 和 `result.ok=true`。该临时 Cron 已删除，最终部署只保留 `54 20 * * *`。
