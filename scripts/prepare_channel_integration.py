@@ -7,6 +7,7 @@ from pathlib import Path
 MARKER='# CF_MUSE_RELAY_TRANSPORT_V1'
 HOOK='''    # CF_MUSE_RELAY_TRANSPORT_V1
     if os.environ.get("MUSE_CF_RELAY_CONFIG"):
+        _ensure_muse_cli_path()
         source = os.environ.get("MUSE_CF_RELAY_SOURCE")
         if not source:
             raise ValueError("MUSE_CF_RELAY_SOURCE is required when CF relay is enabled")

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 from curl_cffi import requests
+from curl_cffi.const import CurlHttpVersion
 from curl_cffi.requests import WebSocket
 from muse_cli.gateway import Gateway, GatewayError, ROUTES
 from noise.connection import Keypair, NoiseConnection
@@ -58,8 +59,11 @@ class RelayGateway(Gateway):
         url = urlunsplit(("wss" if target.scheme == "https" else "ws", target.netloc, "/ws", "", ""))
         self.ws = WebSocket()
         try:
+            # Older curl_cffi versions otherwise negotiate HTTP/2 and can return
+            # an upgrade response without a usable connect-only WebSocket socket.
             self.ws.connect(url, headers={"Authorization": f"Bearer {demo_key}"},
-                            impersonate="chrome", timeout=75, verify=True)
+                            impersonate="chrome", timeout=75, verify=True,
+                            http_version=CurlHttpVersion.V1_1)
             self.noise = NoiseConnection.from_name(b"Noise_XX_25519_AESGCM_SHA256")
             self.noise.set_as_initiator()
             self.noise.set_keypair_from_private_bytes(Keypair.STATIC, os.urandom(32))

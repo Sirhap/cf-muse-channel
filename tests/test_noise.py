@@ -117,6 +117,7 @@ class NoiseTests(unittest.TestCase):
         url, kwargs = peer.connected
         self.assertEqual(url, "wss://relay.test/ws")
         self.assertTrue(kwargs["verify"])
+        self.assertEqual(kwargs["http_version"], probe.CurlHttpVersion.V1_1)
         self.assertIn("Authorization", kwargs["headers"])
         self.assertNotIn("test-demo-key", url)
         client.close()

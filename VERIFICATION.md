@@ -70,6 +70,6 @@ Cookie 无损拆分后存入 CF Secrets，没有使用凭证包里的静态 toke
 - 生产规则限已授权的 `parity.sirhao.top`、`catfk.com`、`muse-demo.sirhao.top` 的443安全连接；仅自有 CF 域名额外允许已授权探测接口需要的 POST，普通站点不允许 POST。其它目标保留待审，没有永久放行。
 - 临时增加一分钟 Cron，Cloudflare 真正触发 scheduled 并成功续期；审计保留 `cron="* * * * *"`、scheduled_time 和 `result.ok=true`。该临时 Cron 已删除，最终部署只保留 `54 20 * * *`。
 - 每日北京时间04:54的首次实际触发在本次核对时尚未到来，不能宣布每日触发已验收。之后需读取 `/renewal/scheduled-status`，确认 `last_event.cron="54 20 * * *"`、预期日期的 scheduled_time 及 `result.ok=true`；手动 refresh、审批 alarm 和临时分钟 Cron 都不能替代这一证据。
-- 自动化：101项 Workers/DO、71项 Python、3项完整运行时重启/Cron，共175项通过，TypeScript通过。新增测试包含 Python/Worker Noise双向互通、握手篡改拒绝、WSS规则、未知决定不重放、真实scheduled来源审计、私有渠道配置和最小补丁。
+- 自动化：101项 Workers/DO、72项 Python、3项完整运行时重启/Cron，共176项通过，TypeScript通过。新增测试包含 Python/Worker Noise双向互通、握手篡改拒绝、WSS规则、未知决定不重放、真实scheduled来源审计、私有渠道配置和最小补丁。
 
 微信/企微本轮部署状态和真实手机收发证据另行记录；Worker RPC与审批通过不代表渠道收发已经完成。新增适配器不修改原任务状态机，见 [CHANNEL_INTEGRATION.md](CHANNEL_INTEGRATION.md)。

@@ -19,8 +19,10 @@ MUSE_CF_RELAY_CONFIG=/home/hatch/.config/cf-muse-channel/relay.json
 MUSE_CF_RELAY_SOURCE=/absolute/path/client/bridge.py
 ```
 
-配置JSON含url和key，必须是当前服务用户拥有且0600的普通文件。不要输出内容、提交仓库或将key写入聊天和命令行。传输适配器的相邻probe.py和Muse SDK依赖必须可用。
+配置JSON含url和key，必须是当前服务用户拥有且0600的普通文件。不要输出内容、提交仓库或将key写入聊天和命令行。传输适配器的相邻probe.py和Muse SDK依赖必须可用。使用 client/requirements.txt 固定的 muse-cli 提交 2e42aeccbef71437f4ccd4faa626414f2461be7b（0.3.10），不能直接使用旧 0.3.2：旧版 _open 不支持 route 参数，且缺少分片重组。若通过源码加载，服务显式设置 MUSE_CLI_SRC 为固定SDK的src目录；CF注入分支先调用原 _ensure_muse_cli_path()，随后才导入适配器。直接从干净服务环境验证，不依赖交互终端已有的 PYTHONPATH。
 
 切换先备份源码、工作区服务单元和模式/标志文件，检查在途任务。企微core沿用原DB、账号与hook_handoff；微信legacy保留hook备用，只有确认无旧在途任务、队列歧义后才能在渠道路由锁内解除fallback锁存。不能重放旧失败任务或把未知任务迁到另一条路径。
+
+客户端显式使用 HTTP/1.1 建立 WebSocket，兼容旧版 curl_cffi 的 connect-only 行为；返回101仍需完成 Noise 握手和 sessions.list 才算连通。
 
 修改后运行原服务解释器的真实CF RPC，再仅重启受影响runner/bridge；工作区unit副本需同步，避免换机自愈覆盖新环境。回滚移除环境开关、恢复源码和标志，保留所有任务账本。真正收发验收需要新的微信/企微入站消息及相应执行和出站回执，RPC和服务active不能代替收发证据。

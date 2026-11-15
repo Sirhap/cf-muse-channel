@@ -33,3 +33,12 @@ class BridgeTests(unittest.TestCase):
   with patch.dict(os.environ,{},clear=True):self.assertEqual(scope['connect'](),'legacy')
  def test_unexpected_source_is_rejected(self):
   with self.assertRaises(ValueError):patcher.patch_source('def different():\n    pass\n')
+ def test_enabled_branch_prepares_sdk_before_loading_external_transport(self):
+  text='import os, importlib.util\ndef connect():\n    """Original transport."""\n    return "legacy"\n'
+  scope={};exec(compile(patcher.patch_source(text),'bridge','exec'),scope)
+  prepared=Mock();module=Mock();module.connect.side_effect=lambda path: self.assertTrue(prepared.called)or'CF'
+  fake_import=Mock();fake_import.util.module_from_spec.return_value=module
+  scope['_ensure_muse_cli_path']=prepared;scope['importlib']=fake_import
+  with patch.dict(os.environ,{'MUSE_CF_RELAY_CONFIG':'private.json','MUSE_CF_RELAY_SOURCE':'/client/bridge.py'}):
+   self.assertEqual(scope['connect'](),'CF')
+  prepared.assert_called_once()
