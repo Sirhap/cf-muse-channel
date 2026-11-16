@@ -33,6 +33,11 @@ def connect(config_path=None):
         result=client.call_json('sessions.list',timeout=15)
         if not isinstance(result,(dict,list)) or isinstance(result,dict)and(result.get('ok')is False or result.get('error')):
             raise ConnectionError('CF relay RPC check failed')
+        if os.environ.get("MUSE_CF_EVENT_STREAM") == "1":
+            spec = importlib.util.spec_from_file_location("_cf_muse_events", Path(__file__).with_name("events.py"))
+            events = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(events)
+            return events.EventGateway(client, lambda: module.RelayGateway(url, key))
         return client
     except Exception:
         client.close();raise ConnectionError('CF relay connection failed')from None
