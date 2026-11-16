@@ -16,6 +16,14 @@ export function unknownChannels(): ChannelHealthReport {
   return { weixin: unknown(), wecom: unknown() };
 }
 
+export function publishedChannelStates(report: ChannelHealthReport, now = Date.now()) {
+  const state = (channel: Channel) => {
+    const reading = report[channel];
+    return reading.valid_until !== null && now >= reading.valid_until ? "stale" : reading.state;
+  };
+  return { weixin: state("weixin"), wecom: state("wecom") };
+}
+
 function timestamp(value: unknown, now: number): number | null {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return null;
   const millis = value * 1000;

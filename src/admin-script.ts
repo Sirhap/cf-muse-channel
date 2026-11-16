@@ -10,6 +10,7 @@ export const adminScript = String.raw`
   let channelAccess = null;
   let channelRequest = null;
   let readings = null;
+  let publicReadings = null;
   const local = { timeZone: "Asia/Shanghai", hourCycle: "h23" };
   const clock = new Intl.DateTimeFormat("zh-CN", { ...local, hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const date = new Intl.DateTimeFormat("zh-CN", { ...local, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -27,10 +28,7 @@ export const adminScript = String.raw`
     channelRequest?.abort();
     channelRequest = null;
     readings = null;
-    for (const channel of channels) {
-      label(channel + "-state", "待查询");
-      label(channel + "-detail", "Worker 中转");
-    }
+    renderChannels();
     label("cookie-state", "待查询");
     byId("cookie-icon").hidden = true;
     label("cookie-note", "输入管理密钥后查看");
@@ -42,41 +40,50 @@ export const adminScript = String.raw`
   }
 
   function renderChannels() {
-    if (!readings) return;
     const display = {
       healthy: ["网关正常", "good"],
       reported: ["近期已连接", ""],
       disconnected: ["连接异常", "warning"],
-      stale: ["状态过期", "warning"],
+      stale: ["信号未更新", "warning"],
       unknown: ["状态未知", ""],
     };
     for (const channel of channels) {
-      const reading = readings[channel];
-      const state = hasTime(reading?.valid_until) && Date.now() >= reading.valid_until ? "stale" : reading?.state;
-      const [text, tone] = display[state] ?? display.unknown;
+      const reading = readings?.[channel];
+      const state = hasTime(reading?.valid_until) && Date.now() >= reading.valid_until
+        ? "stale" : reading?.state ?? publicReadings?.[channel];
+      const [text, tone] = display[state] ?? (publicReadings === null ? ["查询中", ""] : display.unknown);
       label(channel + "-state", text, tone);
-      label(channel + "-detail", hasTime(reading?.observed_at) ? "最近信号 " + stamp(reading.observed_at) : "没有可用的网关信号");
+      label(channel + "-detail", hasTime(reading?.observed_at) ? "最近信号 " + stamp(reading.observed_at) : "Worker 中转");
     }
+  }
+
+  async function loadPublicChannels() {
+    try {
+      const response = await fetch("/channel-health", {
+        cache: "no-store", credentials: "omit", redirect: "error", signal: AbortSignal.timeout(5000),
+      });
+      publicReadings = response.ok ? await response.json() : {};
+    } catch { publicReadings = {}; }
+    renderChannels();
   }
 
   async function refreshChannels(secret) {
     if (channelRequest) return;
     const request = new AbortController();
     channelRequest = request;
-    if (!readings) for (const channel of channels) label(channel + "-state", "查询中");
     try {
       const response = await fetch("/admin/channels", {
         headers: { Authorization: "Bearer " + secret }, cache: "no-store",
         credentials: "omit", redirect: "error", signal: request.signal,
       });
-      const data = response.ok ? await response.json() : {};
+      const data = response.ok ? await response.json() : null;
       if (channelRequest !== request) return;
       readings = data;
       if (response.status === 401) channelAccess = null;
       renderChannels();
     } catch {
       if (channelRequest !== request) return;
-      readings = {};
+      readings = null;
       renderChannels();
     } finally { if (channelRequest === request) channelRequest = null; }
   }
@@ -164,6 +171,13 @@ export const adminScript = String.raw`
   byId("check").addEventListener("click", () => void run(false));
   byId("clear").addEventListener("click", () => { cookie.value = ""; label("feedback", "已清空新 Cookie 输入。"); cookie.focus(); });
   setInterval(renderChannels, 5000);
+  setInterval(() => { if (!document.hidden) void loadPublicChannels(); }, 30_000);
   setInterval(() => { if (channelAccess && !document.hidden) void refreshChannels(channelAccess); }, 60_000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    if (channelAccess) void refreshChannels(channelAccess);
+    else void loadPublicChannels();
+  });
   addEventListener("pagehide", () => { form.reset(); clearStatus(); });
+  void loadPublicChannels();
 `;

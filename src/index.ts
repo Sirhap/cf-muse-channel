@@ -25,7 +25,7 @@ async function networkProbe(): Promise<Response> {
     note: "HTTP response received does not prove Cookie authentication or Noise RPC works." }, ok ? 200 : 502);
 }
 
-/** Route only authenticated credential operations into the per-account coordinator. */
+/** Require credentials for account operations; the public view only reads a sanitized snapshot. */
 export async function handleRequest(request: Request, env: Env,
   dispatch: (request: Request) => Promise<Response>): Promise<Response> {
   const url = new URL(request.url);
@@ -33,11 +33,15 @@ export async function handleRequest(request: Request, env: Env,
     return json({ ok: true, service: "cf-muse-channel", version: "1.0.0" });
   }
   if (url.search) return json({ error: "query_parameters_not_supported" }, 400);
-  if (url.pathname === "/admin" || url.pathname === "/admin/cookie" || url.pathname === "/admin/channels") {
+  if (["/admin", "/admin/cookie", "/admin/channels", "/channel-health"].includes(url.pathname)) {
     const key = env.MUSE_ADMIN_KEY ?? "";
     const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
     if ((!local && url.protocol !== "https:") || !validBearerKey(key) || key === env.DEMO_KEY) return json({ error: "not_found" }, 404);
     if (url.pathname === "/admin" && request.method === "GET") return adminPage(local);
+    if (url.pathname === "/channel-health") {
+      if (request.method !== "GET") return json({ error: "not_found" }, 404);
+      return dispatchSafely(new Request(url, { method: "GET" }), dispatch);
+    }
     const allowed = request.method === "GET" && url.pathname === "/admin/channels"
       || ["GET", "POST"].includes(request.method) && url.pathname === "/admin/cookie";
     if (!allowed) return json({ error: "not_found" }, 404);

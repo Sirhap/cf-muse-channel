@@ -1,4 +1,4 @@
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { expect, it, vi } from "vitest";
 import { channelHealth, inspectChannels } from "../src/channel-health";
 import { handleRequest } from "../src/index";
@@ -51,4 +51,33 @@ it("requires the admin key and does not offer a caller-selected status path", as
   expect(dispatch).not.toHaveBeenCalled();
   expect((await handleRequest(make("/admin/channels", admin), bindings, dispatch)).status).toBe(200);
   expect(dispatch.mock.calls).toHaveLength(1);
+});
+
+it("publishes only cached labels without authentication, upstream access, or alarm scheduling", async () => {
+  const bindings = { ...env, MUSE_ADMIN_KEY: "a-different-test-admin-key-of-sufficient-length" };
+  const stub = env.CREDENTIALS.getByName("public-channel-health");
+  await runInDurableObject(stub, async (instance, state) => {
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    try {
+      const dispatch = vi.fn((forwarded: Request) => instance.fetch(forwarded));
+      const url = "https://live.test/channel-health";
+      const read = (path = url, method = "GET") => handleRequest(new Request(path, { method }), bindings, dispatch);
+      expect((await read(url + "?path=other")).status).toBe(400);
+      expect((await read(url, "POST")).status).toBe(404);
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(await (await read()).json()).toEqual({ weixin: "unknown", wecom: "unknown" });
+
+      const at = Date.now();
+      state.storage.sql.exec("INSERT INTO service_events VALUES (?,?)", "channel_health", JSON.stringify({
+        at, data: {
+          weixin: { state: "healthy", observed_at: at - 30_000, valid_until: at + 120_000 },
+          wecom: { state: "healthy", observed_at: at - 180_000, valid_until: at - 30_000 },
+        },
+      }));
+      expect(await (await read()).json()).toEqual({ weixin: "healthy", wecom: "stale" });
+      expect(upstream).not.toHaveBeenCalled();
+      expect(await state.storage.getAlarm()).toBeNull();
+    } finally { vi.unstubAllGlobals(); }
+  });
 });
