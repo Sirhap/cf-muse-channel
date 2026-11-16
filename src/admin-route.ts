@@ -1,7 +1,7 @@
 import { AdminInputError, readAdminLogin } from "./admin-input";
 import { adminLoginPage, adminPage } from "./admin-page";
 import { adminSessionHash, adminSessionRedirect, adminSessionToken, newAdminSessionToken, type AdminSessions } from "./admin-session";
-import { authorized, json, matchesKey, validBearerKey } from "./http";
+import { authorized, json, matchesKey, validAdminKey } from "./http";
 
 export function isAdminRoute(path: string) {
   return path === "/admin" || path.startsWith("/admin/") || path === "/channel-health" || path === "/cookie-health";
@@ -12,7 +12,7 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
   const path = url.pathname;
   const key = env.MUSE_ADMIN_KEY ?? "";
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if ((!local && url.protocol !== "https:") || !validBearerKey(key) || key === env.DEMO_KEY) {
+  if ((!local && url.protocol !== "https:") || !validAdminKey(key) || key === env.DEMO_KEY) {
     return json({ error: "not_found" }, 404);
   }
   if (path === "/channel-health" || path === "/cookie-health") {
@@ -35,7 +35,7 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
     catch (error) {
       return adminLoginPage("无法读取管理密钥，请重新输入。", error instanceof AdminInputError ? error.status : 400);
     }
-    if (!(await matchesKey(password, key))) return adminLoginPage("管理密钥不正确。", 401);
+    if (!(await matchesKey(password, key, 12))) return adminLoginPage("管理密钥不正确。", 401);
     const newToken = newAdminSessionToken();
     await sessions.startAdminSession(await adminSessionHash(newToken, key));
     if (hash) await sessions.endAdminSession(hash);
@@ -52,7 +52,7 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
     || request.method === "POST" && path === "/admin/current-cookie"
     || ["GET", "POST"].includes(request.method) && path === "/admin/cookie";
   if (!allowed) return json({ error: "not_found" }, 404);
-  if (!(await authorized(request, key)) && !(await signedIn())) return json({ error: "unauthorized" }, 401);
+  if (!(await authorized(request, key, 12)) && !(await signedIn())) return json({ error: "unauthorized" }, 401);
   if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return json({ error: "origin_not_allowed" }, 403);
   const forwarded = new Request(request);
   forwarded.headers.delete("Authorization");

@@ -4,7 +4,7 @@ import { handleRequest } from "../src/index";
 import { adminSessionHash, ADMIN_SESSION_SECONDS } from "../src/admin-session";
 
 const origin = "https://login.test";
-const key = "a-strong-management-key-for-login-tests";
+const key = "fixture-admin..";
 const bindings = { ...env, MUSE_ADMIN_KEY: key };
 
 function login(password: string, source = origin) {
