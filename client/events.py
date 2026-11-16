@@ -51,6 +51,7 @@ class EventGateway:
     def _observe(self, session):
         while self._current(session):
             connection = None
+            accepted = False
             try:
                 connection = self._factory()
                 with self._lock:
@@ -60,7 +61,6 @@ class EventGateway:
                 stream = connection._open("chat.subscribe", body={
                     "session_id": session, "capabilities": ["chat_cancel", "delta_stream"],
                 })
-                self._changed()  # Reconcile any events missed before reconnect.
                 buffer = b""
                 while self._current(session):
                     frame = connection._read_frame()
@@ -75,6 +75,8 @@ class EventGateway:
                     if kind == "response" and not 200 <= response.status < 300:
                         raise ConnectionError("Subscription refused")
                     if kind == "response":
+                        accepted = True
+                        self._changed()  # Reconcile any events missed before reconnect.
                         print("[cf-events] subscription accepted", flush=True)
                     buffer += bytes(response.body if kind == "response" else response.data)
                     if len(buffer) > 2 * 1024 * 1024:
@@ -95,7 +97,8 @@ class EventGateway:
                         self._subscription = None
                 if connection:
                     connection.close()
-                self._changed()
+                if accepted and self._current(session):
+                    self._changed()
             if self._stopped.wait(5):
                 return
 

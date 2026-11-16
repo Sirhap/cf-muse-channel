@@ -73,6 +73,21 @@ class EventGatewayTests(unittest.TestCase):
         self.gateway.history_snapshot("sid", limit=40)
         self.assertEqual(self.client.call_json.call_count, 2)
 
+    def test_failed_subscription_retries_do_not_expire_history_early(self):
+        self.gateway._session = "sid"
+        self.gateway._factory.side_effect = ConnectionError("offline")
+        with patch.object(events.time, "monotonic", return_value=1):
+            self.gateway.history_snapshot("sid")
+        with patch.object(self.gateway._stopped, "wait", side_effect=[False, False, True]):
+            self.gateway._observe("sid")
+        self.assertEqual(self.gateway._factory.call_count, 3)
+        with patch.object(events.time, "monotonic", return_value=10):
+            self.gateway.history_snapshot("sid")
+        self.assertEqual(self.client.call_json.call_count, 1)
+        with patch.object(events.time, "monotonic", return_value=16):
+            self.gateway.history_snapshot("sid")
+        self.assertEqual(self.client.call_json.call_count, 2)
+
     def test_subscription_joins_split_records_and_uses_its_own_reader(self):
         self.gateway._session = "sid"
         connection = Mock()
@@ -88,7 +103,7 @@ class EventGatewayTests(unittest.TestCase):
         connection.close.side_effect = self.gateway._stopped.set
         self.gateway._factory = Mock(return_value=connection)
         self.gateway._observe("sid")
-        self.assertGreaterEqual(self.gateway._revision, 2)
+        self.assertEqual(self.gateway._revision, 2)
         self.assertTrue(self.gateway._wake.is_set())
         self.assertEqual(connection._read_frame.call_count, 2)
         self.client._read_frame.assert_not_called()
