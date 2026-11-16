@@ -5,12 +5,18 @@ export const adminScript = String.raw`
   const key = byId("key");
   const cookie = byId("cookie");
   const feedback = byId("feedback");
+  const currentCookie = byId("current-cookie");
+  const revealCookie = byId("reveal-cookie");
+  const copyCookie = byId("copy-cookie");
   const buttons = form.querySelectorAll("button");
   const channels = ["weixin", "wecom"];
   let channelAccess = null;
   let channelRequest = null;
   let readings = null;
   let publicReadings = null;
+  let publicCookieState = "loading";
+  let cookieRequest = null;
+  let hideTimer = null;
   const local = { timeZone: "Asia/Shanghai", hourCycle: "h23" };
   const clock = new Intl.DateTimeFormat("zh-CN", { ...local, hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const date = new Intl.DateTimeFormat("zh-CN", { ...local, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -24,14 +30,13 @@ export const adminScript = String.raw`
   }
 
   function clearStatus() {
+    hideCurrentCookie();
     channelAccess = null;
     channelRequest?.abort();
     channelRequest = null;
     readings = null;
     renderChannels();
-    label("cookie-state", "待查询");
-    byId("cookie-icon").hidden = true;
-    label("cookie-note", "输入管理密钥后查看");
+    renderPublicCookie();
     label("renewal-time", "—");
     label("renewal-note", "输入管理密钥后查看");
     label("approval-state", "待查询");
@@ -65,6 +70,90 @@ export const adminScript = String.raw`
       publicReadings = response.ok ? await response.json() : {};
     } catch { publicReadings = {}; }
     renderChannels();
+  }
+
+  function renderPublicCookie() {
+    const states = {
+      loading: "查询中",
+      healthy: "正常",
+      needs_login: "需要重新登录",
+      unconfigured: "尚未配置",
+      unverified: "待验证",
+    };
+    const healthy = publicCookieState === "healthy";
+    label("cookie-state", states[publicCookieState] ?? "状态未知",
+      healthy ? "good" : publicCookieState === "needs_login" ? "warning" : "");
+    byId("cookie-icon").hidden = !healthy;
+    label("cookie-note", "最近一次验证结果");
+  }
+
+  async function loadPublicCookie() {
+    try {
+      const response = await fetch("/cookie-health", {
+        cache: "no-store", credentials: "omit", redirect: "error", signal: AbortSignal.timeout(5000),
+      });
+      publicCookieState = response.ok ? (await response.json()).state : null;
+    } catch { publicCookieState = null; }
+    if (!channelAccess) renderPublicCookie();
+  }
+
+  function hideCurrentCookie() {
+    cookieRequest?.abort();
+    cookieRequest = null;
+    clearTimeout(hideTimer);
+    currentCookie.value = "";
+    currentCookie.hidden = true;
+    copyCookie.hidden = true;
+    revealCookie.textContent = "显示";
+    revealCookie.setAttribute("aria-expanded", "false");
+  }
+
+  async function toggleCurrentCookie() {
+    if (!currentCookie.hidden || cookieRequest) { hideCurrentCookie(); return; }
+    const secret = key.value.trim();
+    if (!secret) { label("feedback", "请输入管理密钥。", "warning"); key.focus(); return; }
+    const request = new AbortController();
+    cookieRequest = request;
+    revealCookie.textContent = "取消";
+    try {
+      const response = await fetch("/admin/current-cookie", {
+        method: "POST", headers: { Authorization: "Bearer " + secret },
+        cache: "no-store", credentials: "omit", redirect: "error", signal: request.signal,
+      });
+      const data = await response.json();
+      if (cookieRequest !== request) return;
+      if (!response.ok || typeof data.cookie !== "string" || !data.cookie) {
+        const message = response.status === 401 ? "管理密钥不正确。"
+          : response.status === 404 ? "尚无当前 Cookie。" : "暂时无法读取当前 Cookie。";
+        label("feedback", message, "warning");
+        hideCurrentCookie();
+        return;
+      }
+      label("feedback", "");
+      currentCookie.value = data.cookie;
+      currentCookie.hidden = false;
+      copyCookie.hidden = false;
+      revealCookie.textContent = "隐藏";
+      revealCookie.setAttribute("aria-expanded", "true");
+      hideTimer = setTimeout(hideCurrentCookie, 60_000);
+    } catch {
+      if (cookieRequest !== request) return;
+      label("feedback", "暂时无法读取当前 Cookie。", "warning");
+      hideCurrentCookie();
+    } finally {
+      if (cookieRequest === request) cookieRequest = null;
+    }
+  }
+
+  async function copyCurrentCookie() {
+    if (currentCookie.hidden || !currentCookie.value) return;
+    try {
+      await navigator.clipboard.writeText(currentCookie.value);
+      label("feedback", "已复制当前 Cookie。", "good");
+    } catch {
+      currentCookie.select();
+      label("feedback", "请手动复制已选中的 Cookie。");
+    }
   }
 
   async function refreshChannels(secret) {
@@ -123,6 +212,7 @@ export const adminScript = String.raw`
     const candidate = save ? cookie.value.trim() : null;
     if (!secret) { label("feedback", "请输入管理密钥。", "warning"); key.focus(); return; }
     if (save && !candidate) { label("feedback", "请粘贴新 Cookie。", "warning"); cookie.focus(); return; }
+    if (save) hideCurrentCookie();
     buttons.forEach((button) => button.disabled = true);
     key.readOnly = cookie.readOnly = true;
     label("feedback", save ? "正在验证 Muse 连接，请稍候…" : "正在查询状态…");
@@ -169,15 +259,19 @@ export const adminScript = String.raw`
   key.addEventListener("input", clearStatus);
   form.addEventListener("submit", (event) => { event.preventDefault(); void run(true); });
   byId("check").addEventListener("click", () => void run(false));
+  revealCookie.addEventListener("click", () => void toggleCurrentCookie());
+  copyCookie.addEventListener("click", () => void copyCurrentCookie());
   byId("clear").addEventListener("click", () => { cookie.value = ""; label("feedback", "已清空新 Cookie 输入。"); cookie.focus(); });
   setInterval(renderChannels, 5000);
   setInterval(() => { if (!document.hidden) void loadPublicChannels(); }, 30_000);
+  setInterval(() => { if (!document.hidden && !channelAccess) void loadPublicCookie(); }, 30_000);
   setInterval(() => { if (channelAccess && !document.hidden) void refreshChannels(channelAccess); }, 60_000);
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) return;
+    if (document.hidden) { hideCurrentCookie(); return; }
     if (channelAccess) void refreshChannels(channelAccess);
-    else void loadPublicChannels();
+    else { void loadPublicChannels(); void loadPublicCookie(); }
   });
   addEventListener("pagehide", () => { form.reset(); clearStatus(); });
   void loadPublicChannels();
+  void loadPublicCookie();
 `;

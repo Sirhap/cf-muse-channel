@@ -155,6 +155,28 @@ export class CookieController {
     });
   }
 
+  /** Public metadata only. Read the current record without initializing or renewing it. */
+  async publicCookieState() {
+    const { cookie, seed } = await this.seedConfig();
+    const saved = this.store.load();
+    if (!saved || saved.seed !== seed) return cookie ? "unverified" : "unconfigured";
+    if (saved.needsLogin) return "needs_login";
+    return this.status(saved).ok && cookieHeader(saved.cookies) ? "healthy" : "unverified";
+  }
+
+  /** Only the dedicated administrator route may export the Cookie used by the next connection. */
+  showCurrentCookie(): Promise<Response> {
+    return this.exclusive(async () => {
+      try {
+        const cookie = cookieHeader((await this.state()).cookies);
+        return cookie ? json({ cookie }) : json({ error: "cookie_not_configured" }, 404);
+      } catch (error) {
+        const { code } = this.failure(error);
+        return json({ error: code }, code === "cookie_not_configured" ? 404 : 503);
+      }
+    });
+  }
+
   /** Daily renewal and authenticated manual checks share the exact rotation path. */
   refresh() {
     return this.exclusive(async () => {

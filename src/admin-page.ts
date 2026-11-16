@@ -50,8 +50,8 @@ export function adminPage(local = false): Response {
     <section class="metrics" aria-label="凭证与续期概览">
       <article class="panel metric">
         <div class="metric-label">Cookie 状态</div>
-        <div class="metric-value"><span id="cookie-icon" class="health-icon" hidden>${icon("check")}</span><span id="cookie-state">待查询</span></div>
-        <div class="metric-note" id="cookie-note">输入管理密钥后查看</div>
+        <div class="metric-value"><span id="cookie-icon" class="health-icon" hidden>${icon("check")}</span><span id="cookie-state">查询中</span></div>
+        <div class="metric-note" id="cookie-note">最近一次验证结果</div>
       </article>
       <article class="panel metric">
         <div class="metric-label">每日续期</div>
@@ -74,9 +74,17 @@ export function adminPage(local = false): Response {
         <form id="editor" method="post" autocomplete="off">
           <label for="key">管理密钥</label>
           <input id="key" type="password" placeholder="输入管理密钥" maxlength="512" autocomplete="off" spellcheck="false" required>
+          <div class="current-cookie">
+            <div class="current-cookie-bar">
+              <label for="current-cookie">当前 Cookie</label>
+              <button class="quiet" id="reveal-cookie" type="button" aria-controls="current-cookie" aria-expanded="false">显示</button>
+              <button class="quiet" id="copy-cookie" type="button" hidden>复制</button>
+            </div>
+            <textarea id="current-cookie" readonly hidden autocomplete="off" spellcheck="false"></textarea>
+          </div>
           <label for="cookie">新 Cookie</label>
           <textarea id="cookie" placeholder="粘贴 Cookie 请求头…" maxlength="${MAX_COOKIE_LENGTH + 8}" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="hint" required></textarea>
-          <small id="hint">格式：<code>名称=值; 名称2=值2</code>。已保存的 Cookie 不会显示。</small>
+          <small id="hint">格式：<code>名称=值; 名称2=值2</code></small>
           <div class="actions">
             <button class="primary" type="submit">验证并保存</button>
             <button class="secondary" id="clear" type="button">清空</button>

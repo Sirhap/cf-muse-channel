@@ -124,6 +124,22 @@ describe("Worker Cookie management", () => {
       await instance.scheduledRenewal(1, "54 20 * * *");
       const lastAuth = fetcher.mock.calls.filter(([url]) => String(url).endsWith("/api/auth/check")).at(-1);
       expect(new Headers(lastAuth?.[1]?.headers).get("Cookie")).toBe("hatch_sess=rotated-candidate");
+
+      const current = origin + "/admin/current-cookie";
+      const reveal = (key: string, source = origin) => handleRequest(new Request(current, {
+        method: "POST", headers: { Authorization: "Bearer " + key, Origin: source },
+      }), bindings, dispatch);
+      expect((await reveal(bindings.DEMO_KEY)).status).toBe(401);
+      expect((await reveal(adminKey, "https://other.test")).status).toBe(403);
+      expect((await handleRequest(new Request(current), bindings, dispatch)).status).toBe(404);
+      const exported = await reveal(adminKey);
+      expect(exported.headers.get("Cache-Control")).toBe("no-store");
+      expect(await exported.json()).toEqual({ cookie: "hatch_sess=rotated-candidate" });
+
+      const callsBeforeStatus = fetcher.mock.calls.length;
+      const status = await handleRequest(new Request(origin + "/cookie-health"), bindings, dispatch);
+      expect(await status.json()).toEqual({ state: "healthy" });
+      expect(fetcher.mock.calls).toHaveLength(callsBeforeStatus);
     });
   });
 });

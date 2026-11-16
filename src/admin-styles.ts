@@ -65,6 +65,10 @@ export const adminStyles = `
   }
   input { margin-bottom: 15px; }
   textarea { min-height: 126px; resize: vertical; line-height: 1.65; }
+  .current-cookie { padding: 7px 11px; margin-bottom: 15px; background: #f2ebe4; border-radius: 8px; }
+  .current-cookie-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+  .current-cookie-bar label { margin: 0 auto 0 0; }
+  #current-cookie { min-height: 80px; font-family: ui-monospace, monospace; overflow-wrap: anywhere; font-size: 13px; }
   ::placeholder { color: #766b6b; opacity: 1; }
   :focus-visible { outline: 2px solid #b6422b; outline-offset: 3px; }
   .sidebar :focus-visible { outline-color: #f9b7a8; }

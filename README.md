@@ -108,7 +108,7 @@ export DEMO_KEY
 
 Worker 使用候选 Cookie 换证、建立 Noise 连接并调用只读 `sessions.list`。成功时才将候选及服务端轮换结果一次写入已有 Durable Object；失败不覆盖当前凭证记录。保存和定时续期共用串行更新，之后的新建连和自动续期会使用更新后保存的 Cookie。现有连接不主动断开。保持种子 Secret 和 VM ID 不变时，重启或代码部署会继续使用已保存值；重新上传不同的 Cookie 种子或更改 VM ID 会按原规则重新初始化。
 
-页面只返回验证时间、手动更换时间和脱敏结果。Cookie、管理密钥、网关令牌不回显，页面不使用浏览器持久存储。无须让 Worker 持有 Cloudflare 管理令牌。停用管理入口时移除 `MUSE_ADMIN_KEY`，已保存的 Cookie 和原有续期不受影响。
+首页自动显示最近一次 Cookie 验证结果。输入管理密钥后，点「当前 Cookie」旁的「显示」可查看并复制当前供新连接使用的 Cookie 请求头。60 秒后或切换页面时自动隐藏。状态接口只返回状态，页面不会回显管理密钥或网关令牌，页面不使用浏览器持久存储。无须让 Worker 持有 Cloudflare 管理令牌。停用管理入口时移除 `MUSE_ADMIN_KEY`，已保存的 Cookie 和原有续期不受影响。
 
 ## 部署独立 Worker
 

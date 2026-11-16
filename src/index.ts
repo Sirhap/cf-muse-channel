@@ -33,16 +33,17 @@ export async function handleRequest(request: Request, env: Env,
     return json({ ok: true, service: "cf-muse-channel", version: "1.0.0" });
   }
   if (url.search) return json({ error: "query_parameters_not_supported" }, 400);
-  if (["/admin", "/admin/cookie", "/admin/channels", "/channel-health"].includes(url.pathname)) {
+  if (["/admin", "/admin/cookie", "/admin/channels", "/admin/current-cookie", "/channel-health", "/cookie-health"].includes(url.pathname)) {
     const key = env.MUSE_ADMIN_KEY ?? "";
     const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
     if ((!local && url.protocol !== "https:") || !validBearerKey(key) || key === env.DEMO_KEY) return json({ error: "not_found" }, 404);
     if (url.pathname === "/admin" && request.method === "GET") return adminPage(local);
-    if (url.pathname === "/channel-health") {
+    if (url.pathname === "/channel-health" || url.pathname === "/cookie-health") {
       if (request.method !== "GET") return json({ error: "not_found" }, 404);
       return dispatchSafely(new Request(url, { method: "GET" }), dispatch);
     }
     const allowed = request.method === "GET" && url.pathname === "/admin/channels"
+      || request.method === "POST" && url.pathname === "/admin/current-cookie"
       || ["GET", "POST"].includes(request.method) && url.pathname === "/admin/cookie";
     if (!allowed) return json({ error: "not_found" }, 404);
     if (!(await authorized(request, key))) return json({ error: "unauthorized" }, 401);

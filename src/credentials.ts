@@ -32,6 +32,10 @@ export class MuseCredentials extends DurableObject<Env> {
     if (path === "/channel-health" && request.method === "GET") {
       return json(publishedChannelStates(this.channelSnapshot()?.data ?? unknownChannels()));
     }
+    if (path === "/cookie-health" && request.method === "GET") {
+      return json({ state: await this.controller.publicCookieState() });
+    }
+    if (path === "/admin/current-cookie" && request.method === "POST") return this.controller.showCurrentCookie();
     await this.ensureAlarm();
     if (path === "/admin/channels" && request.method === "GET") return json(await this.channels());
     if (path === "/admin/cookie") {
