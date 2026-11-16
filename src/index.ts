@@ -35,9 +35,9 @@ export async function handleRequest(request: Request, env: Env,
   if (url.search) return json({ error: "query_parameters_not_supported" }, 400);
   if (url.pathname === "/admin" || url.pathname === "/admin/cookie") {
     const key = env.MUSE_ADMIN_KEY ?? "";
-    const secure = url.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if (!secure || !validBearerKey(key) || key === env.DEMO_KEY) return json({ error: "not_found" }, 404);
-    if (url.pathname === "/admin" && request.method === "GET") return adminPage();
+    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if ((!local && url.protocol !== "https:") || !validBearerKey(key) || key === env.DEMO_KEY) return json({ error: "not_found" }, 404);
+    if (url.pathname === "/admin" && request.method === "GET") return adminPage(local);
     if (url.pathname !== "/admin/cookie" || !["GET", "POST"].includes(request.method)) return json({ error: "not_found" }, 404);
     if (!(await authorized(request, key))) return json({ error: "unauthorized" }, 401);
     if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return json({ error: "origin_not_allowed" }, 403);

@@ -29,9 +29,9 @@ export class MuseCredentials extends DurableObject<Env> {
     await this.ensureAlarm();
     const path = new URL(request.url).pathname;
     if (path === "/admin/cookie") {
-      if (request.method === "GET") return this.controller.adminStatus();
+      if (request.method === "GET") return this.dashboard(await this.controller.adminStatus());
       if (request.method !== "POST") return json({ error: "not_found" }, 404);
-      try { return await this.controller.replaceCookies(await readCookieInput(request)); }
+      try { return await this.dashboard(await this.controller.replaceCookies(await readCookieInput(request))); }
       catch (error) {
         if (error instanceof AdminInputError) return json({ error: error.code }, error.status);
         throw error;
@@ -48,6 +48,17 @@ export class MuseCredentials extends DurableObject<Env> {
 
   /** Cron invokes only renewal; no chat or user task is submitted. */
   refresh() { return this.controller.refresh(); }
+
+  /** Add the existing service summaries only to authenticated management responses. */
+  private async dashboard(response: Response) {
+    if (!response.ok) return response;
+    const [credentials, renewal, approval] = await Promise.all([
+      response.json<Record<string, unknown>>(),
+      this.serviceStatus("/renewal/scheduled-status").catch(() => null),
+      this.serviceStatus("/approvals/status").catch(() => null),
+    ]);
+    return json({ ...credentials, renewal, approval });
+  }
 
   private async serviceStatus(path: string) {
     const kind = path === "/approvals/status" ? "approval_poll" : "scheduled_renewal";

@@ -1,94 +1,117 @@
 import { MAX_COOKIE_LENGTH } from "./admin-input";
+import { adminScript } from "./admin-script";
+import { adminStyles } from "./admin-styles";
 
-export function adminPage(): Response {
+const paths = {
+  relay: '<path fill="currentColor" stroke="none" d="M1 9 16 1v9L1 18zm9 6 15-8v9l-15 8z"/>',
+  key: '<circle cx="8" cy="9" r="4"/><path d="m11 12 9 9m-3-3 3-3m-6 0 3-3"/>',
+  cloud: '<path d="M7 18a4 4 0 1 1 .4-8A6 6 0 0 1 19 11.5a3.3 3.3 0 0 1-.5 6.5Z"/>',
+  check: '<path d="m6 12 4 4 8-8"/>',
+  lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+  refresh: '<path d="M20 10a8 8 0 1 0-2 8m2-13v5h-5"/>',
+  play: '<circle cx="12" cy="12" r="10"/><path fill="currentColor" stroke="none" d="m10 7 7 5-7 5V7Z"/>',
+  wechat: '<path d="M13 16a9 9 0 0 1-5 .4L4 19l.5-3.8a6.5 6.5 0 0 1-2-4.6C2.5 6.9 5.7 4 10 4s7.5 2.9 7.5 6.6"/><path d="M22 15.2c0-2.8-2.6-4.9-5.8-4.9s-5.8 2.1-5.8 4.9 2.6 5 5.8 5a7 7 0 0 0 2.1-.3l2.6 1.7-.4-3a4.2 4.2 0 0 0 1.5-3.4Z"/><path stroke-width="2.5" d="M7 9h.1m5.6 0h.1m1 5.4h.1m4 0h.1"/>',
+  wecom: '<path d="M14 18a10 10 0 0 1-5.2.5L4 21l.8-4a7.6 7.6 0 0 1-2.3-5.3c0-4.1 3.6-7.4 8-7.4 4.5 0 8.1 3.3 8.1 7.4"/><circle cx="17.5" cy="16" r="2"/><circle cx="21" cy="19.5" r="1.6"/><circle cx="14.3" cy="21" r="1.6"/><path d="m16.7 17.9-1.6 1.8m3.7-2.4 1.1 1"/>',
+};
+
+function icon(name: keyof typeof paths) {
+  return `<svg class="icon" viewBox="0 0 26 26" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">${paths[name]}</svg>`;
+}
+
+export function adminPage(local = false): Response {
   const nonce = crypto.randomUUID();
   return new Response(`<!doctype html>
 <html lang="zh-CN">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Muse Worker · Cookie 管理</title>
-<style nonce="${nonce}">
-  :root { color-scheme: light dark; font: 16px/1.6 system-ui,sans-serif; }
-  body { margin: 0; padding: 2.5rem 1rem; }
-  main { max-width: 40rem; margin: auto; }
-  h1 { font-size: 1.65rem; margin: .25rem 0; }
-  p { margin: .5rem 0 1.25rem; }
-  form { border: 1px solid GrayText; border-radius: 12px; padding: 1.25rem; }
-  label { display: block; font-weight: 600; margin-top: 1rem; }
-  label:first-child { margin-top: 0; }
-  input, textarea { box-sizing: border-box; width: 100%; padding: .65rem; margin: .25rem 0; border: 1px solid GrayText; border-radius: 6px; font: inherit; }
-  textarea { min-height: 9rem; resize: vertical; font-family: monospace; }
-  small { display: block; }
-  .actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1rem; }
-  button { font: inherit; font-weight: 600; padding: .45rem .85rem; border-radius: 6px; border: 1px solid GrayText; cursor: pointer; }
-  button[type=submit] { color: white; background: #224fc0; border-color: #224fc0; }
-  button:disabled { opacity: .55; cursor: wait; }
-  #status { display: block; margin-top: 1rem; white-space: pre-line; overflow-wrap: anywhere; }
-</style>
-<main>
-  <h1>Muse Cookie 管理</h1>
-  <p>粘贴新的 Muse 请求 Cookie。Worker 会先验证 Muse 连接，成功后才保存；微信和企微之后的新连接会使用它。</p>
-  <form id="editor" method="post" autocomplete="off">
-    <label for="key">管理密钥</label>
-    <input id="key" type="password" maxlength="512" autocomplete="off" spellcheck="false" required>
-    <label for="cookie">新 Cookie</label>
-    <textarea id="cookie" maxlength="${MAX_COOKIE_LENGTH + 8}" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="hint" required></textarea>
-    <small id="hint">格式：name=value; name2=value2。这里不会显示已保存的 Cookie。</small>
-    <div class="actions">
-      <button type="submit">验证并保存</button>
-      <button id="check" type="button">查看当前状态</button>
-      <button id="clear" type="button">清空输入</button>
+<title>Cookie 管理 · Muse Relay</title>
+<style nonce="${nonce}">${adminStyles}</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar" aria-label="控制台导航">
+    <div class="brand">${icon("relay")}<span>Muse Relay</span></div>
+    <div class="sidebar-label">运行控制台</div>
+    <nav><a href="/admin" aria-current="page">${icon("key")}<span>Cookie 管理</span></a></nav>
+    <div class="sidebar-footer">${icon("cloud")}<span>Cloudflare Worker</span></div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div class="breadcrumb"><span>控制台</span><span aria-hidden="true">/</span><strong>Cookie 管理</strong></div>
+      <span class="environment"><span aria-hidden="true"></span>${local ? "本地预览" : "生产环境"}</span>
     </div>
-    <output id="status" role="status" aria-live="polite"></output>
-    <noscript>请开启 JavaScript 后使用管理页。</noscript>
-  </form>
-</main>
-<script nonce="${nonce}">
-  const form = document.getElementById("editor");
-  const key = document.getElementById("key");
-  const cookie = document.getElementById("cookie");
-  const status = document.getElementById("status");
-  const buttons = form.querySelectorAll("button");
-  const localTime = (time) => typeof time === "number"
-    ? new Date(time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) : "暂无";
-  async function run(save) {
-    if (!key.value.trim()) { key.reportValidity(); return; }
-    buttons.forEach((button) => button.disabled = true);
-    status.textContent = save ? "正在验证 Muse 连接，请稍候…" : "正在查询…";
-    try {
-      const headers = { Authorization: "Bearer " + key.value.trim() };
-      const options = { method: save ? "POST" : "GET", headers, cache: "no-store", credentials: "omit", redirect: "error" };
-      if (save) {
-        headers["Content-Type"] = "application/json";
-        options.body = JSON.stringify({ cookie: cookie.value.trim() });
-      }
-      const response = await fetch("/admin/cookie", options);
-      const result = await response.json();
-      if (!response.ok) {
-        if (response.status === 401) status.textContent = "管理密钥不正确。";
-        else if (response.status === 400 || response.status === 413) status.textContent = "Cookie 格式不正确或太长。请粘贴一行完整的 Cookie 请求头。";
-        else if (result.error === "cookie_not_saved") {
-          const code = result.last_error?.upstream_status;
-          status.textContent = code === 401 ? "Muse 拒绝了新 Cookie，旧配置没有被替换。" : "新 Cookie 未通过连接验证或未能保存，旧配置没有被替换。";
-        } else status.textContent = "暂时无法处理请求，请稍后再试。";
-        return;
-      }
-      if (save) cookie.value = "";
-      const current = !result.configured ? "尚未配置" : result.needs_login ? "需要重新登录" : result.ok ? "正常" : "尚未验证或最近检查失败";
-      status.textContent = [
-        save ? "新 Cookie 已验证并保存。" : "当前状态：" + current,
-        "最近验证（北京时间）：" + localTime(result.last_verified_at),
-        "最近手动更换（北京时间）：" + localTime(result.last_imported_at),
-      ].join("\\n");
-    } catch {
-      status.textContent = save ? "未收到保存结果。请先查看当前状态，再决定是否重试。" : "查询失败，请稍后再试。";
-    } finally { buttons.forEach((button) => button.disabled = false); }
-  }
-  form.addEventListener("submit", (event) => { event.preventDefault(); void run(true); });
-  document.getElementById("check").addEventListener("click", () => void run(false));
-  document.getElementById("clear").addEventListener("click", () => { form.reset(); status.textContent = ""; });
-  addEventListener("pagehide", () => { form.reset(); status.textContent = ""; });
-</script>
+    <header class="heading">
+      <h1>Cookie 管理</h1>
+      <p>管理 Muse 凭证与自动续期</p>
+    </header>
+
+    <section class="metrics" aria-label="凭证与续期概览">
+      <article class="panel metric">
+        <div class="metric-label">Cookie 状态</div>
+        <div class="metric-value"><span id="cookie-icon" class="health-icon" hidden>${icon("check")}</span><span id="cookie-state">待查询</span></div>
+        <div class="metric-note" id="cookie-note">输入管理密钥后查看</div>
+      </article>
+      <article class="panel metric">
+        <div class="metric-label">每日续期</div>
+        <div class="metric-value metric-time">04:54</div>
+        <div class="metric-note">北京时间</div>
+      </article>
+      <article class="panel metric">
+        <div class="metric-label">最近续期</div>
+        <div class="metric-value metric-time" id="renewal-time">—</div>
+        <div class="metric-note" id="renewal-note">输入管理密钥后查看</div>
+      </article>
+    </section>
+
+    <div class="content-grid">
+      <section class="panel editor" aria-labelledby="edit-title">
+        <div class="panel-heading">
+          <h2 id="edit-title">手动更换 Cookie</h2>
+          <p>验证通过后才会替换当前 Cookie。</p>
+        </div>
+        <form id="editor" method="post" autocomplete="off">
+          <label for="key">管理密钥</label>
+          <input id="key" type="password" placeholder="输入管理密钥" maxlength="512" autocomplete="off" spellcheck="false" required>
+          <label for="cookie">新 Cookie</label>
+          <textarea id="cookie" placeholder="粘贴 Cookie 请求头…" maxlength="${MAX_COOKIE_LENGTH + 8}" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="hint" required></textarea>
+          <small id="hint">格式：<code>名称=值; 名称2=值2</code>。已保存的 Cookie 不会显示。</small>
+          <div class="actions">
+            <button class="primary" type="submit">验证并保存</button>
+            <button class="secondary" id="clear" type="button">清空</button>
+            <button class="quiet" id="check" type="button">${icon("refresh")}查看状态</button>
+          </div>
+          <output id="feedback" role="status" aria-live="polite"></output>
+          <noscript>请开启 JavaScript 后使用管理页。</noscript>
+        </form>
+      </section>
+
+      <aside class="side-panels" aria-label="渠道与审批">
+        <section class="panel overview" aria-labelledby="channels-title">
+          <div class="panel-heading">
+            <h2 id="channels-title">渠道连接</h2>
+            <span class="relay-mark">${icon("relay")}</span>
+          </div>
+          <ul class="channels">
+            <li>${icon("wechat")}<span>微信</span><span class="tag">Worker 中转</span></li>
+            <li>${icon("wecom")}<span>企业微信</span><span class="tag">Worker 中转</span></li>
+          </ul>
+          <p class="muted">当前显示接入方式。</p>
+        </section>
+        <section class="panel overview approvals" aria-labelledby="approvals-title">
+          <div class="panel-heading"><h2 id="approvals-title">Worker 自动审批</h2></div>
+          <div class="approval-state">${icon("play")}<strong id="approval-state">待查询</strong></div>
+          <p class="muted" id="approval-note">仅自动处理符合规则的请求。</p>
+        </section>
+      </aside>
+    </div>
+
+    <footer class="footer"><span>${icon("lock")}凭证仅用于 Muse 验证与连接</span><span>所有时间均为北京时间</span></footer>
+  </main>
+</div>
+<script nonce="${nonce}">${adminScript}</script>
+</body>
 </html>`, {
     headers: {
       "Content-Type": "text/html; charset=utf-8",

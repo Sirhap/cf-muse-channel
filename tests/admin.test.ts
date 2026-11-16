@@ -44,6 +44,33 @@ describe("Worker Cookie management", () => {
     await expect(readCookieInput(request("a=" + "b".repeat(40_000)))).rejects.toMatchObject({ status: 413 });
   });
 
+  it("shows the persisted daily Cron and approval state only after admin authentication", async () => {
+    const stub = env.CREDENTIALS.getByName("admin-dashboard-stored-status");
+    await runInDurableObject(stub, async (instance) => {
+      const fetcher = vi.fn(async () => Response.json({ access_token: "fixture-only" }));
+      vi.stubGlobal("fetch", fetcher);
+      await instance.scheduledRenewal(1794776058075, "54 20 * * *");
+      const dispatch = vi.fn((forwarded: Request) => instance.fetch(forwarded));
+      const endpoint = origin + "/admin/cookie";
+      expect((await handleRequest(new Request(endpoint), bindings, dispatch)).status).toBe(401);
+      expect(dispatch).not.toHaveBeenCalled();
+      const response = await handleRequest(new Request(endpoint, {
+        headers: { Authorization: "Bearer " + adminKey },
+      }), bindings, dispatch);
+      const payload = await response.json();
+      expect(payload).toMatchObject({
+        configured: true, ok: true,
+        renewal: {
+          daily_cron_utc: "54 20 * * *",
+          last_event: { source: "cloudflare_scheduled", scheduled_time: 1794776058075, result: { ok: true } },
+        },
+        approval: { enabled: false, last_event: null },
+      });
+      expect(JSON.stringify(payload)).not.toContain("fixture-only");
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("keeps the old row byte for byte when candidate authentication or Noise validation fails", async () => {
     const stub = env.CREDENTIALS.getByName("admin-preserves-active-row");
     await runInDurableObject(stub, async (instance, state) => {
