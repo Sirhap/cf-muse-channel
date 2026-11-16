@@ -87,6 +87,9 @@ export const adminStyles = `
   .channels li + li { border-top: 1px solid var(--line); }
   .channels .icon { width: 27px; height: 27px; }
   .tag { background: #ece6de; color: #544448; padding: 2px 9px; border-radius: 20px; font-size: 12px; white-space: nowrap; }
+  .channel-detail { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+  .tag[data-tone="good"] { background: #dce8ce; color: var(--green); }
+  .tag[data-tone="warning"] { background: #f3e2d7; color: var(--warning); }
   .approval-state { display: flex; align-items: center; gap: 9px; font-size: 20px; margin: 13px 0 4px; }
   [data-tone="good"] { color: var(--green); }
   [data-tone="warning"] { color: var(--warning); }

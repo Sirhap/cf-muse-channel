@@ -6,6 +6,10 @@ export const adminScript = String.raw`
   const cookie = byId("cookie");
   const feedback = byId("feedback");
   const buttons = form.querySelectorAll("button");
+  const channels = ["weixin", "wecom"];
+  let channelAccess = null;
+  let channelRequest = null;
+  let readings = null;
   const local = { timeZone: "Asia/Shanghai", hourCycle: "h23" };
   const clock = new Intl.DateTimeFormat("zh-CN", { ...local, hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const date = new Intl.DateTimeFormat("zh-CN", { ...local, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -19,6 +23,14 @@ export const adminScript = String.raw`
   }
 
   function clearStatus() {
+    channelAccess = null;
+    channelRequest?.abort();
+    channelRequest = null;
+    readings = null;
+    for (const channel of channels) {
+      label(channel + "-state", "待查询");
+      label(channel + "-detail", "Worker 中转");
+    }
     label("cookie-state", "待查询");
     byId("cookie-icon").hidden = true;
     label("cookie-note", "输入管理密钥后查看");
@@ -27,6 +39,46 @@ export const adminScript = String.raw`
     label("approval-state", "待查询");
     label("approval-note", "仅自动处理符合规则的请求。");
     label("feedback", "");
+  }
+
+  function renderChannels() {
+    if (!readings) return;
+    const display = {
+      healthy: ["网关正常", "good"],
+      reported: ["近期已连接", ""],
+      disconnected: ["连接异常", "warning"],
+      stale: ["状态过期", "warning"],
+      unknown: ["状态未知", ""],
+    };
+    for (const channel of channels) {
+      const reading = readings[channel];
+      const state = hasTime(reading?.valid_until) && Date.now() >= reading.valid_until ? "stale" : reading?.state;
+      const [text, tone] = display[state] ?? display.unknown;
+      label(channel + "-state", text, tone);
+      label(channel + "-detail", hasTime(reading?.observed_at) ? "最近信号 " + stamp(reading.observed_at) : "没有可用的网关信号");
+    }
+  }
+
+  async function refreshChannels(secret) {
+    if (channelRequest) return;
+    const request = new AbortController();
+    channelRequest = request;
+    if (!readings) for (const channel of channels) label(channel + "-state", "查询中");
+    try {
+      const response = await fetch("/admin/channels", {
+        headers: { Authorization: "Bearer " + secret }, cache: "no-store",
+        credentials: "omit", redirect: "error", signal: request.signal,
+      });
+      const data = response.ok ? await response.json() : {};
+      if (channelRequest !== request) return;
+      readings = data;
+      if (response.status === 401) channelAccess = null;
+      renderChannels();
+    } catch {
+      if (channelRequest !== request) return;
+      readings = {};
+      renderChannels();
+    } finally { if (channelRequest === request) channelRequest = null; }
   }
 
   function renderSummary(result) {
@@ -95,6 +147,8 @@ export const adminScript = String.raw`
       }
       if (save) cookie.value = "";
       renderSummary(result);
+      channelAccess = secret;
+      void refreshChannels(secret);
       const imported = hasTime(result.last_imported_at) ? "\n最近手动更换：" + stamp(result.last_imported_at) : "";
       label("feedback", (save ? "新 Cookie 已验证并保存。" : "状态已更新。") + imported, save ? "good" : "");
     } catch {
@@ -109,5 +163,7 @@ export const adminScript = String.raw`
   form.addEventListener("submit", (event) => { event.preventDefault(); void run(true); });
   byId("check").addEventListener("click", () => void run(false));
   byId("clear").addEventListener("click", () => { cookie.value = ""; label("feedback", "已清空新 Cookie 输入。"); cookie.focus(); });
+  setInterval(renderChannels, 5000);
+  setInterval(() => { if (channelAccess && !document.hidden) void refreshChannels(channelAccess); }, 60_000);
   addEventListener("pagehide", () => { form.reset(); clearStatus(); });
 `;

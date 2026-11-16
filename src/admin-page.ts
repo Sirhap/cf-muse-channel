@@ -94,10 +94,10 @@ export function adminPage(local = false): Response {
             <span class="relay-mark">${icon("relay")}</span>
           </div>
           <ul class="channels">
-            <li>${icon("wechat")}<span>微信</span><span class="tag">Worker 中转</span></li>
-            <li>${icon("wecom")}<span>企业微信</span><span class="tag">Worker 中转</span></li>
+            <li>${icon("wechat")}<div><strong>微信</strong><span class="channel-detail" id="weixin-detail">Worker 中转</span></div><span class="tag" id="weixin-state">待查询</span></li>
+            <li>${icon("wecom")}<div><strong>企业微信</strong><span class="channel-detail" id="wecom-detail">Worker 中转</span></div><span class="tag" id="wecom-state">待查询</span></li>
           </ul>
-          <p class="muted">当前显示接入方式。</p>
+          <p class="muted">显示网关连接状态；实际收发以渠道回执为准。</p>
         </section>
         <section class="panel overview approvals" aria-labelledby="approvals-title">
           <div class="panel-heading"><h2 id="approvals-title">Worker 自动审批</h2></div>

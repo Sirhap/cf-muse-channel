@@ -1,12 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import { AdminInputError, readCookieInput } from "./admin-input";
 import { parsePolicy, pollApprovals } from "./approval-policy";
+import { inspectChannels, unknownChannels, type ChannelHealthReport } from "./channel-health";
 import { json } from "./http";
 import { CookieController, type CredentialState, type CredentialStore } from "./muse";
 
 /** One coordinator owns this personal account's rotating Cookie and renewal requests. */
 export class MuseCredentials extends DurableObject<Env> {
   private readonly controller: CookieController;
+  private channelProbe?: Promise<ChannelHealthReport>;
+  private channelCache?: { at: number; data: ChannelHealthReport };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -28,6 +31,7 @@ export class MuseCredentials extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     await this.ensureAlarm();
     const path = new URL(request.url).pathname;
+    if (path === "/admin/channels" && request.method === "GET") return json(await this.channels());
     if (path === "/admin/cookie") {
       if (request.method === "GET") return this.dashboard(await this.controller.adminStatus());
       if (request.method !== "POST") return json({ error: "not_found" }, 404);
@@ -48,6 +52,18 @@ export class MuseCredentials extends DurableObject<Env> {
 
   /** Cron invokes only renewal; no chat or user task is submitted. */
   refresh() { return this.controller.refresh(); }
+
+  private async channels() {
+    if (this.channelCache && Date.now() - this.channelCache.at < 15_000) return this.channelCache.data;
+    this.channelProbe ??= this.controller.useRpc(inspectChannels)
+      .catch(() => unknownChannels())
+      .then((data) => {
+        this.channelCache = { at: Date.now(), data };
+        this.channelProbe = undefined;
+        return data;
+      });
+    return this.channelProbe;
+  }
 
   /** Add the existing service summaries only to authenticated management responses. */
   private async dashboard(response: Response) {

@@ -122,7 +122,7 @@ export class MuseRpc {
     } catch (error) { frames.close(); throw error; }
   }
   close() { this.frames.close(); }
-  async call(path: string, service = 1, method = 'GET', body?: unknown): Promise<unknown> {
+  async call(path: string, service = 1, method = 'GET', body?: unknown, timeout = 20000): Promise<unknown> {
     const stream = this.stream++;
     let request = join(b(1, method), b(2, path), b(3, join(b(1, 'x-request-id'), b(2, crypto.randomUUID()))), n(5, 1));
     if (body !== undefined) request = join(request, b(3, join(b(1, 'content-type'), b(2, 'application/json'))), b(4, JSON.stringify(body)));
@@ -130,7 +130,7 @@ export class MuseRpc {
     const envelope = join(n(1, service), b(2, frame));
     const transport = join(n(1, BigInt(stream)), n(2, 0), n(3, 1), b(4, envelope));
     this.frames.socket.send(owned(await this.noise.encrypt(transport)));
-    const deadline = Date.now() + 20000;
+    const deadline = Date.now() + timeout;
     let status = 0, length = 0;
     const chunks: Uint8Array[] = [];
     while (Date.now() < deadline) {
