@@ -41,7 +41,7 @@ npm run build
 npm run dev
 ```
 
-完整自动化回归使用 `npm run test:all`（当前 177 项测试，含本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
+完整自动化回归使用 `npm run test:all`（当前 181 项测试，含本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
 
 默认使用 `http://127.0.0.1:8787`。本地运行时的出站来自本机，不证明 CF 云端出站可用。
 
@@ -98,9 +98,17 @@ export DEMO_KEY
 .venv/bin/python client/probe.py renew --url https://your-worker.example.com
 ```
 
-明确认证 401 会标记 `needs_login=true`，停止后续自动认证，等待新凭证导入。网络失败保留 Cookie 并记录网络错误；普通 403 不直接归因为过期。导入新凭证并重新上传 Secrets 后，可调用 `renew` 核查恢复。状态接口只返回检查/轮换时间和错误代码，不返回 Cookie、令牌或种子指纹。
+明确认证 401 会标记 `needs_login=true`，停止后续自动认证，等待新凭证导入。网络失败保留 Cookie 并记录网络错误；普通 403 不直接归因为过期。可以通过管理页验证并保存新 Cookie，也可以重新上传 Secrets 后调用 `renew` 核查恢复。状态接口只返回检查/轮换时间和错误代码，不返回 Cookie、令牌或种子指纹。
 
 部署需要 SQLite Durable Objects；默认配置创建独立的 `MuseCredentials` 类和命名空间，只用于本账号凭证，与旧项目的聊天房间无关。
+
+## 手动更换 Cookie
+
+在 Worker 的 Secret 中设置独立随机的 `MUSE_ADMIN_KEY`（32–512 个可打印 ASCII 字符，不含空格，且与 `DEMO_KEY` 不同），然后打开自定义域名的 `/admin`。输入管理密钥后可查询当前状态，或粘贴 Muse 请求头的 `name=value; name2=value2` 并点 **验证并保存**。可带开头的 `Cookie:`；不要粘贴整个导出文件。未设置有效管理密钥时，管理路由返回 404。
+
+Worker 使用候选 Cookie 换证、建立 Noise 连接并调用只读 `sessions.list`。成功时才将候选及服务端轮换结果一次写入已有 Durable Object；失败不覆盖当前凭证记录。保存和定时续期共用串行更新，之后的新建连和自动续期会使用更新后保存的 Cookie。现有连接不主动断开。保持种子 Secret 和 VM ID 不变时，重启或代码部署会继续使用已保存值；重新上传不同的 Cookie 种子或更改 VM ID 会按原规则重新初始化。
+
+页面只返回验证时间、手动更换时间和脱敏结果。Cookie、管理密钥、网关令牌不回显，页面不使用浏览器持久存储。无须让 Worker 持有 Cloudflare 管理令牌。停用管理入口时移除 `MUSE_ADMIN_KEY`，已保存的 Cookie 和原有续期不受影响。
 
 ## 部署独立 Worker
 

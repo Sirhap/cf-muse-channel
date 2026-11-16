@@ -1,4 +1,5 @@
-import { authorized, json } from "./http";
+import { adminPage } from "./admin-page";
+import { authorized, json, validBearerKey } from "./http";
 export { MuseCredentials } from "./credentials";
 
 const MUSE_ORIGIN = "https://muse.ai";
@@ -32,6 +33,19 @@ export async function handleRequest(request: Request, env: Env,
     return json({ ok: true, service: "cf-muse-channel", version: "1.0.0" });
   }
   if (url.search) return json({ error: "query_parameters_not_supported" }, 400);
+  if (url.pathname === "/admin" || url.pathname === "/admin/cookie") {
+    const key = env.MUSE_ADMIN_KEY ?? "";
+    const secure = url.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (!secure || !validBearerKey(key) || key === env.DEMO_KEY) return json({ error: "not_found" }, 404);
+    if (url.pathname === "/admin" && request.method === "GET") return adminPage();
+    if (url.pathname !== "/admin/cookie" || !["GET", "POST"].includes(request.method)) return json({ error: "not_found" }, 404);
+    if (!(await authorized(request, key))) return json({ error: "unauthorized" }, 401);
+    if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return json({ error: "origin_not_allowed" }, 403);
+    // Keep the admin key at the public Worker boundary.
+    const forwarded = new Request(request);
+    forwarded.headers.delete("Authorization");
+    return dispatchSafely(forwarded, dispatch);
+  }
   if (!(await authorized(request, env.DEMO_KEY ?? ""))) return json({ error: "unauthorized" }, 401);
   if (url.pathname === "/probe/network" && request.method === "POST") return networkProbe();
   if (url.pathname === "/ws" && request.method === "GET"
@@ -41,6 +55,10 @@ export async function handleRequest(request: Request, env: Env,
   const allowed = (request.method === "POST" && ["/probe/cookie", "/credentials/refresh", "/approvals/poll", "/probe/worker-rpc"].includes(url.pathname))
     || (request.method === "GET" && ["/ws", "/credentials/status", "/approvals/status", "/renewal/scheduled-status"].includes(url.pathname));
   if (!allowed) return json({ error: "not_found" }, 404);
+  return dispatchSafely(request, dispatch);
+}
+
+async function dispatchSafely(request: Request, dispatch: (request: Request) => Promise<Response>) {
   try {
     return await dispatch(request);
   } catch {

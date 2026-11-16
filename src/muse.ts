@@ -10,6 +10,7 @@ type SafeFailure = { stage: string; error: string; upstream_status?: number };
 export interface CredentialState {
   seed: string;
   cookies: CookieJar;
+  importedAt?: number;
   lastCheckedAt: number | null;
   lastVerifiedAt: number | null;
   lastRotatedAt: number | null;
@@ -49,7 +50,7 @@ export class CookieController {
     }
   }
 
-  private async state(): Promise<CredentialState> {
+  private async seedConfig() {
     const hasParts = Boolean(this.env.MUSE_COOKIE_PART_1);
     if (hasParts && typeof this.env.MUSE_COOKIE_PART_2 !== "string") {
       throw new ProbeError("configuration", "cookie_parts_incomplete");
@@ -57,11 +58,16 @@ export class CookieController {
     const cookie = (hasParts
       ? `${this.env.MUSE_COOKIE_PART_1}${this.env.MUSE_COOKIE_PART_2}`
       : this.env.MUSE_COOKIE ?? "").trim();
-    if (!cookie) throw new ProbeError("configuration", "cookie_not_configured");
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([cookie, this.env.MUSE_VM_ID ?? ""])));
     const seed = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return { cookie, seed };
+  }
+
+  private async state(): Promise<CredentialState> {
+    const { cookie, seed } = await this.seedConfig();
     const previous = this.store.load();
     if (previous?.seed === seed) return previous;
+    if (!cookie) throw new ProbeError("configuration", "cookie_not_configured");
     const state: CredentialState = {
       seed, cookies: initialCookies(cookie), lastCheckedAt: null, lastVerifiedAt: null,
       lastRotatedAt: null, lastError: null, needsLogin: false,
@@ -70,19 +76,19 @@ export class CookieController {
     return state;
   }
 
-  private session(state: CredentialState): CookieSession {
+  private session(state: CredentialState, checkpoint = (next: CredentialState) => this.persist(next)): CookieSession {
     return {
       header: () => cookieHeader(state.cookies),
       apply: (headers) => {
         const cookies = applySetCookies(state.cookies, headers);
         if (JSON.stringify(cookies) === JSON.stringify(state.cookies)) return;
         const next = { ...state, cookies, lastRotatedAt: Date.now() };
-        this.persist(next);
+        checkpoint(next);
         Object.assign(state, next);
       },
       verified: () => {
         const next = { ...state, lastVerifiedAt: Date.now(), lastError: null, needsLogin: false };
-        this.persist(next);
+        checkpoint(next);
         Object.assign(state, next);
       },
     };
@@ -94,6 +100,7 @@ export class CookieController {
       configured: true, needs_login: state.needsLogin,
       last_checked_at: state.lastCheckedAt, last_verified_at: state.lastVerifiedAt,
       last_rotated_at: state.lastRotatedAt, last_error: state.lastError,
+      last_imported_at: state.importedAt ?? null,
     };
   }
 
@@ -106,6 +113,46 @@ export class CookieController {
     // A generic 403 can be an origin/proxy denial; do not mislabel it as expired credentials.
     state.needsLogin = state.needsLogin || (failure.stage === "/api/auth/check" && failure.upstreamStatus === 401);
     this.persist(state);
+  }
+
+  /** Verify the candidate in memory. Publish the entire new jar in one write after a real RPC. */
+  replaceCookies(cookies: CookieJar): Promise<Response> {
+    return this.exclusive(async () => {
+      let rpc: MuseRpc | undefined;
+      try {
+        const { seed } = await this.seedConfig();
+        const candidate: CredentialState = {
+          seed, cookies, lastCheckedAt: Date.now(), lastVerifiedAt: null,
+          lastRotatedAt: null, lastError: null, needsLogin: false,
+        };
+        const upstream = await connectMuse(this.session(candidate, () => {}), this.env);
+        try {
+          rpc = await MuseRpc.connect(upstream.webSocket!);
+          await rpc.call("/api/session/list", 0);
+        } catch {
+          throw new ProbeError("noise_rpc", "verification_failed");
+        }
+        candidate.importedAt = Date.now();
+        candidate.lastVerifiedAt = candidate.importedAt;
+        this.persist(candidate);
+        return json(this.status(candidate));
+      } catch (error) {
+        const failure = this.failure(error);
+        return json({ ok: false, error: "cookie_not_saved",
+          last_error: { stage: failure.stage, error: failure.code, upstream_status: failure.upstreamStatus } }, 502);
+      } finally { rpc?.close(); }
+    });
+  }
+
+  adminStatus(): Promise<Response> {
+    return this.exclusive(async () => {
+      try { return json(this.status(await this.state())); }
+      catch (error) {
+        const failure = this.failure(error);
+        if (failure.code === "cookie_not_configured") return json({ ok: false, configured: false, needs_login: false });
+        return json({ ok: false, error: failure.code }, 503);
+      }
+    });
   }
 
   /** Daily renewal and authenticated manual checks share the exact rotation path. */

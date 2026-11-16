@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { AdminInputError, readCookieInput } from "./admin-input";
 import { parsePolicy, pollApprovals } from "./approval-policy";
 import { json } from "./http";
 import { CookieController, type CredentialState, type CredentialStore } from "./muse";
@@ -27,6 +28,15 @@ export class MuseCredentials extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     await this.ensureAlarm();
     const path = new URL(request.url).pathname;
+    if (path === "/admin/cookie") {
+      if (request.method === "GET") return this.controller.adminStatus();
+      if (request.method !== "POST") return json({ error: "not_found" }, 404);
+      try { return await this.controller.replaceCookies(await readCookieInput(request)); }
+      catch (error) {
+        if (error instanceof AdminInputError) return json({ error: error.code }, error.status);
+        throw error;
+      }
+    }
     if (path === "/approvals/status" || path === "/renewal/scheduled-status") return json(await this.serviceStatus(path));
     if (path === "/approvals/poll") return json(await this.poll());
     if (path === "/probe/worker-rpc") {

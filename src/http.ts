@@ -5,6 +5,10 @@ export function json(value: unknown, status = 200): Response {
   });
 }
 
+export function validBearerKey(key: string): boolean {
+  return /^[!-~]{32,512}$/.test(key);
+}
+
 export async function authorized(request: Request, key: string): Promise<boolean> {
   const header = request.headers.get("Authorization") ?? "";
   if (!header.startsWith("Bearer ")) return false;
