@@ -54,16 +54,28 @@ def history_events(history: object) -> list[dict]:
 class RelayGateway(Gateway):
     """Use the pinned SDK's framing/RPC over a Worker-authenticated WebSocket."""
 
-    def __init__(self, base_url: str, demo_key: str):
+    def __init__(self, base_url: str, demo_key: str, ws_factory=None):
         target = worker_origin(base_url)
         url = urlunsplit(("wss" if target.scheme == "https" else "ws", target.netloc, "/ws", "", ""))
-        self.ws = WebSocket()
+        if ws_factory is None:
+            self.ws = WebSocket()
+            connect_kwargs = dict(headers={"Authorization": f"Bearer {demo_key}"},
+                                  impersonate="chrome", timeout=75, verify=True,
+                                  http_version=CurlHttpVersion.V1_1)
+        else:
+            # websockets.sync.client transport (MUSE_CF_EVENT_STREAM path
+            # only): the VM egress path adds "Connection: upgrade, close"
+            # to the 101 response and curl_cffi refuses that upgrade, while
+            # the websockets client accepts it. Same URL/key, same egress
+            # proxy, TLS verification on; curl-only options are ignored by
+            # the wrapper.
+            self.ws = ws_factory()
+            connect_kwargs = dict(headers={"Authorization": f"Bearer {demo_key}"},
+                                  timeout=75)
         try:
             # Older curl_cffi versions otherwise negotiate HTTP/2 and can return
             # an upgrade response without a usable connect-only WebSocket socket.
-            self.ws.connect(url, headers={"Authorization": f"Bearer {demo_key}"},
-                            impersonate="chrome", timeout=75, verify=True,
-                            http_version=CurlHttpVersion.V1_1)
+            self.ws.connect(url, **connect_kwargs)
             self.noise = NoiseConnection.from_name(b"Noise_XX_25519_AESGCM_SHA256")
             self.noise.set_as_initiator()
             self.noise.set_keypair_from_private_bytes(Keypair.STATIC, os.urandom(32))

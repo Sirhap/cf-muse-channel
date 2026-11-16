@@ -1,1 +1,2 @@
 muse-cli @ https://github.com/nikships/muse-cli/archive/2e42aeccbef71437f4ccd4faa626414f2461be7b.tar.gz
+websockets>=17.1,<18

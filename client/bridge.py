@@ -28,16 +28,26 @@ def connect(config_path=None):
         if spec is None or spec.loader is None:raise ImportError('CF relay adapter unavailable')
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);sys.modules[module_name]=module
     module.worker_origin(url)
-    client=module.RelayGateway(url,key)
+    ws_factory=None
+    if os.environ.get("MUSE_CF_EVENT_STREAM") == "1":
+        # websockets.sync.client transport for both sockets on this path:
+        # the VM egress path adds "Connection: upgrade, close" to the 101
+        # response and curl_cffi refuses that upgrade. Same URL/key, same
+        # egress proxy, TLS verification on.
+        wspec = importlib.util.spec_from_file_location("_cf_muse_ws_transport", Path(__file__).with_name("ws_transport.py"))
+        ws_transport = importlib.util.module_from_spec(wspec)
+        wspec.loader.exec_module(ws_transport)
+        ws_factory = ws_transport.SyncWebSocket
+    client=module.RelayGateway(url,key,ws_factory=ws_factory)
     try:
         result=client.call_json('sessions.list',timeout=15)
         if not isinstance(result,(dict,list)) or isinstance(result,dict)and(result.get('ok')is False or result.get('error')):
             raise ConnectionError('CF relay RPC check failed')
-        if os.environ.get("MUSE_CF_EVENT_STREAM") == "1":
+        if ws_factory is not None:
             spec = importlib.util.spec_from_file_location("_cf_muse_events", Path(__file__).with_name("events.py"))
             events = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(events)
-            return events.EventGateway(client, lambda: module.RelayGateway(url, key))
+            return events.EventGateway(client, lambda: module.RelayGateway(url, key, ws_factory=ws_factory))
         return client
     except Exception:
         client.close();raise ConnectionError('CF relay connection failed')from None
