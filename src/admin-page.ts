@@ -18,9 +18,9 @@ function icon(name: keyof typeof paths) {
   return `<svg class="icon" viewBox="0 0 26 26" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">${paths[name]}</svg>`;
 }
 
-export function adminPage(local = false): Response {
+export function adminPage(local = false, signedIn = false): Response {
   const nonce = crypto.randomUUID();
-  return new Response(`<!doctype html>
+  return htmlResponse(`<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -28,7 +28,7 @@ export function adminPage(local = false): Response {
 <title>Cookie 管理 · Muse Relay</title>
 <style nonce="${nonce}">${adminStyles}</style>
 </head>
-<body>
+<body data-authenticated="${signedIn}">
 <div class="shell">
   <aside class="sidebar" aria-label="控制台导航">
     <div class="brand">${icon("relay")}<span>Muse Relay</span></div>
@@ -40,7 +40,8 @@ export function adminPage(local = false): Response {
   <main class="main">
     <div class="topbar">
       <div class="breadcrumb"><span>控制台</span><span aria-hidden="true">/</span><strong>Cookie 管理</strong></div>
-      <span class="environment"><span aria-hidden="true"></span>${local ? "本地预览" : "生产环境"}</span>
+      <div class="account-actions"><span class="environment"><span aria-hidden="true"></span>${local ? "本地预览" : "生产环境"}</span>
+      ${signedIn ? '<form action="/admin/logout" method="post"><button class="quiet" type="submit">退出登录</button></form>' : '<a class="login-link" href="/admin/login">登录管理</a>'}</div>
     </div>
     <header class="heading">
       <h1>Cookie 管理</h1>
@@ -61,7 +62,7 @@ export function adminPage(local = false): Response {
       <article class="panel metric">
         <div class="metric-label">最近续期</div>
         <div class="metric-value metric-time" id="renewal-time">—</div>
-        <div class="metric-note" id="renewal-note">输入管理密钥后查看</div>
+        <div class="metric-note" id="renewal-note">登录后查看</div>
       </article>
     </section>
 
@@ -71,9 +72,9 @@ export function adminPage(local = false): Response {
           <h2 id="edit-title">手动更换 Cookie</h2>
           <p>验证通过后才会替换当前 Cookie。</p>
         </div>
+        ${signedIn ? "" : '<p class="login-prompt">登录后可以查看和更换 Cookie。<a href="/admin/login">前往登录</a></p>'}
         <form id="editor" method="post" autocomplete="off">
-          <label for="key">管理密钥</label>
-          <input id="key" type="password" placeholder="输入管理密钥" maxlength="512" autocomplete="off" spellcheck="false" required>
+          <fieldset ${signedIn ? "" : "disabled"}>
           <div class="current-cookie">
             <div class="current-cookie-bar">
               <label for="current-cookie">当前 Cookie</label>
@@ -90,6 +91,7 @@ export function adminPage(local = false): Response {
             <button class="secondary" id="clear" type="button">清空</button>
             <button class="quiet" id="check" type="button">${icon("refresh")}查看状态</button>
           </div>
+          </fieldset>
           <output id="feedback" role="status" aria-live="polite"></output>
           <noscript>请开启 JavaScript 后使用管理页。</noscript>
         </form>
@@ -120,14 +122,46 @@ export function adminPage(local = false): Response {
 </div>
 <script nonce="${nonce}">${adminScript}</script>
 </body>
-</html>`, {
+</html>`, nonce);
+}
+
+export function adminLoginPage(error = "", status = 200): Response {
+  const nonce = crypto.randomUUID();
+  const errorText = error ? '<p class="login-error" role="alert">' + error + '</p>' : "";
+  return htmlResponse(`<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录管理台 · Muse Relay</title>
+<style nonce="${nonce}">${adminStyles}</style>
+</head>
+<body class="login-page">
+<main class="login-card">
+  <div class="brand">${icon("relay")}<span>Muse Relay</span></div>
+  <h1>登录管理台</h1>
+  <p>使用管理密钥登录。</p>
+  <form action="/admin/login" method="post">
+    <label for="password">管理密钥</label>
+    <input id="password" name="password" type="password" maxlength="512" autocomplete="current-password" required autofocus>
+    ${errorText}
+    <button class="primary" type="submit">登录</button>
+  </form>
+  <a class="back-link" href="/admin">返回状态概览</a>
+</main>
+</body>
+</html>`, nonce, status);
+}
+
+function htmlResponse(html: string, nonce: string, status = 200): Response {
+  return new Response(html, {
+    status,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
-      "Referrer-Policy": "no-referrer",
-      "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+      "Referrer-Policy": "same-origin",
+      "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
     },
   });
 }

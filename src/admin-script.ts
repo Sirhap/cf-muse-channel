@@ -2,7 +2,7 @@
 export const adminScript = String.raw`
   const byId = (id) => document.getElementById(id);
   const form = byId("editor");
-  const key = byId("key");
+  let signedIn = document.body.dataset.authenticated === "true";
   const cookie = byId("cookie");
   const feedback = byId("feedback");
   const currentCookie = byId("current-cookie");
@@ -10,7 +10,6 @@ export const adminScript = String.raw`
   const copyCookie = byId("copy-cookie");
   const buttons = form.querySelectorAll("button");
   const channels = ["weixin", "wecom"];
-  let channelAccess = null;
   let channelRequest = null;
   let readings = null;
   let publicReadings = null;
@@ -31,14 +30,14 @@ export const adminScript = String.raw`
 
   function clearStatus() {
     hideCurrentCookie();
-    channelAccess = null;
+    signedIn = false;
     channelRequest?.abort();
     channelRequest = null;
     readings = null;
     renderChannels();
     renderPublicCookie();
     label("renewal-time", "—");
-    label("renewal-note", "输入管理密钥后查看");
+    label("renewal-note", "登录后查看");
     label("approval-state", "待查询");
     label("approval-note", "仅自动处理符合规则的请求。");
     label("feedback", "");
@@ -94,7 +93,7 @@ export const adminScript = String.raw`
       });
       publicCookieState = response.ok ? (await response.json()).state : null;
     } catch { publicCookieState = null; }
-    if (!channelAccess) renderPublicCookie();
+    if (!signedIn) renderPublicCookie();
   }
 
   function hideCurrentCookie() {
@@ -110,23 +109,23 @@ export const adminScript = String.raw`
 
   async function toggleCurrentCookie() {
     if (!currentCookie.hidden || cookieRequest) { hideCurrentCookie(); return; }
-    const secret = key.value.trim();
-    if (!secret) { label("feedback", "请输入管理密钥。", "warning"); key.focus(); return; }
+    if (!signedIn) { location.assign("/admin/login"); return; }
     const request = new AbortController();
     cookieRequest = request;
     revealCookie.textContent = "取消";
     try {
       const response = await fetch("/admin/current-cookie", {
-        method: "POST", headers: { Authorization: "Bearer " + secret },
-        cache: "no-store", credentials: "omit", redirect: "error", signal: request.signal,
+        method: "POST",
+        cache: "no-store", credentials: "same-origin", redirect: "error", signal: request.signal,
       });
       const data = await response.json();
       if (cookieRequest !== request) return;
       if (!response.ok || typeof data.cookie !== "string" || !data.cookie) {
-        const message = response.status === 401 ? "管理密钥不正确。"
+        const message = response.status === 401 ? "登录已过期，请重新登录。"
           : response.status === 404 ? "尚无当前 Cookie。" : "暂时无法读取当前 Cookie。";
         label("feedback", message, "warning");
         hideCurrentCookie();
+        if (response.status === 401) location.assign("/admin/login");
         return;
       }
       label("feedback", "");
@@ -156,19 +155,19 @@ export const adminScript = String.raw`
     }
   }
 
-  async function refreshChannels(secret) {
+  async function refreshChannels() {
     if (channelRequest) return;
     const request = new AbortController();
     channelRequest = request;
     try {
       const response = await fetch("/admin/channels", {
-        headers: { Authorization: "Bearer " + secret }, cache: "no-store",
-        credentials: "omit", redirect: "error", signal: request.signal,
+        cache: "no-store",
+        credentials: "same-origin", redirect: "error", signal: request.signal,
       });
       const data = response.ok ? await response.json() : null;
       if (channelRequest !== request) return;
       readings = data;
-      if (response.status === 401) channelAccess = null;
+      if (response.status === 401) { clearStatus(); location.assign("/admin/login"); }
       renderChannels();
     } catch {
       if (channelRequest !== request) return;
@@ -208,17 +207,16 @@ export const adminScript = String.raw`
   }
 
   async function run(save) {
-    const secret = key.value.trim();
+    if (!signedIn) { location.assign("/admin/login"); return; }
     const candidate = save ? cookie.value.trim() : null;
-    if (!secret) { label("feedback", "请输入管理密钥。", "warning"); key.focus(); return; }
     if (save && !candidate) { label("feedback", "请粘贴新 Cookie。", "warning"); cookie.focus(); return; }
     if (save) hideCurrentCookie();
     buttons.forEach((button) => button.disabled = true);
-    key.readOnly = cookie.readOnly = true;
+    cookie.readOnly = true;
     label("feedback", save ? "正在验证 Muse 连接，请稍候…" : "正在查询状态…");
     try {
-      const headers = { Authorization: "Bearer " + secret };
-      const options = { method: save ? "POST" : "GET", headers, cache: "no-store", credentials: "omit", redirect: "error" };
+      const headers = {};
+      const options = { method: save ? "POST" : "GET", headers, cache: "no-store", credentials: "same-origin", redirect: "error" };
       if (save) {
         headers["Content-Type"] = "application/json";
         options.body = JSON.stringify({ cookie: candidate });
@@ -229,7 +227,8 @@ export const adminScript = String.raw`
         let message = "暂时无法处理请求，请稍后再试。";
         if (response.status === 401) {
           clearStatus();
-          message = "管理密钥不正确。";
+          location.assign("/admin/login");
+          message = "登录已过期，请重新登录。";
         } else if (response.status === 400 || response.status === 413) {
           message = "Cookie 格式不正确或太长。请粘贴一行完整的 Cookie 请求头。";
         } else if (result.error === "cookie_not_saved") {
@@ -244,19 +243,17 @@ export const adminScript = String.raw`
       }
       if (save) cookie.value = "";
       renderSummary(result);
-      channelAccess = secret;
-      void refreshChannels(secret);
+      void refreshChannels();
       const imported = hasTime(result.last_imported_at) ? "\n最近手动更换：" + stamp(result.last_imported_at) : "";
       label("feedback", (save ? "新 Cookie 已验证并保存。" : "状态已更新。") + imported, save ? "good" : "");
     } catch {
       label("feedback", save ? "未收到保存结果。请先查看当前状态，再决定是否重试。" : "查询失败，请稍后再试。", "warning");
     } finally {
       buttons.forEach((button) => button.disabled = false);
-      key.readOnly = cookie.readOnly = false;
+      cookie.readOnly = false;
     }
   }
 
-  key.addEventListener("input", clearStatus);
   form.addEventListener("submit", (event) => { event.preventDefault(); void run(true); });
   byId("check").addEventListener("click", () => void run(false));
   revealCookie.addEventListener("click", () => void toggleCurrentCookie());
@@ -264,14 +261,16 @@ export const adminScript = String.raw`
   byId("clear").addEventListener("click", () => { cookie.value = ""; label("feedback", "已清空新 Cookie 输入。"); cookie.focus(); });
   setInterval(renderChannels, 5000);
   setInterval(() => { if (!document.hidden) void loadPublicChannels(); }, 30_000);
-  setInterval(() => { if (!document.hidden && !channelAccess) void loadPublicCookie(); }, 30_000);
-  setInterval(() => { if (channelAccess && !document.hidden) void refreshChannels(channelAccess); }, 60_000);
+  setInterval(() => { if (!document.hidden && !signedIn) void loadPublicCookie(); }, 30_000);
+  setInterval(() => { if (signedIn && !document.hidden) void refreshChannels(); }, 60_000);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { hideCurrentCookie(); return; }
-    if (channelAccess) void refreshChannels(channelAccess);
+    if (signedIn) void refreshChannels();
     else { void loadPublicChannels(); void loadPublicCookie(); }
   });
   addEventListener("pagehide", () => { form.reset(); clearStatus(); });
+  addEventListener("pageshow", (event) => { if (event.persisted) location.reload(); });
   void loadPublicChannels();
   void loadPublicCookie();
+  if (signedIn) void run(false);
 `;

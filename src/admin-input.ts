@@ -8,15 +8,15 @@ export class AdminInputError extends Error {
   constructor(readonly code: string, readonly status: number) { super(code); }
 }
 
-/** Parse only a request Cookie header; bound the stream before decoding JSON. */
-export async function readCookieInput(request: Request): Promise<CookieJar> {
-  if (request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase() !== "application/json") {
-    throw new AdminInputError("json_required", 415);
-  }
-  if (Number(request.headers.get("Content-Length")) > MAX_BODY_BYTES) throw new AdminInputError("cookie_too_large", 413);
+function mediaType(request: Request) {
+  return request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+}
+
+async function readBoundedBody(request: Request, maximum: number, tooLarge: string): Promise<string> {
+  if (Number(request.headers.get("Content-Length")) > maximum) throw new AdminInputError(tooLarge, 413);
   const reader = request.body?.getReader();
-  if (!reader) throw new AdminInputError("invalid_cookie", 400);
-  const buffer = new Uint8Array(MAX_BODY_BYTES);
+  if (!reader) return "";
+  const buffer = new Uint8Array(maximum);
   let size = 0;
   try {
     for (;;) {
@@ -24,12 +24,26 @@ export async function readCookieInput(request: Request): Promise<CookieJar> {
       if (chunk.done) break;
       if (size + chunk.value.byteLength > buffer.byteLength) {
         await reader.cancel();
-        throw new AdminInputError("cookie_too_large", 413);
+        throw new AdminInputError(tooLarge, 413);
       }
       buffer.set(chunk.value, size);
       size += chunk.value.byteLength;
     }
-    const payload: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(buffer.subarray(0, size)));
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(buffer.subarray(0, size));
+  } finally { reader.releaseLock(); }
+}
+
+export async function readAdminLogin(request: Request): Promise<string> {
+  if (mediaType(request) !== "application/x-www-form-urlencoded") throw new AdminInputError("form_required", 415);
+  const body = await readBoundedBody(request, 2048, "login_too_large");
+  return new URLSearchParams(body).get("password")?.trim() ?? "";
+}
+
+/** Parse only a request Cookie header; bound the stream before decoding JSON. */
+export async function readCookieInput(request: Request): Promise<CookieJar> {
+  if (mediaType(request) !== "application/json") throw new AdminInputError("json_required", 415);
+  try {
+    const payload: unknown = JSON.parse(await readBoundedBody(request, MAX_BODY_BYTES, "cookie_too_large"));
     if (!payload || typeof payload !== "object" || !("cookie" in payload) || typeof payload.cookie !== "string") {
       throw new AdminInputError("invalid_cookie", 400);
     }
@@ -48,5 +62,5 @@ export async function readCookieInput(request: Request): Promise<CookieJar> {
   } catch (error) {
     if (error instanceof AdminInputError) throw error;
     throw new AdminInputError("invalid_cookie", 400);
-  } finally { reader.releaseLock(); }
+  }
 }

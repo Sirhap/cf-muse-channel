@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { AdminInputError, readCookieInput } from "./admin-input";
+import { ADMIN_SESSION_SECONDS } from "./admin-session";
 import { parsePolicy, pollApprovals } from "./approval-policy";
 import { inspectChannels, publishedChannelStates, unknownChannels, type ChannelHealthReport } from "./channel-health";
 import { json } from "./http";
@@ -25,6 +26,22 @@ export class MuseCredentials extends DurableObject<Env> {
     this.controller = new CookieController(env, store);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS approval_decisions (id TEXT PRIMARY KEY, state TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, started INTEGER NOT NULL, finished INTEGER)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS service_events (kind TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS admin_sessions (hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)");
+  }
+
+  startAdminSession(hash: string) {
+    const now = Date.now();
+    this.ctx.storage.sql.exec("DELETE FROM admin_sessions WHERE expires_at <= ?", now);
+    this.ctx.storage.sql.exec("INSERT INTO admin_sessions VALUES (?,?)", hash, now + ADMIN_SESSION_SECONDS * 1000);
+  }
+
+  hasAdminSession(hash: string) {
+    const session = this.ctx.storage.sql.exec("SELECT 1 FROM admin_sessions WHERE hash=? AND expires_at>?", hash, Date.now());
+    return session.toArray().length > 0;
+  }
+
+  endAdminSession(hash: string) {
+    this.ctx.storage.sql.exec("DELETE FROM admin_sessions WHERE hash=?", hash);
   }
 
   async fetch(request: Request): Promise<Response> {

@@ -1,5 +1,6 @@
-import { adminPage } from "./admin-page";
-import { authorized, json, validBearerKey } from "./http";
+import { handleAdminRoute, isAdminRoute } from "./admin-route";
+import type { AdminSessions } from "./admin-session";
+import { authorized, json } from "./http";
 export { MuseCredentials } from "./credentials";
 
 const MUSE_ORIGIN = "https://muse.ai";
@@ -27,31 +28,15 @@ async function networkProbe(): Promise<Response> {
 
 /** Require credentials for account operations; the public view only reads a sanitized snapshot. */
 export async function handleRequest(request: Request, env: Env,
-  dispatch: (request: Request) => Promise<Response>): Promise<Response> {
+  dispatch: (request: Request) => Promise<Response>, sessions?: AdminSessions): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/health" && request.method === "GET") {
     return json({ ok: true, service: "cf-muse-channel", version: "1.0.0" });
   }
   if (url.search) return json({ error: "query_parameters_not_supported" }, 400);
-  if (["/admin", "/admin/cookie", "/admin/channels", "/admin/current-cookie", "/channel-health", "/cookie-health"].includes(url.pathname)) {
-    const key = env.MUSE_ADMIN_KEY ?? "";
-    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if ((!local && url.protocol !== "https:") || !validBearerKey(key) || key === env.DEMO_KEY) return json({ error: "not_found" }, 404);
-    if (url.pathname === "/admin" && request.method === "GET") return adminPage(local);
-    if (url.pathname === "/channel-health" || url.pathname === "/cookie-health") {
-      if (request.method !== "GET") return json({ error: "not_found" }, 404);
-      return dispatchSafely(new Request(url, { method: "GET" }), dispatch);
-    }
-    const allowed = request.method === "GET" && url.pathname === "/admin/channels"
-      || request.method === "POST" && url.pathname === "/admin/current-cookie"
-      || ["GET", "POST"].includes(request.method) && url.pathname === "/admin/cookie";
-    if (!allowed) return json({ error: "not_found" }, 404);
-    if (!(await authorized(request, key))) return json({ error: "unauthorized" }, 401);
-    if (request.method === "POST" && request.headers.get("Origin") !== url.origin) return json({ error: "origin_not_allowed" }, 403);
-    // Keep the admin key at the public Worker boundary.
-    const forwarded = new Request(request);
-    forwarded.headers.delete("Authorization");
-    return dispatchSafely(forwarded, dispatch);
+  if (isAdminRoute(url.pathname)) {
+    try { return await handleAdminRoute(request, env, dispatch, sessions); }
+    catch { return json({ error: "credential_service_unavailable" }, 503); }
   }
   if (!(await authorized(request, env.DEMO_KEY ?? ""))) return json({ error: "unauthorized" }, 401);
   if (url.pathname === "/probe/network" && request.method === "POST") return networkProbe();
@@ -75,7 +60,8 @@ async function dispatchSafely(request: Request, dispatch: (request: Request) => 
 
 export default {
   fetch(request: Request, env: Env): Promise<Response> {
-    return handleRequest(request, env, (forwarded) => env.CREDENTIALS.getByName("primary-account").fetch(forwarded));
+    const coordinator = env.CREDENTIALS.getByName("primary-account");
+    return handleRequest(request, env, (forwarded) => coordinator.fetch(forwarded), coordinator);
   },
   async scheduled(event: ScheduledController, env: Env): Promise<void> {
     const status = await env.CREDENTIALS.getByName("primary-account").scheduledRenewal(event.scheduledTime, event.cron);

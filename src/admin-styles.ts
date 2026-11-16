@@ -34,6 +34,22 @@ export const adminStyles = `
   .sidebar-footer { display: flex; align-items: center; gap: 10px; margin: auto 0 0 7px; color: #edddd8; font-size: 14px; }
   .main { width: 100%; max-width: 1540px; min-width: 0; margin-inline: auto; padding: 0 clamp(22px, 3vw, 45px); }
   .topbar { min-height: 65px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .account-actions { display: flex; align-items: center; gap: 10px; }
+  .account-actions form { margin: 0; }
+  .login-link, .login-prompt a, .back-link { color: var(--coral); text-underline-offset: 4px; }
+  fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+  fieldset:disabled { opacity: .55; }
+  .login-prompt { margin-top: 14px; font-size: 14px; }
+  .login-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--sidebar); }
+  .login-card { width: min(100%, 440px); background: var(--paper); padding: 36px; border-radius: 16px; }
+  .login-card .brand { margin-bottom: 34px; padding: 0; }
+  .login-card .brand .icon { color: var(--coral); }
+  .login-card h1 { font-size: 32px; }
+  .login-card p { color: var(--muted); margin-top: 10px; }
+  .login-card form { margin-top: 28px; }
+  .login-card button { width: 100%; justify-content: center; }
+  .login-card .login-error { color: var(--warning); margin-bottom: 15px; font-size: 14px; }
+  .back-link { display: inline-block; margin-top: 22px; font-size: 14px; }
   .breadcrumb { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 14px; }
   .breadcrumb strong { color: var(--ink); }
   .environment { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; border: 1px solid #9dadaa; border-radius: 5px; color: var(--green); background: #edf0e3; font-size: 12px; font-weight: 650; white-space: nowrap; }
