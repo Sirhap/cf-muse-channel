@@ -56,6 +56,7 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
   const allowed = (request.method === "GET" && ["/admin/managed/status", "/admin/managed/probe"].includes(path))
     || (request.method === "POST" && path === "/admin/managed/probe")
     || (request.method === "POST" && path === "/admin/managed/connectivity")
+    || (request.method === "POST" && path === "/admin/managed/confirm-delivery")
     || (request.method === "POST" && ["/admin/managed/weixin", "/admin/managed/wecom"].includes(path))
     || request.method === "GET" && path === "/admin/channels"
     || request.method === "POST" && path === "/admin/current-cookie"

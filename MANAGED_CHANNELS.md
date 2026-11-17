@@ -26,7 +26,7 @@
 
 ## 故障边界
 
-入站按原消息 ID 和会话唯一去重；每会话串行，不同会话可分别推进。正式回复先入 SQLite 发件表，再提交腾讯。每个分片有持久发送边界；确认回执前断线会标为 `unknown`，禁止自动重发该片。缺少回执不等于没有送达。
+入站按原消息 ID 和会话唯一去重；每会话串行，不同会话可分别推进。正式回复先入 SQLite 发件表，再提交腾讯。每个分片有持久发送边界；确认回执前断线会标为 `unknown`，禁止自动重发该片。缺少回执不等于没有送达。管理员取得收件人的明确确认后，可用 `POST /admin/managed/confirm-delivery` 提交 `task_id`、原 `message_id` 和 `received:true`，只核销一个短消息气泡的未知投递，留下确认来源与时间；接口不会重新发送。
 
 提交前保存会话、历史序号和唯一设备标识。重启将中断的 `submitting` 转为 `unknown`；之后只读核对相同设备标识的用户消息，找到后继续等待原任务，绝不重提。无法确认时保持待核查，并阻止该会话后续任务越过它。替换账号或凭证前必须核对在途任务和未投递结果；仅关闭接收不受此限制。
 
@@ -35,3 +35,5 @@
 CF 发生重启、网络断开或维护时，持久化 alarm 会重新连接渠道并核对已有任务。保活不能保证零停顿；网络和腾讯/Muse 服务仍是外部依赖。
 
 部署时还需核对实际 DO 运行版本：Cloudflare 默认可能让活跃对象继续运行旧代码最多 5 分钟。参见 [官方代码更新策略](https://developers.cloudflare.com/durable-objects/deployments/durable-objects-code-updates/)。不要仅凭 Worker 部署成功就进入账号切换；需要立即更新时，先确认没有在途提交/投递，再使用平台支持的 immediate 策略。当前固定 Wrangler 版本尚未实现该参数，可等待对象更新或使用官方 REST 部署接口，避免无依据升级依赖。
+
+已有管理域名也可将 `MOBILE` 绑定到独立渠道 Worker 的 `ManagedChannels` 类（使用 `script_name`），并设置 `MANAGED_CHANNELS_ENABLED=true`，让原 `/admin` 与 `/channel-health` 直接读取同一份 CF 渠道状态。凭证 DO 保持原命名空间，Cron 与自动审批继续由原凭证 Worker 执行；托管开启后停止采样虚机中的旧渠道状态文件。

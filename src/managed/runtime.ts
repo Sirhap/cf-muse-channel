@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { json } from "../http";
 import { MuseRpc } from "../noise";
 import { ManagedStore, type Task, type Outbound } from "./store";
-import { assertPlatformSuccess, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
+import { assertPlatformSuccess, boundedJson, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
 
 interface Health { connected: boolean; last_ok: number | null; error: string | null; }
 interface Diagnostic {
@@ -47,6 +47,22 @@ export class ManagedChannels extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    if (path === "/admin/managed/confirm-delivery" && request.method === "POST") {
+      try {
+        const body = await boundedJson(new Response(request.body), 2048);
+        if (body.received !== true || !Number.isSafeInteger(body.task_id) || Number(body.task_id) <= 0 || !string(body.message_id)) return json({ error: "explicit_receipt_required" }, 400);
+        const task = this.store.task(Number(body.task_id));
+        if (task.message_id !== body.message_id) return json({ error: "receipt_binding_mismatch" }, 409);
+        const row = this.ctx.storage.sql.exec<Outbound>("SELECT * FROM outbound WHERE task_id=?", task.id).toArray()[0];
+        // A recipient's confirmation resolves a single ambiguous bubble; never resend it.
+        if (!row || row.text.length > 900 || !["unknown", "delivered"].includes(row.state)) return json({ error: "delivery_not_confirmable" }, 409);
+        this.ctx.storage.transactionSync(() => {
+          this.store.set("outbound-receipt:" + row.id, { source: "administrator_recipient_confirmation", at: Date.now(), message_id: task.message_id });
+          this.ctx.storage.sql.exec("UPDATE outbound SET state='delivered' WHERE id=?", row.id);
+        });
+        return json({ ok: true, task_id: task.id, source: "recipient_confirmation" });
+      } catch { return json({ error: "invalid_delivery_receipt" }, 400); }
+    }
     if (path === "/admin/managed/connectivity" && request.method === "POST") {
       const weixin = this.config("weixin");
       const [wx, wc] = await Promise.all([
@@ -110,6 +126,9 @@ export class ManagedChannels extends DurableObject<Env> {
         recent: this.ctx.storage.sql.exec<{ id: number; state: string; channel: string; message_id: string; created_at: number }>(
           "SELECT id,state,json_extract(route,'$.channel') channel,message_id,created_at FROM tasks ORDER BY id DESC LIMIT 10").toArray()
           .map((task) => ({ ...task, error: this.store.get("task-error:" + task.id) })),
+        deliveries: this.ctx.storage.sql.exec<{ id: number; task_id: number; state: string }>(
+          "SELECT id,task_id,state FROM outbound ORDER BY id DESC LIMIT 10").toArray()
+          .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id) })),
         scope: "text",
       });
     }
@@ -562,7 +581,8 @@ export class ManagedChannels extends DurableObject<Env> {
             this.store.set("outbound-part:" + row.id, i + 1);
             this.ctx.storage.sql.exec("UPDATE outbound SET state=? WHERE id=?", i + 1 === chunks.length ? "delivered" : "pending", row.id);
           });
-        } catch {
+        } catch (error) {
+          this.store.set("outbound-error:" + row.id, { code: failureCode(error), at: Date.now() });
           this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
           break;
         }

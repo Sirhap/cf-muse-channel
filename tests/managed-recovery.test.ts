@@ -188,3 +188,34 @@ it("removes the handshake deadline after upgrading a persistent WeCom connection
     } finally { runtime.closeWecom(); peer?.close(); vi.restoreAllMocks(); vi.unstubAllGlobals(); }
   });
 });
+
+it("resolves a recipient-confirmed ambiguous bubble without sending and rejects a mismatched message", async () => {
+  await runInDurableObject(env.MOBILE.getByName("managed-recipient-receipt"), async (instance, state) => {
+    const store = new ManagedStore(state.storage.sql);
+    const task = store.ingest(message("confirmed-bubble"))!;
+    store.complete(task, "received");
+    state.storage.sql.exec("UPDATE outbound SET state='unknown'");
+    const request = (id: string) => instance.fetch(new Request("https://internal/admin/managed/confirm-delivery", {
+      method: "POST", body: JSON.stringify({ received: true, task_id: task.id, message_id: id }),
+    }));
+    expect((await request("different-message")).status).toBe(409);
+    expect((await request(task.message_id)).status).toBe(200);
+    expect((await request(task.message_id)).status).toBe(200);
+    expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM outbound").one().state).toBe("delivered");
+    expect(state.storage.sql.exec("SELECT * FROM outbound").toArray()).toHaveLength(1);
+  });
+});
+
+it("accepts Tencent's omitted default success code but rejects explicit send errors and arbitrary payloads", async () => {
+  const { weixinCall } = await import("../src/managed/protocol");
+  const config = { enabled: false, account: "test", secret: "synthetic", allowedSenders: ["alice"] };
+  let response: unknown = {};
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json(response)));
+  try {
+    await expect(weixinCall("sendmessage", config, {})).resolves.toEqual({});
+    response = { ret: -2 };
+    await expect(weixinCall("sendmessage", config, {})).rejects.toThrow("platform_rejected_-2");
+    response = { error: "denied" };
+    await expect(weixinCall("sendmessage", config, {})).rejects.toThrow("platform_rejected");
+  } finally { vi.unstubAllGlobals(); }
+});

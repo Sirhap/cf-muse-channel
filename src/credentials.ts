@@ -148,7 +148,8 @@ export class MuseCredentials extends DurableObject<Env> {
           accepted: (id) => { this.ctx.storage.sql.exec("UPDATE approval_decisions SET state='rpc_accepted',finished=? WHERE id=?", Date.now(), id); },
         });
         // Piggyback on the existing scheduled session. Anonymous reads can never start one.
-        if (source === "durable_object_alarm" && Date.now() - (this.channelSnapshot()?.at ?? 0) >= 60_000) {
+        if (this.env.MANAGED_CHANNELS_ENABLED !== "true" && source === "durable_object_alarm"
+          && Date.now() - (this.channelSnapshot()?.at ?? 0) >= 60_000) {
           try { this.saveChannels(await inspectChannels(rpc)); } catch { /* Status sampling is independent of approval decisions. */ }
         }
         return result;
