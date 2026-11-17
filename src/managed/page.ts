@@ -11,7 +11,7 @@ h1 {font-size:36px} label {margin-top:14px} output,pre {display:block;white-spac
 label.toggle {display:flex;gap:8px;align-items:center} input[type=checkbox]{width:auto;margin:0}
 @media(max-width:680px){.forms{grid-template-columns:1fr}}
 </style></head><body><main><header><a href="/admin">返回 Cookie 管理</a>
-<h1>CF 渠道托管</h1><p>首版支持文字、队列和基础命令。请使用专属测试账号，或确认原接收端已停止接收。</p></header>
+<h1>CF 渠道托管</h1><p>消息直接交给 Muse 原生处理。接入现有账号前，请确认原接收端已停止接收。</p></header>
 <div class="forms">
 ${(["weixin", "wecom"] as const).map((channel) => `<section class="panel"><h2>${channel === "weixin" ? "微信" : "企业微信"}</h2>
 <form data-channel="${channel}" autocomplete="off">
@@ -29,9 +29,11 @@ async function refresh(){
   if(r.status===401){location.assign('/admin/login');return}
   const d=await r.json();
   const labels={weixin:'微信',wecom:'企微'};
+  const phases={queued:'待转发',submitting:'发送中',submitted:'已交给 Muse',running:'旧回合处理中',succeeded:'已处理',unknown:'待核对',cancelled:'已停止',failed:'未完成',delivered:'已确认投递',pending:'待投递',sending:'投递中'};
+  const counts=rows=>(rows??[]).map(x=>(phases[x.state]??x.state)+' '+x.count).join(' · ')||'暂无';
   state.textContent=Object.entries(d.channels??{}).map(([k,v])=>labels[k]+' · '+(!v.configured?'未配置':!v.enabled?'未启用':v.connected?'网关连接正常':v.error?'连接失败':'等待连接')
     +(v.last_ok?' · 最近回包 '+new Date(v.last_ok).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}):'')).join('\\n')
-    +'\\n任务 '+JSON.stringify(d.tasks??[])+'\\n投递 '+JSON.stringify(d.outbound??[]);
+    +'\\nMuse 原生处理：'+counts(d.tasks)+'\\n回复投递：'+counts(d.outbound);
  }catch{state.textContent='状态读取失败，请稍后重试。'}
 }
 for(const form of document.querySelectorAll('form')){

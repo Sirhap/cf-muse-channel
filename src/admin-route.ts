@@ -53,8 +53,8 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
     return adminSessionRedirect("/admin/login", "");
   }
 
-  const allowed = (request.method === "GET" && ["/admin/managed/status", "/admin/managed/probe"].includes(path))
-    || (request.method === "POST" && path === "/admin/managed/probe")
+  const allowed = (request.method === "GET" && ["/admin/managed/status", "/admin/managed/probe", "/admin/managed/probe-native"].includes(path))
+    || (request.method === "POST" && ["/admin/managed/probe", "/admin/managed/probe-native"].includes(path))
     || (request.method === "POST" && path === "/admin/managed/connectivity")
     || (request.method === "POST" && path === "/admin/managed/confirm-delivery")
     || (request.method === "POST" && ["/admin/managed/weixin", "/admin/managed/wecom"].includes(path))

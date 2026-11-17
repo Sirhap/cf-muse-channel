@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { json } from "../http";
 import { MuseRpc } from "../noise";
 import { ManagedStore, type Task, type Outbound } from "./store";
-import { channelReply } from "./reply";
+import { NativeConversations } from "./native";
 import { assertPlatformSuccess, boundedJson, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
 
 interface Health { connected: boolean; last_ok: number | null; error: string | null; }
@@ -16,6 +16,7 @@ interface Diagnostic {
 }
 export class ManagedChannels extends DurableObject<Env> {
   private store: ManagedStore;
+  private native: NativeConversations;
   private muse?: MuseRpc;
   private museConnecting?: Promise<MuseRpc>;
   private museSerial: Promise<void> = Promise.resolve();
@@ -36,6 +37,9 @@ export class ManagedChannels extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.store = new ManagedStore(ctx.storage.sql);
+    this.native = new NativeConversations(this.store, (operation) => this.rpc(operation),
+      (operation) => ctx.storage.transactionSync(operation),
+      (session) => ctx.waitUntil(this.watch(session).catch(() => {})));
     // A worker may have died after sending. Such tasks always require reconciliation.
     ctx.storage.sql.exec("UPDATE tasks SET state='unknown' WHERE state='submitting'");
     ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE state='sending'");
@@ -48,6 +52,25 @@ export class ManagedChannels extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    if (path === "/admin/managed/probe-native" && ["GET", "POST"].includes(request.method)) {
+      if (request.method === "POST" && !this.store.get("native-verification")) {
+        if (this.env.MANAGED_CHANNELS_ENABLED !== "true") return json({ error: "native_probe_disabled" }, 409);
+        this.ctx.storage.transactionSync(() => {
+          const text = ["这是连续输入验证，请等我发完再回答，不执行任何其他操作。", "这是第二条补充消息。", "输入完成，请回复你已经收到连续输入。"];
+          const ids = text.map((value, index) => this.store.ingest({ id: "native-probe-" + index, text: value,
+            channel: "weixin", account: "isolated-native-probe", chat: "isolated-native-probe", sender: "isolated-native-probe", group: false, context: "" })!.id);
+          this.store.set("native-verification", { ids, created_at: Date.now() });
+        });
+        await this.ctx.storage.setAlarm(Date.now() + 100);
+        this.ctx.waitUntil(this.pump());
+      }
+      const probe = this.store.get<{ ids: number[]; created_at: number }>("native-verification");
+      if (!probe) return json({ state: "not_started" });
+      const inputs = probe.ids.map((id) => ({ id, state: this.store.task(id).state, ...this.store.get<object>("native-input:" + id) }));
+      const replies = this.ctx.storage.sql.exec<{ id: number; text: string }>("SELECT id,text FROM tasks WHERE message_id LIKE 'native:%' ORDER BY id").toArray()
+        .map((row) => ({ ...row, ...this.store.get<object>("native-output:" + row.id) }));
+      return json({ state: inputs.every((row) => "confirmed_at" in row) && replies.length > 0 ? "succeeded" : "awaiting_native_receipts", inputs, replies });
+    }
     if (path === "/admin/managed/confirm-delivery" && request.method === "POST") {
       try {
         const body = await boundedJson(new Response(request.body), 2048);
@@ -113,7 +136,8 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261117-reply-v2",
+        runtime_version: "managed-20261117-native-v1",
+        mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
         last_pump_error: this.store.get("last_pump_error"),
@@ -130,6 +154,7 @@ export class ManagedChannels extends DurableObject<Env> {
         deliveries: this.ctx.storage.sql.exec<{ id: number; task_id: number; state: string }>(
           "SELECT id,task_id,state FROM outbound ORDER BY id DESC LIMIT 10").toArray()
           .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id) })),
+        native_sessions: this.ctx.storage.sql.exec("SELECT COUNT(*) count,SUM(awaiting) active FROM native_sessions").one(),
         scope: "text",
       });
     }
@@ -144,7 +169,9 @@ export class ManagedChannels extends DurableObject<Env> {
         const outstanding = this.ctx.storage.sql.exec<{ count: number }>(
           `SELECT COUNT(*) count FROM tasks WHERE json_extract(route,'$.channel')=? AND
           (state IN ('queued','submitting','running','unknown') OR id IN (SELECT task_id FROM outbound WHERE state<>'delivered'))`, channel).one().count;
-        if (replacing && outstanding) return json({ error: "tasks_must_be_reconciled_before_configuration_change" }, 409);
+        const nativeActive = this.ctx.storage.sql.exec<{ count: number }>(
+          "SELECT COUNT(*) count FROM native_sessions WHERE awaiting=1 AND json_extract(route,'$.channel')=?", channel).one().count;
+        if (replacing && (outstanding || nativeActive)) return json({ error: "tasks_must_be_reconciled_before_configuration_change" }, 409);
         if (channel === "weixin" && (!previous || previous.account !== data.account || data.initialCursor !== undefined)) {
           this.store.set("weixin_cursor", data.initialCursor ?? "");
         }
@@ -234,7 +261,8 @@ export class ManagedChannels extends DurableObject<Env> {
   private active() {
     const diagnostic = this.store.get<Diagnostic>("diagnostic");
     return Boolean(diagnostic && diagnostic.state !== "succeeded" && diagnostic.state !== "failed")
-      || this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) count FROM tasks WHERE state IN ('queued','running','unknown')").one().count > 0;
+      || this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) count FROM tasks WHERE state IN ('queued','submitting','running','unknown')").one().count > 0
+      || this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) count FROM native_sessions WHERE awaiting=1").one().count > 0;
   }
 
   private async pollWeixin(config: ChannelConfig) {
@@ -344,16 +372,9 @@ export class ManagedChannels extends DurableObject<Env> {
   private ingest(message: Incoming) {
     const task = this.store.ingest(message);
     if (!task) return;
-    const word = task.text.trim().split(/\s+/)[0];
     // Queries and controls bypass older chat work but are persisted and deduplicated first.
     const reply = this.store.command(task);
     if (reply !== null) this.store.complete(task, reply);
-    else if (word === "/stop") {
-      this.ctx.storage.sql.exec("UPDATE tasks SET state='cancelled' WHERE conversation=? AND id<>? AND state='queued'", task.conversation, task.id);
-      const running = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) count FROM tasks WHERE conversation=? AND state IN ('running','submitting','unknown')", task.conversation).one().count;
-      if (running) this.store.set("cancel:" + task.conversation, true);
-      this.store.complete(task, "已登记停止请求，正在核对远端任务。");
-    }
   }
 
   private async watch(session: string) {
@@ -364,7 +385,7 @@ export class ManagedChannels extends DurableObject<Env> {
     catch (error) { this.watching.delete(session); throw error; }
     const diagnostic = this.store.get<Diagnostic>("diagnostic");
     const interested = this.ctx.storage.sql.exec<{ count: number }>(
-      "SELECT COUNT(*) count FROM tasks WHERE session=? AND state IN ('queued','submitting','running','unknown')", session).one().count > 0;
+      "SELECT COUNT(*) count FROM tasks WHERE session=? AND state IN ('queued','submitting','submitted','running','unknown')", session).one().count > 0;
     if (!interested && !(diagnostic?.session === session && diagnostic.state !== "succeeded")) {
       this.watching.delete(session); client.close(); return;
     }
@@ -404,18 +425,30 @@ export class ManagedChannels extends DurableObject<Env> {
     let loops = 0;
     do {
       revision = this.eventRevision;
-      await this.deliver(); // Local commands remain available during a Muse outage.
+      await this.deliver();
       await this.diagnostic();
-      const running = this.ctx.storage.sql.exec<Task>("SELECT * FROM tasks WHERE state IN ('running','unknown') ORDER BY id LIMIT 10").toArray();
-      for (const task of running) {
-        try { await this.check(task); }
-        catch { this.store.set("task-error:" + task.id, { code: "result_check_failed", at: Date.now() }); }
-      }
-      const task = this.store.candidate();
+      await this.native.recoverLegacy();
       let prepared = true;
-      if (task) {
-        try { await this.submit(task); }
-        catch { prepared = false; this.store.set("task-error:" + task.id, { code: "submission_preflight_failed", at: Date.now() }); }
+      // These are unsent transport receipts. Forward the burst immediately;
+      // an earlier Muse turn never gates the next input.
+      for (let sent = 0; sent < 20; sent++) {
+        const task = this.store.candidate();
+        if (!task) break;
+        try { await this.native.forward(task); }
+        catch {
+          prepared = false;
+          this.store.set("task-error:" + task.id, { code: "submission_preflight_failed", at: Date.now() });
+          break;
+        }
+      }
+      for (const binding of this.native.sessions()) {
+        try {
+          const produced = await this.native.collect(binding);
+          await this.deliver();
+          if (produced || binding.awaiting && Date.now() - binding.last_checked > 15000) {
+            await this.native.refreshActivity(binding);
+          }
+        } catch { this.store.set("native-error:" + binding.session, { code: "native_history_check_failed", at: Date.now() }); }
       }
       await this.deliver();
       if (!prepared) break;
@@ -452,102 +485,9 @@ export class ManagedChannels extends DurableObject<Env> {
     }
   }
 
-  private async submit(task: Task) {
-    const row = this.ctx.storage.sql.exec<{ generation: number; session: string | null }>("SELECT generation,session FROM conversations WHERE id=?", task.conversation).one();
-    const sessionKey = "session:" + task.conversation + ":" + task.generation;
-    let session = this.store.get<string>(sessionKey) ?? (row.generation === task.generation ? row.session : null);
-    if (!session) {
-      const started = object(await this.rpc((rpc) => rpc.call("/session/start", 0, "POST", {
-        method: "/api/session/start", params: { origin: "fresh", lifecycle: "persistent", title: "CF managed channel" },
-      })));
-      session = string(started.session_id);
-      if (!session) throw new Error("session_unavailable");
-      this.ctx.storage.sql.exec("UPDATE conversations SET session=? WHERE id=? AND generation=?", session, task.conversation, task.generation);
-    }
-    this.store.set(sessionKey, session);
-    const id = session;
-    const history = object(await this.rpc((rpc) => rpc.call("/chat/history?session_id=" + encodeURIComponent(id) + "&limit=10", 0)));
-    const baseline = Math.max(0, ...this.history(history).map((event) => Number(event.seq)));
-    this.ctx.storage.sql.exec("UPDATE tasks SET session=?,baseline=? WHERE id=?", id, baseline, task.id);
-    const device = "cf-managed-" + crypto.randomUUID();
-    this.store.set("device:" + task.id, device);
-    this.ctx.waitUntil(this.watch(id).catch(() => {}));
-    // This durable boundary forbids replay if sending or the following write is interrupted.
-    this.ctx.storage.sql.exec("UPDATE tasks SET state='submitting' WHERE id=? AND state='queued'", task.id);
-    try {
-      await this.rpc((rpc) => rpc.open("/chat/stream", 0, "POST", {
-        session_id: id, node_id: device, capabilities: {}, items: [{ type: "text", text: task.text }],
-      }));
-      this.ctx.storage.sql.exec("UPDATE tasks SET state='running' WHERE id=?", task.id);
-    } catch { this.ctx.storage.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", task.id); }
-  }
-
   private history(response: Record<string, unknown>) {
     if (!Array.isArray(response.chat_events)) throw new Error("history_unavailable");
     return response.chat_events.map(object).filter((event) => Number.isSafeInteger(event.seq));
-  }
-
-  private async check(task: Task) {
-    if (!task.session) throw new Error("task_missing_session");
-    const session = task.session;
-    this.ctx.waitUntil(this.watch(session).catch(() => {}));
-    const history = object(await this.rpc((rpc) => rpc.call("/chat/history?session_id=" + encodeURIComponent(session) + "&limit=100", 0)));
-    const events = this.history(history);
-    let anchor = this.store.get<number>("anchor:" + task.id);
-    if (anchor === null) {
-      const device = this.store.get<string>("device:" + task.id);
-      const matches = events.filter((event) => {
-        const payload = object(event.payload);
-        return event.event_name === "message.user" && Number(event.seq) > task.baseline
-          && device !== null && (object(payload.metadata).client_device_id === device || object(payload.chat_context).device_id === device)
-          && (payload.display_text === task.text || payload.content === task.text);
-      });
-      if (matches.length !== 1) return; // Read-only recovery never guesses or replays an ambiguous submission.
-      anchor = Number(matches[0].seq);
-      this.store.set("anchor:" + task.id, anchor);
-      this.ctx.storage.sql.exec("UPDATE tasks SET state='running' WHERE id=?", task.id);
-    }
-    const cancelling = Boolean(this.store.get("cancel:" + task.conversation));
-    if (cancelling && !this.store.get("cancel-sent:" + task.id)) {
-      await this.rpc((rpc) => rpc.call("/chat/cancel", 0, "POST", { session_id: session }));
-      this.store.set("cancel-sent:" + task.id, true);
-    }
-    const current = object(await this.rpc((rpc) => rpc.call("/api/session/list/" + encodeURIComponent(session), 0)));
-    const sessionState = string(current.status);
-    if (!["completed", "failed", "error", "cancelled", "canceled"].includes(sessionState)) return;
-    const latest = new Map<unknown, Record<string, unknown>>();
-    for (const event of events) {
-      if (event.event_name === "message.assistant" && Number(event.seq) > anchor) {
-        latest.set(event.message_id ?? object(event.payload).message_id ?? event.seq, event);
-      }
-    }
-    const replies = [...latest.values()].sort((a, b) => Number(a.seq) - Number(b.seq));
-    const last = object(replies.at(-1)?.payload);
-    const terminal = string(last.status);
-    if (["cancelled", "canceled"].includes(sessionState) || ["cancelled", "canceled"].includes(terminal)) {
-      this.finish(task, "任务已停止。", "cancelled"); return;
-    }
-    if (["failed", "error"].includes(sessionState) || ["failed", "error"].includes(terminal)) {
-      this.finish(task, "Muse 任务未完成，请查看任务状态后再决定是否重新发送。", "failed"); return;
-    }
-    if (!replies.length) return;
-    if (replies.some((event) => ["running", "pending", "in_progress", "streaming", "generating"].includes(string(object(event.payload).status))
-      || object(event.payload).display_text_ready === false)) return;
-    const texts = replies.map((event) => object(event.payload))
-      .filter((payload) => ["completed", "complete", "succeeded"].includes(string(payload.status)))
-      .map((payload) => string(payload.display_text)).filter(Boolean);
-    if (!texts.length) return;
-    this.finish(task, texts.join("\n"), "succeeded");
-  }
-
-  /** Only confirmed terminal state releases the conversation for its next turn. */
-  private finish(task: Task, text: string, state: "succeeded" | "failed" | "cancelled") {
-    this.ctx.storage.transactionSync(() => {
-      this.store.complete(task, channelReply(text), state);
-      this.store.set("cancel:" + task.conversation, false);
-    });
-    // Reuse the subscription for the next turn. Its existing bounded idle read
-    // timeout closes it naturally; reconnecting never replays a user message.
   }
 
   private async deliver() {

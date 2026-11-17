@@ -15,62 +15,6 @@ interface Harness {
   deliver: () => Promise<void>;
 }
 
-it("recovers an uncertain submission by its exact device receipt, waits for the whole run, and commits once", async () => {
-  await runInDurableObject(env.MOBILE.getByName("managed-recover"), async (_instance, state) => {
-    const runtime = new ManagedChannels(state, env) as unknown as Harness;
-    const store = new ManagedStore(state.storage.sql);
-    const task = store.ingest(message("uncertain"))!;
-    state.storage.sql.exec("UPDATE tasks SET state='unknown',session='remote',baseline=10 WHERE id=?", task.id);
-    store.set("device:" + task.id, "our-device");
-    let status = "running", device = "other-device";
-    const call = vi.fn(async (path: string) => path.startsWith("/chat/history") ? { chat_events: [
-      { seq: 11, event_name: "message.user", payload: { display_text: task.text, metadata: { client_device_id: device } } },
-      { seq: 12, message_id: "reply", event_name: "message.assistant", payload: { status: "completed", display_text: "progress report" } },
-      { seq: 13, message_id: "reply", event_name: "message.assistant", payload: { status: "completed", display_text: "final result" } },
-    ] } : { status });
-    vi.spyOn(runtime, "rpc").mockImplementation(async (operation) => operation({ call }));
-    vi.spyOn(runtime, "watch").mockResolvedValue();
-    try {
-      await runtime.check(store.task(task.id));
-      expect(store.task(task.id).state).toBe("unknown");
-      device = "our-device";
-      await runtime.check(store.task(task.id));
-      expect(store.task(task.id).state).toBe("running");
-      expect(state.storage.sql.exec("SELECT * FROM outbound").toArray()).toHaveLength(0);
-      status = "completed";
-      await runtime.check(store.task(task.id));
-      expect(store.task(task.id).result).toBe("final result");
-      expect(state.storage.sql.exec("SELECT * FROM outbound").toArray()).toHaveLength(1);
-    } finally { vi.restoreAllMocks(); }
-  });
-});
-
-it("a cancellation acknowledgement does not release the next queued task before the remote run stops", async () => {
-  await runInDurableObject(env.MOBILE.getByName("managed-stop"), async (_instance, state) => {
-    const runtime = new ManagedChannels(state, env) as unknown as Harness;
-    const store = new ManagedStore(state.storage.sql);
-    const task = store.ingest(message("first"))!;
-    const next = store.ingest(message("second"))!;
-    state.storage.sql.exec("UPDATE tasks SET state='running',session='remote' WHERE id=?", task.id);
-    store.set("anchor:" + task.id, 10);
-    store.set("cancel:" + task.conversation, true);
-    let status = "running";
-    const call = vi.fn(async (path: string) => path.startsWith("/chat/history") ? { chat_events: [] } : { status });
-    vi.spyOn(runtime, "rpc").mockImplementation(async (operation) => operation({ call }));
-    vi.spyOn(runtime, "watch").mockResolvedValue();
-    try {
-      await runtime.check(store.task(task.id));
-      expect(store.task(task.id).state).toBe("running");
-      expect(store.candidate()).toBeNull();
-      status = "cancelled";
-      await runtime.check(store.task(task.id));
-      expect(store.task(task.id).state).toBe("cancelled");
-      expect(store.candidate()?.id).toBe(next.id);
-      expect(call.mock.calls.filter(([path]) => path === "/chat/cancel")).toHaveLength(1);
-    } finally { vi.restoreAllMocks(); }
-  });
-});
-
 it("does not resend a chunk after losing its platform acknowledgement or after a restart", async () => {
   await runInDurableObject(env.MOBILE.getByName("managed-outbound-recovery"), async (_instance, state) => {
     const runtime = new ManagedChannels(state, env) as unknown as Harness;
@@ -218,34 +162,6 @@ it("accepts Tencent's omitted default success code but rejects explicit send err
     response = { error: "denied" };
     await expect(weixinCall("sendmessage", config, {})).rejects.toThrow("platform_rejected");
   } finally { vi.unstubAllGlobals(); }
-});
-
-it("keeps an established session subscription warm between two turns instead of closing it on every reply", async () => {
-  await runInDurableObject(env.MOBILE.getByName("managed-warm-subscription"), async (_instance, state) => {
-    const runtime = new ManagedChannels(state, env) as unknown as {
-      socket: () => Promise<unknown>;
-      watch: (session: string) => Promise<void>;
-      finish: (task: Task, text: string, status: string) => void;
-    };
-    const store = new ManagedStore(state.storage.sql);
-    const task = store.ingest(message("first-turn"))!;
-    state.storage.sql.exec("UPDATE tasks SET session='session',state='running' WHERE id=?", task.id);
-    let release!: () => void;
-    const stream = new Promise<void>((resolve) => { release = resolve; });
-    const client = { subscribe: vi.fn(() => stream), close: vi.fn() };
-    const connect = vi.spyOn(runtime, "socket").mockResolvedValue(client);
-    try {
-      await runtime.watch("session");
-      runtime.finish(store.task(task.id), "answer\n\n[[hatch_widget:widget-hidden]]", "succeeded");
-      expect(store.task(task.id).result).toBe("answer");
-      expect(client.close).not.toHaveBeenCalled();
-      const second = store.ingest(message("second-turn"))!;
-      state.storage.sql.exec("UPDATE tasks SET session='session',state='running' WHERE id=?", second.id);
-      await runtime.watch("session");
-      expect(connect).toHaveBeenCalledTimes(1);
-      expect(client.subscribe).toHaveBeenCalledTimes(1);
-    } finally { release(); vi.restoreAllMocks(); }
-  });
 });
 
 it("recognizes a lossless Tencent send message ID even when the zero ret field is omitted", async () => {

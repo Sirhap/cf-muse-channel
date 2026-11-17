@@ -1,5 +1,5 @@
 import type { Incoming } from "./protocol";
-export type TaskState = "queued" | "submitting" | "running" | "unknown" | "succeeded" | "failed" | "cancelled";
+export type TaskState = "queued" | "submitting" | "submitted" | "running" | "unknown" | "succeeded" | "failed" | "cancelled";
 export interface Task extends Record<string, SqlStorageValue> {
   id: number; message_id: string; route: string; conversation: string; text: string; state: TaskState;
   session: string | null; baseline: number; result: string | null; created_at: number; generation: number;
@@ -45,26 +45,20 @@ export class ManagedStore {
   }
   task(id: number) { return this.sql.exec<Task>("SELECT * FROM tasks WHERE id=?", id).one(); }
   candidate(): Task | null {
-    return this.sql.exec<Task>(`SELECT t.* FROM tasks t WHERE state='queued' AND NOT EXISTS(
-      SELECT 1 FROM tasks older WHERE older.conversation=t.conversation AND older.id<t.id
-      AND older.state IN ('queued','submitting','running','unknown')) ORDER BY id LIMIT 1`).toArray()[0] ?? null;
+    return this.sql.exec<Task>("SELECT * FROM tasks WHERE state='queued' ORDER BY id LIMIT 1").toArray()[0] ?? null;
   }
   command(task: Task): string | null {
-    const [word, ...args] = task.text.trim().split(/\s+/);
+    const word = task.text.trim();
     if (word === "/ping") return "pong · CF 网关运行中";
-    if (word === "/help") return "/ping 连通检查\n/status 状态\n/queue 排队\n/new 新会话\n/stop 停止任务\n/help 命令表\n首版支持文字消息。";
+    if (word === "/help") return "/ping 连通检查\n/status 连接状态\n/new 新会话\n/stop 向 Muse 请求停止\n/help 命令表\n消息直接交给 Muse 原生处理。";
     if (word === "/unsupported-media") return "CF 托管首版暂支持文字，请发送文字消息。";
     if (word === "/new") {
       this.sql.exec("UPDATE conversations SET generation=generation+1,session=NULL WHERE id=?", task.conversation);
       return "已开启新会话。";
     }
-    if (word === "/status" || word === "/queue") {
-      const rows = this.sql.exec<{ state: string; count: number }>("SELECT state,COUNT(*) count FROM tasks WHERE conversation=? AND id<>? AND state IN ('queued','running','submitting','unknown') GROUP BY state", task.conversation, task.id).toArray();
-      return rows.length ? rows.map((row) => ({ queued: "排队", running: "执行", submitting: "提交中", unknown: "待核查" }[row.state] + " " + row.count)).join("\n") : "当前空闲。";
-    }
+    if (word === "/queue") return "CF 不设置对话执行队列，消息由 Muse 原生处理。";
+    if (word === "/status") return "CF 渠道已连接，消息直接交给 Muse 原生处理。";
     if (word === "/stop") return null; // Requires remote cancellation in the runtime.
-    if (word.startsWith("/")) return "暂不支持此命令，请发送 /help。";
-    if (args.length > 10000 || task.text.length > 32000) return "消息过长，请缩短后再发送。";
     return null;
   }
 }

@@ -23,7 +23,7 @@ it("validates explicit account ownership and normalizes actual Tencent inbound s
   expect(() => assertPlatformSuccess({ ret: -1 })).toThrow();
 });
 
-it("atomically deduplicates ingress, queues per conversation, and commits one immutable outbound", async () => {
+it("atomically deduplicates ingress, forwards without waiting for previous turns, and commits one immutable outbound", async () => {
   await runInDurableObject(env.MOBILE.getByName("queue-test"), async (_instance, state) => {
     const store = new ManagedStore(state.storage.sql);
     const one = store.ingest(message("one"))!;
@@ -31,7 +31,7 @@ it("atomically deduplicates ingress, queues per conversation, and commits one im
     const two = store.ingest(message("two"))!;
     expect(store.candidate()?.id).toBe(one.id);
     state.storage.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", one.id);
-    expect(store.candidate()).toBeNull();
+    expect(store.candidate()?.id).toBe(two.id);
     state.storage.transactionSync(() => store.complete(one, "reply"));
     expect(store.candidate()?.id).toBe(two.id);
     state.storage.transactionSync(() => store.complete(one, "reply"));
@@ -39,7 +39,7 @@ it("atomically deduplicates ingress, queues per conversation, and commits one im
   });
 });
 
-it("deduplicates new-session commands before changing the conversation and fences unknown submissions", async () => {
+it("deduplicates new-session commands while keeping uncertain submissions from being resent", async () => {
   await runInDurableObject(env.MOBILE.getByName("commands-test"), async (_instance, state) => {
     const store = new ManagedStore(state.storage.sql);
     const command = store.ingest(message("new", "/new"))!;
@@ -48,8 +48,8 @@ it("deduplicates new-session commands before changing the conversation and fence
     const next = store.ingest(message("after-new"))!;
     expect(next.generation).toBe(1);
     state.storage.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", next.id);
-    store.ingest(message("after-unknown"));
-    expect(store.candidate()).toBeNull();
+    const later = store.ingest(message("after-unknown"))!;
+    expect(store.candidate()?.id).toBe(later.id);
     const help = store.ingest(message("help", "/help"))!;
     expect(store.command(help)).toContain("/stop");
   });

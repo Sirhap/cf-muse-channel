@@ -64,6 +64,7 @@ export default {
     const coordinator = env.CREDENTIALS.getByName("primary-account");
     return handleRequest(request, env, (forwarded) => {
       const path = new URL(forwarded.url).pathname;
+      if (path === "/admin/managed/probe-native") return env.MOBILE.getByName("native-verification").fetch(forwarded);
       const managed = path.startsWith("/admin/managed/") || env.MANAGED_CHANNELS_ENABLED === "true"
         && ["/channel-health", "/admin/channels"].includes(path);
       return managed ? env.MOBILE.getByName("channels").fetch(forwarded) : coordinator.fetch(forwarded);
