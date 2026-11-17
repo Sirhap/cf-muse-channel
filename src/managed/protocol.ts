@@ -108,10 +108,13 @@ export async function weixinCall(path: string, config: ChannelConfig, body: unkn
     body: JSON.stringify(body), redirect: "manual", signal: AbortSignal.timeout(timeout),
   }));
   // iLink empty long-poll replies may omit ret/errcode. They still need a valid
-  // updates shape; a send acknowledgement must always carry an explicit code.
+  // updates shape. Successful sends can omit zero and return only message_id.
   const implicitSuccess = result.ret === undefined && result.errcode === undefined
     && ((path === "getupdates" && (Array.isArray(result.msgs) || typeof result.get_updates_buf === "string"))
-      || (path === "sendmessage" && Object.keys(result).length === 0));
+      || (path === "sendmessage" && Object.keys(result).every((key) => ["message_id", "errmsg"].includes(key))
+        && (result.errmsg === undefined || result.errmsg === "")
+        && (result.message_id === undefined || typeof result.message_id === "string" && /^\d+$/.test(result.message_id)
+          || typeof result.message_id === "number" && Number.isSafeInteger(result.message_id) && result.message_id > 0)));
   if (!implicitSuccess) assertPlatformSuccess(result);
   return result;
 }

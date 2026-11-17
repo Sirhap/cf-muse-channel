@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { json } from "../http";
 import { MuseRpc } from "../noise";
 import { ManagedStore, type Task, type Outbound } from "./store";
+import { channelReply } from "./reply";
 import { assertPlatformSuccess, boundedJson, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
 
 interface Health { connected: boolean; last_ok: number | null; error: string | null; }
@@ -112,7 +113,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261116-2",
+        runtime_version: "managed-20261117-reply-v2",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
         last_pump_error: this.store.get("last_pump_error"),
@@ -542,10 +543,11 @@ export class ManagedChannels extends DurableObject<Env> {
   /** Only confirmed terminal state releases the conversation for its next turn. */
   private finish(task: Task, text: string, state: "succeeded" | "failed" | "cancelled") {
     this.ctx.storage.transactionSync(() => {
-      this.store.complete(task, text, state);
+      this.store.complete(task, channelReply(text), state);
       this.store.set("cancel:" + task.conversation, false);
     });
-    if (task.session) this.subscriptions.get(task.session)?.close();
+    // Reuse the subscription for the next turn. Its existing bounded idle read
+    // timeout closes it naturally; reconnecting never replays a user message.
   }
 
   private async deliver() {

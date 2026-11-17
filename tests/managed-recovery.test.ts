@@ -219,3 +219,40 @@ it("accepts Tencent's omitted default success code but rejects explicit send err
     await expect(weixinCall("sendmessage", config, {})).rejects.toThrow("platform_rejected");
   } finally { vi.unstubAllGlobals(); }
 });
+
+it("keeps an established session subscription warm between two turns instead of closing it on every reply", async () => {
+  await runInDurableObject(env.MOBILE.getByName("managed-warm-subscription"), async (_instance, state) => {
+    const runtime = new ManagedChannels(state, env) as unknown as {
+      socket: () => Promise<unknown>;
+      watch: (session: string) => Promise<void>;
+      finish: (task: Task, text: string, status: string) => void;
+    };
+    const store = new ManagedStore(state.storage.sql);
+    const task = store.ingest(message("first-turn"))!;
+    state.storage.sql.exec("UPDATE tasks SET session='session',state='running' WHERE id=?", task.id);
+    let release!: () => void;
+    const stream = new Promise<void>((resolve) => { release = resolve; });
+    const client = { subscribe: vi.fn(() => stream), close: vi.fn() };
+    const connect = vi.spyOn(runtime, "socket").mockResolvedValue(client);
+    try {
+      await runtime.watch("session");
+      runtime.finish(store.task(task.id), "answer\n\n[[hatch_widget:widget-hidden]]", "succeeded");
+      expect(store.task(task.id).result).toBe("answer");
+      expect(client.close).not.toHaveBeenCalled();
+      const second = store.ingest(message("second-turn"))!;
+      state.storage.sql.exec("UPDATE tasks SET session='session',state='running' WHERE id=?", second.id);
+      await runtime.watch("session");
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(client.subscribe).toHaveBeenCalledTimes(1);
+    } finally { release(); vi.restoreAllMocks(); }
+  });
+});
+
+it("recognizes a lossless Tencent send message ID even when the zero ret field is omitted", async () => {
+  const { weixinCall } = await import("../src/managed/protocol");
+  vi.stubGlobal("fetch", vi.fn(async () => new Response('{"message_id":7528384617896807432}')));
+  try {
+    await expect(weixinCall("sendmessage", { enabled: false, account: "test", secret: "synthetic", allowedSenders: ["alice"] }, {}))
+      .resolves.toEqual({ message_id: "7528384617896807432" });
+  } finally { vi.unstubAllGlobals(); }
+});

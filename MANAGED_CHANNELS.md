@@ -1,6 +1,8 @@
 # CF 独立渠道托管
 
-`ManagedChannels` 将腾讯渠道接收、Muse Noise 调用、会话队列和回复投递放在 Cloudflare Durable Object 中。微信使用腾讯 iLink 长轮询；企业微信使用腾讯 WSS；Muse 回复使用独立 WSS 订阅唤醒，15 秒历史查询作补查。Muse 虚机里的 Python 网关、Core 和 bridge 不参与这条链路。Muse 自身仍负责执行用户任务。
+`ManagedChannels` 将腾讯渠道接收、Muse Noise 调用、会话队列和回复投递放在 Cloudflare Durable Object 中。微信使用腾讯 iLink 长轮询；企业微信使用腾讯 WSS；Muse 回复使用独立 WSS 订阅唤醒，15 秒历史查询作补查。同一会话连续回合复用订阅连接，空闲读取超过 120 秒后关闭；断线重连仍然只读核对已有任务。Muse 虚机里的 Python 网关、Core 和 bridge 不参与这条链路。Muse 自身仍负责执行用户任务。
+
+转发前清理独占一行的 `[[hatch_widget:…]]` 交互组件标记，保留正文、普通方括号和行内示例。只有组件、没有正文时给出渠道不支持显示的说明。
 
 本版支持文字收发、发送者白名单、私聊会话隔离、企微群聊隔离和 `/ping`、`/help`、`/status`、`/queue`、`/new`、`/stop`。微信群消息不接收。图片、语音、文件和视频传输、扫码登录、原 Core 的全部扩展命令，以及 hook 备用暂未接入；非文字消息会收到范围提示。
 
