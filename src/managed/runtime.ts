@@ -107,6 +107,9 @@ export class ManagedChannels extends DurableObject<Env> {
         tasks: this.ctx.storage.sql.exec("SELECT state,COUNT(*) count FROM tasks GROUP BY state").toArray(),
         outbound: this.ctx.storage.sql.exec("SELECT state,COUNT(*) count FROM outbound GROUP BY state").toArray(),
         pending: this.ctx.storage.sql.exec("SELECT id,state,created_at FROM tasks WHERE state IN ('queued','submitting','running','unknown') ORDER BY id LIMIT 20").toArray(),
+        recent: this.ctx.storage.sql.exec<{ id: number; state: string; channel: string; message_id: string; created_at: number }>(
+          "SELECT id,state,json_extract(route,'$.channel') channel,message_id,created_at FROM tasks ORDER BY id DESC LIMIT 10").toArray()
+          .map((task) => ({ ...task, error: this.store.get("task-error:" + task.id) })),
         scope: "text",
       });
     }
@@ -250,7 +253,14 @@ export class ManagedChannels extends DurableObject<Env> {
   }
 
   private async connectWecom(config: ChannelConfig) {
-    const result = await fetch("https://openws.work.weixin.qq.com", { headers: { Upgrade: "websocket" }, redirect: "manual", signal: AbortSignal.timeout(15000) });
+    // A permanently armed timeout aborts the upgraded socket 15 seconds later.
+    // Bound only the handshake, then remove the timer for the connection lifetime.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    let result: Response;
+    try {
+      result = await fetch("https://openws.work.weixin.qq.com", { headers: { Upgrade: "websocket" }, redirect: "manual", signal: controller.signal });
+    } finally { clearTimeout(timeout); }
     if (result.status !== 101 || !result.webSocket) throw new Error("wecom_upgrade_failed_" + result.status);
     const socket = result.webSocket;
     const current = this.config("wecom");

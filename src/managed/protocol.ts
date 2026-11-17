@@ -81,7 +81,15 @@ export async function boundedJson(response: Response, limit = 1024 * 1024): Prom
   const bytes = new Uint8Array(length);
   let at = 0;
   for (const part of parts) { bytes.set(part, at); at += part.length; }
-  return object(JSON.parse(new TextDecoder().decode(bytes)));
+  // Tencent message IDs are 64-bit JSON integers. The reviver's original source
+  // preserves them before Number rounding can corrupt routing and deduplication.
+  return object(JSON.parse(new TextDecoder().decode(bytes), (_key, value: unknown, context?: { source?: string }) => {
+    if (typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      if (!context?.source || !/^-?\d+$/.test(context.source)) throw new Error("unsafe_json_integer");
+      return context.source;
+    }
+    return value;
+  }));
 }
 export function assertPlatformSuccess(result: Record<string, unknown>) {
   if (!("ret" in result || "errcode" in result) || (result.ret !== undefined && result.ret !== 0)

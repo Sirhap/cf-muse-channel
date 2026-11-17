@@ -151,3 +151,40 @@ it("accepts an empty iLink update checkpoint without ret while requiring explici
     await expect(weixinCall("sendmessage", config, {})).rejects.toThrow("platform_rejected");
   } finally { vi.unstubAllGlobals(); }
 });
+
+it("preserves Tencent's 64-bit message IDs before JavaScript can round them or discard the message", async () => {
+  const { boundedJson, weixinMessages } = await import("../src/managed/protocol");
+  const response = new Response('{"ret":0,"msgs":[{"message_id":7527655115952555016,"from_user_id":"alice","item_list":[{"type":1,"text_item":{"text":"CF test"}}]}]}');
+  const data = await boundedJson(response);
+  expect(weixinMessages(data, { enabled: true, account: "test", secret: "synthetic", allowedSenders: ["alice"] })[0]?.id)
+    .toBe("7527655115952555016");
+});
+
+it("removes the handshake deadline after upgrading a persistent WeCom connection", async () => {
+  await runInDurableObject(env.MOBILE.getByName("managed-handshake-deadline"), async (_instance, state) => {
+    const config = { enabled: true, account: "test-account", secret: "synthetic", allowedSenders: ["alice"] };
+    state.storage.sql.exec("INSERT INTO config VALUES ('wecom',?)", JSON.stringify(config));
+    const runtime = new ManagedChannels(state, env) as unknown as {
+      connectWecom: (settings: typeof config) => Promise<void>;
+      frame: () => Promise<Record<string, unknown>>;
+      closeWecom: () => void;
+    };
+    let peer: WebSocket | undefined;
+    let signal: AbortSignal | undefined;
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const clear = vi.spyOn(globalThis, "clearTimeout");
+    vi.spyOn(runtime, "frame").mockResolvedValue({ errcode: 0 });
+    vi.stubGlobal("fetch", vi.fn(async (_input: unknown, init?: RequestInit) => {
+      signal = init?.signal ?? undefined;
+      const pair = new WebSocketPair(); peer = pair[1]; peer.accept();
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }));
+    try {
+      await runtime.connectWecom(config);
+      const timerIndex = timers.mock.calls.findIndex(([, milliseconds]) => milliseconds === 15000);
+      expect(timerIndex).toBeGreaterThanOrEqual(0);
+      expect(clear).toHaveBeenCalledWith(timers.mock.results[timerIndex].value);
+      expect(signal?.aborted).toBe(false);
+    } finally { runtime.closeWecom(); peer?.close(); vi.restoreAllMocks(); vi.unstubAllGlobals(); }
+  });
+});
