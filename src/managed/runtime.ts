@@ -274,10 +274,10 @@ export class ManagedChannels extends DurableObject<Env> {
         }
       } catch { this.healthResult("wecom", "invalid_gateway_frame"); }
     });
-    const disconnected = () => {
+    const disconnected = (event: Event) => {
       if (this.wecom !== socket) return;
       this.closeWecom();
-      this.healthResult("wecom", "gateway_disconnected");
+      this.healthResult("wecom", event instanceof CloseEvent ? "gateway_closed_" + event.code : "gateway_disconnected");
       this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now() + 5000));
     };
     socket.addEventListener("close", disconnected);

@@ -99,6 +99,9 @@ export async function weixinCall(path: string, config: ChannelConfig, body: unkn
       AuthorizationType: "ilink_bot_token", "X-WECHAT-UIN": btoa(uin), "iLink-App-Id": "bot", "iLink-App-ClientVersion": "132105" },
     body: JSON.stringify(body), redirect: "manual", signal: AbortSignal.timeout(timeout),
   }));
-  assertPlatformSuccess(result);
+  // iLink empty long-poll replies may omit ret/errcode. They still need a valid
+  // updates shape; a send acknowledgement must always carry an explicit code.
+  if (!(path === "getupdates" && result.ret === undefined && result.errcode === undefined
+    && (Array.isArray(result.msgs) || typeof result.get_updates_buf === "string"))) assertPlatformSuccess(result);
   return result;
 }

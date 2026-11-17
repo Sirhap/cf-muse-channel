@@ -141,3 +141,13 @@ it("preflights WeCom with a real Workers Request without subscribing to or takin
     } finally { server?.close(); vi.unstubAllGlobals(); }
   });
 });
+
+it("accepts an empty iLink update checkpoint without ret while requiring explicit send acknowledgement", async () => {
+  const { weixinCall } = await import("../src/managed/protocol");
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ msgs: [], get_updates_buf: "synthetic-cursor" })));
+  const config = { enabled: false, account: "test-account", secret: "synthetic", allowedSenders: ["alice"] };
+  try {
+    await expect(weixinCall("getupdates", config, {})).resolves.toMatchObject({ msgs: [] });
+    await expect(weixinCall("sendmessage", config, {})).rejects.toThrow("platform_rejected");
+  } finally { vi.unstubAllGlobals(); }
+});
