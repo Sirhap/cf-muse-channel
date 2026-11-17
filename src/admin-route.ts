@@ -1,6 +1,7 @@
 import { AdminInputError, readAdminLogin } from "./admin-input";
 import { adminLoginPage, adminPage } from "./admin-page";
 import { adminSessionHash, adminSessionRedirect, adminSessionToken, newAdminSessionToken, type AdminSessions } from "./admin-session";
+import { managedPage } from "./managed/page";
 import { authorized, json, matchesKey, validAdminKey } from "./http";
 
 export function isAdminRoute(path: string) {
@@ -42,13 +43,21 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
     return adminSessionRedirect("/admin", newToken);
   }
 
+  if (path === "/admin/managed" && request.method === "GET") {
+    return await signedIn() ? managedPage() : adminSessionRedirect("/admin/login");
+  }
+
   if (path === "/admin/logout" && request.method === "POST") {
     if (request.headers.get("Origin") !== url.origin) return json({ error: "origin_not_allowed" }, 403);
     if (hash && sessions) await sessions.endAdminSession(hash);
     return adminSessionRedirect("/admin/login", "");
   }
 
-  const allowed = request.method === "GET" && path === "/admin/channels"
+  const allowed = (request.method === "GET" && ["/admin/managed/status", "/admin/managed/probe"].includes(path))
+    || (request.method === "POST" && path === "/admin/managed/probe")
+    || (request.method === "POST" && path === "/admin/managed/connectivity")
+    || (request.method === "POST" && ["/admin/managed/weixin", "/admin/managed/wecom"].includes(path))
+    || request.method === "GET" && path === "/admin/channels"
     || request.method === "POST" && path === "/admin/current-cookie"
     || ["GET", "POST"].includes(request.method) && path === "/admin/cookie";
   if (!allowed) return json({ error: "not_found" }, 404);

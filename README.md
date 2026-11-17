@@ -1,13 +1,13 @@
 # CF Muse Channel · Cookie 连接版
 
-这个仓库现提供 CF Cookie 中转和 Python 验证客户端，替换原来的网页聊天、Durable Object 房间、MCP 与 hook 接入器实现。旧代码保留在 Git 历史中，替换前基线为 `43ea75f`。
+这个仓库提供 CF 独立渠道托管、Cookie 中转和 Python 验证客户端，替换原来的网页聊天、Durable Object 房间、MCP 与 hook 接入器实现。旧代码保留在 Git 历史中，替换前基线为 `43ea75f`。
 
 ```text
 Python 客户端 ── HTTPS / WSS ── CF Worker ── Cookie 换证 / WSS ── Muse
        └──────────────── Noise 加密协议 ────────────────────────┘
 ```
 
-CF 负责 Cookie 认证、WebSocket 中转和自主网络审批，Python 客户端处理渠道连接、会话与结果查询。Cookie 放在 CF Secret，客户端使用独立 `DEMO_KEY`，只连接配置好的 Worker。
+CF 可直接负责微信/企微文字收发、会话队列、Muse 执行和回复投递，见 [MANAGED_CHANNELS.md](MANAGED_CHANNELS.md)。原 Python 适配模式继续可用。CF 同时负责 Cookie 认证、WebSocket 中转和自主网络审批。Cookie 放在 CF Secret，客户端使用独立 `DEMO_KEY`，只连接配置好的 Worker。
 
 当前版本提供微信、企业微信的连接适配器和最小接入补丁，见 [CHANNEL_INTEGRATION.md](CHANNEL_INTEGRATION.md)；实际部署与手机收发验收分别记录，不包含聊天网页。Worker 会接收服务端返回的新 Cookie，并自动续期；会话被服务端撤销或已失效时仍需重新登录导入。长连接断开或结果未知时不会自动重发任务。
 
@@ -41,7 +41,7 @@ npm run build
 npm run dev
 ```
 
-完整自动化回归使用 `npm run test:all`（当前 190 项测试，含本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
+完整自动化回归使用 `npm run test:all`（含渠道断线恢复、取消确认与分片投递测试，以及本地运行时重启、实际 scheduled 事件、长任务结束标记与审批规则）；独立打包检查使用 `npm run build`。行为范围、已发现问题和 17 项线上检查见 [TESTING.md](TESTING.md)。
 
 默认使用 `http://127.0.0.1:8787`。本地运行时的出站来自本机，不证明 CF 云端出站可用。
 

@@ -1,0 +1,50 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cf-muse-managed",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-15",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": false,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CREDENTIALS",
+        "class_name": "MuseCredentials",
+        "script_name": "REPLACE_WITH_EXISTING_CREDENTIAL_WORKER"
+      },
+      {
+        "name": "MOBILE",
+        "class_name": "ManagedChannels"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "managed-v1",
+      "new_sqlite_classes": [
+        "ManagedChannels"
+      ]
+    }
+  ],
+  "triggers": {
+    "crons": []
+  },
+  "vars": {
+    "AUTO_APPROVAL_ENABLED": "false",
+    "AUTO_APPROVAL_POLICY_JSON": "{\"rules\":[]}",
+    "MANAGED_CHANNELS_ENABLED": "true"
+  },
+  "account_id": "REPLACE_WITH_YOUR_ACCOUNT_ID",
+  "routes": [
+    {
+      "pattern": "channels.example.com",
+      "custom_domain": true
+    }
+  ]
+}

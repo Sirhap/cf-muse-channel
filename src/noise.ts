@@ -122,19 +122,9 @@ export class MuseRpc {
     } catch (error) { frames.close(); throw error; }
   }
   close() { this.frames.close(); }
-  async call(path: string, service = 1, method = 'GET', body?: unknown, timeout = 20000): Promise<unknown> {
-    const stream = this.stream++;
-    let request = join(b(1, method), b(2, path), b(3, join(b(1, 'x-request-id'), b(2, crypto.randomUUID()))), n(5, 1));
-    if (body !== undefined) request = join(request, b(3, join(b(1, 'content-type'), b(2, 'application/json'))), b(4, JSON.stringify(body)));
-    const frame = join(n(1, stream), b(2, request));
-    const envelope = join(n(1, service), b(2, frame));
-    const transport = join(n(1, BigInt(stream)), n(2, 0), n(3, 1), b(4, envelope));
-    this.frames.socket.send(owned(await this.noise.encrypt(transport)));
-    const deadline = Date.now() + timeout;
-    let status = 0, length = 0;
-    const chunks: Uint8Array[] = [];
-    while (Date.now() < deadline) {
-      const record = fields(await this.noise.decrypt(await this.frames.read(Math.max(1, deadline - Date.now()))));
+  private async readFrame(timeout: number) {
+    for (;;) {
+      const record = fields(await this.noise.decrypt(await this.frames.read(timeout)));
       const total = Number(getNumber(record, 3)) || 1, index = Number(getNumber(record, 2));
       let payload = getBytes(record, 4);
       if (total > 1) {
@@ -148,7 +138,57 @@ export class MuseRpc {
         if (group.parts.size !== total) continue;
         payload = join(...Array.from({ length: total }, (_, i) => group.parts.get(i)!)); this.fragments.delete(id);
       }
-      const serviceResponse = fields(payload), responseFrame = fields(getBytes(serviceResponse, 1));
+      const serviceResponse = fields(payload);
+      return fields(getBytes(serviceResponse, 1));
+    }
+  }
+  /** Send once. Caller must persist an intent before invoking this for a chat turn. */
+  async open(path: string, service = 0, method = 'POST', body?: unknown) {
+    const stream = this.stream++;
+    let request = join(b(1, method), b(2, path), b(3, join(b(1, 'x-request-id'), b(2, crypto.randomUUID()))), n(5, 1));
+    if (body !== undefined) request = join(request, b(3, join(b(1, 'content-type'), b(2, 'application/json'))), b(4, JSON.stringify(body)));
+    const frame = join(n(1, stream), b(2, request));
+    const envelope = join(n(1, service), b(2, frame));
+    const transport = join(n(1, BigInt(stream)), n(2, 0), n(3, 1), b(4, envelope));
+    this.frames.socket.send(owned(await this.noise.encrypt(transport)));
+    return stream;
+  }
+
+  /** A dedicated connection owns this subscription's receive loop. */
+  async subscribe(path: string, body: unknown, onEvent: (event: unknown) => void) {
+    const stream = await this.open(path, 0, 'POST', body);
+    let buffer = '';
+    const decoder = new TextDecoder();
+    for (;;) {
+      const frame = await this.readFrame(120000);
+      if (Number(getNumber(frame, 1)) !== stream) continue;
+      if (frame.has(5)) throw new Error('rpc_stream_reset');
+      const response = frame.has(3) ? fields(getBytes(frame, 3)) : fields(getBytes(frame, 4));
+      if (frame.has(3)) {
+        const status = Number(getNumber(response, 1));
+        if (status < 200 || status >= 300) throw new Error('subscription_refused');
+      }
+      buffer += decoder.decode(getBytes(response, frame.has(3) ? 3 : 1), { stream: true });
+      if (buffer.length > 2 * 1024 * 1024) throw new Error('subscription_limit');
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+        if (line.trim()) onEvent(JSON.parse(line));
+      }
+      if (Boolean(getNumber(response, frame.has(3) ? 4 : 2))) {
+        buffer += decoder.decode();
+        if (buffer.trim()) onEvent(JSON.parse(buffer));
+        return;
+      }
+    }
+  }
+  async call(path: string, service = 1, method = 'GET', body?: unknown, timeout = 20000): Promise<unknown> {
+    const stream = await this.open(path, service, method, body);
+    const deadline = Date.now() + timeout;
+    let status = 0, length = 0;
+    const chunks: Uint8Array[] = [];
+    while (Date.now() < deadline) {
+      const responseFrame = await this.readFrame(Math.max(1, deadline - Date.now()));
       if (Number(getNumber(responseFrame, 1)) !== stream) continue;
       if (responseFrame.has(5)) throw new Error('rpc_stream_reset');
       let end = false, chunk = EMPTY;

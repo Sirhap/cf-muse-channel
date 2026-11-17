@@ -13,3 +13,5 @@ AUTO_APPROVAL_POLICY_JSON=""
 
 # Optional: a separate management password (12–512 characters) to enable /admin.
 MUSE_ADMIN_KEY=""
+
+MANAGED_CHANNELS_ENABLED="false"

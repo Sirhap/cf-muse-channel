@@ -1,6 +1,7 @@
 import { handleAdminRoute, isAdminRoute } from "./admin-route";
 import type { AdminSessions } from "./admin-session";
 import { authorized, json } from "./http";
+export { ManagedChannels } from "./managed/runtime";
 export { MuseCredentials } from "./credentials";
 
 const MUSE_ORIGIN = "https://muse.ai";
@@ -61,7 +62,12 @@ async function dispatchSafely(request: Request, dispatch: (request: Request) => 
 export default {
   fetch(request: Request, env: Env): Promise<Response> {
     const coordinator = env.CREDENTIALS.getByName("primary-account");
-    return handleRequest(request, env, (forwarded) => coordinator.fetch(forwarded), coordinator);
+    return handleRequest(request, env, (forwarded) => {
+      const path = new URL(forwarded.url).pathname;
+      const managed = path.startsWith("/admin/managed/") || env.MANAGED_CHANNELS_ENABLED === "true"
+        && ["/channel-health", "/admin/channels"].includes(path);
+      return managed ? env.MOBILE.getByName("channels").fetch(forwarded) : coordinator.fetch(forwarded);
+    }, coordinator);
   },
   async scheduled(event: ScheduledController, env: Env): Promise<void> {
     const status = await env.CREDENTIALS.getByName("primary-account").scheduledRenewal(event.scheduledTime, event.cron);

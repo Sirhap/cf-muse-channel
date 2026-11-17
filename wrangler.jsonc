@@ -16,6 +16,10 @@
       {
         "name": "CREDENTIALS",
         "class_name": "MuseCredentials"
+      },
+      {
+        "name": "MOBILE",
+        "class_name": "ManagedChannels"
       }
     ]
   },
@@ -24,6 +28,12 @@
       "tag": "cookie-v1",
       "new_sqlite_classes": [
         "MuseCredentials"
+      ]
+    },
+    {
+      "tag": "managed-v1",
+      "new_sqlite_classes": [
+        "ManagedChannels"
       ]
     }
   ],
@@ -34,6 +44,7 @@
   },
   "vars": {
     "AUTO_APPROVAL_ENABLED": "false",
-    "AUTO_APPROVAL_POLICY_JSON": "{\"rules\":[]}"
+    "AUTO_APPROVAL_POLICY_JSON": "{\"rules\":[]}",
+    "MANAGED_CHANNELS_ENABLED": "false"
   }
 }

@@ -40,7 +40,7 @@ export function adminPage(local = false, signedIn = false): Response {
   <main class="main">
     <div class="topbar">
       <div class="breadcrumb"><span>控制台</span><span aria-hidden="true">/</span><strong>Cookie 管理</strong></div>
-      <div class="account-actions"><span class="environment"><span aria-hidden="true"></span>${local ? "本地预览" : "生产环境"}</span>
+      <div class="account-actions">${signedIn ? '<a class="login-link" href="/admin/managed">渠道托管</a>' : ""}<span class="environment"><span aria-hidden="true"></span>${local ? "本地预览" : "生产环境"}</span>
       ${signedIn ? '<form action="/admin/logout" method="post"><button class="quiet" type="submit">退出登录</button></form>' : '<a class="login-link" href="/admin/login">登录管理</a>'}</div>
     </div>
     <header class="heading">

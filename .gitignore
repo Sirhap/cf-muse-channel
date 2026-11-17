@@ -29,3 +29,5 @@ muse-credentials*.zip
 *.key
 
 .playwright-cli/
+
+wrangler.managed.local.jsonc
