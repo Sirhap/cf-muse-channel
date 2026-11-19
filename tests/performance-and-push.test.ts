@@ -430,4 +430,18 @@ describe("ManagedChannels 主动推送 (/managed/push) 与事件唤醒优化", (
       expect(close).toHaveBeenCalledTimes(1);
     });
   });
+
+  it("已启用渠道但 alarm 丢失时，查询状态自动补挂 alarm 自愈", async () => {
+    await runInDurableObject(env.MOBILE.getByName("managed-alarm-self-heal"), async (_instance, state) => {
+      const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
+      state.storage.sql.exec("INSERT INTO config VALUES ('wecom',?)", JSON.stringify({
+        enabled: true, account: "wc-bot", secret: "wc-secret", allowedSenders: ["alice"],
+      }));
+      expect(await state.storage.getAlarm()).toBeNull();
+      const res = await runtime.fetch(new Request("https://internal/admin/managed/status"));
+      expect(res.status).toBe(200);
+      const body = await res.json<{ next_alarm_at: number | null }>();
+      expect(body.next_alarm_at).not.toBeNull();
+    });
+  });
 });

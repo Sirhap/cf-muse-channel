@@ -55,6 +55,9 @@ export class ManagedChannels extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    if (["/channel-health", "/admin/channels", "/admin/managed/status", "/managed/push", "/admin/managed/push"].includes(path)) {
+      await this.ensureAlarm();
+    }
     if (path === "/admin/managed/probe-native" && ["GET", "POST"].includes(request.method)) {
       if (request.method === "POST" && !this.store.get("native-verification")) {
         if (this.env.MANAGED_CHANNELS_ENABLED !== "true") return json({ error: "native_probe_disabled" }, 409);
@@ -352,6 +355,15 @@ export class ManagedChannels extends DurableObject<Env> {
   private healthResult(channel: Channel, error?: string) {
     this.health[channel] = error ? { ...this.health[channel], connected: false, error }
       : { connected: true, last_ok: Date.now(), error: null };
+  }
+
+  /** 若渠道已启用或有待处理任务但持久化 alarm 丢失（例如配额超限重启后），自动补挂 alarm 自愈。 */
+  async ensureAlarm(): Promise<boolean> {
+    if (this.env.MANAGED_CHANNELS_ENABLED !== "true") return false;
+    if (!this.config("weixin")?.enabled && !this.config("wecom")?.enabled && !this.active()) return false;
+    if (await this.ctx.storage.getAlarm() !== null) return false;
+    await this.ctx.storage.setAlarm(Date.now() + 1000);
+    return true;
   }
 
   async alarm() {

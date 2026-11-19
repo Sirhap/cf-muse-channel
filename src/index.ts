@@ -73,5 +73,8 @@ export default {
   async scheduled(event: ScheduledController, env: Env): Promise<void> {
     const status = await env.CREDENTIALS.getByName("primary-account").scheduledRenewal(event.scheduledTime, event.cron);
     if (!status.ok) console.warn(JSON.stringify({ event: "cookie_refresh_failed", error: status.last_error }));
+    if (env.MANAGED_CHANNELS_ENABLED === "true" && env.MOBILE) {
+      await env.MOBILE.getByName("channels").ensureAlarm().catch(() => {});
+    }
   },
 } satisfies ExportedHandler<Env>;
