@@ -45,7 +45,7 @@ export async function handleRequest(request: Request, env: Env,
       && request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
     return json({ error: "websocket_upgrade_required" }, 426);
   }
-  const allowed = (request.method === "POST" && ["/probe/cookie", "/credentials/refresh", "/approvals/poll", "/probe/worker-rpc"].includes(url.pathname))
+  const allowed = (request.method === "POST" && ["/probe/cookie", "/credentials/refresh", "/approvals/poll", "/probe/worker-rpc", "/managed/push"].includes(url.pathname))
     || (request.method === "GET" && ["/ws", "/credentials/status", "/approvals/status", "/renewal/scheduled-status"].includes(url.pathname));
   if (!allowed) return json({ error: "not_found" }, 404);
   return dispatchSafely(request, dispatch);
@@ -65,7 +65,7 @@ export default {
     return handleRequest(request, env, (forwarded) => {
       const path = new URL(forwarded.url).pathname;
       if (path === "/admin/managed/probe-native") return env.MOBILE.getByName("native-verification").fetch(forwarded);
-      const managed = path.startsWith("/admin/managed/") || env.MANAGED_CHANNELS_ENABLED === "true"
+      const managed = path.startsWith("/admin/managed/") || path === "/managed/push" || env.MANAGED_CHANNELS_ENABLED === "true"
         && ["/channel-health", "/admin/channels"].includes(path);
       return managed ? env.MOBILE.getByName("channels").fetch(forwarded) : coordinator.fetch(forwarded);
     }, coordinator);

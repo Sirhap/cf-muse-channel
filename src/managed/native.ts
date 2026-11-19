@@ -32,13 +32,58 @@ export class NativeConversations {
       .sort((a, b) => Number(a.seq) - Number(b.seq));
   }
 
-  private history(session: string) {
-    return this.rpc((client) => client.call("/chat/history?session_id=" + encodeURIComponent(session) + "&limit=500", 0));
+  private history(session: string, limit = 40) {
+    return this.rpc((client) => client.call("/chat/history?session_id=" + encodeURIComponent(session) + "&limit=" + limit, 0));
+  }
+
+  /** 默认仅拉取最近 40 条事件；若检测到游标与最小序号间存在缺口，自动阶梯补拉避免漏消息。 */
+  private async historySince(session: string, cursor: number) {
+    let events = this.events(await this.history(session, 40));
+    if (cursor > 0 && events.length >= 40 && Number(events[0].seq) > cursor + 1) {
+      events = this.events(await this.history(session, 200));
+      if (events.length >= 200 && Number(events[0].seq) > cursor + 1) {
+        events = this.events(await this.history(session, 500));
+      }
+    }
+    return events;
   }
 
   sessions() {
     return this.store.sql.exec<NativeSession>(`SELECT n.* FROM native_sessions n JOIN conversations c ON c.id=n.conversation
       WHERE n.awaiting=1 OR c.generation=n.generation ORDER BY n.last_checked`).toArray();
+  }
+
+  session(id: string): NativeSession | null {
+    return this.store.sql.exec<NativeSession>("SELECT * FROM native_sessions WHERE session=?", id).toArray()[0] ?? null;
+  }
+
+  /** 查找指定渠道最近保存的合法路由（用于主动推送自动继承微信最新 context_token 与目标聊天）。 */
+  latestRoute(channel: Incoming["channel"], account: string, chat?: string, group?: boolean): Incoming | null {
+    const rows = this.store.sql.exec<{ route: string }>(
+      "SELECT route FROM native_sessions WHERE json_extract(route,'$.channel')=? AND json_extract(route,'$.account')=? ORDER BY last_checked DESC LIMIT 50",
+      channel, account).toArray();
+    for (const row of rows) {
+      try {
+        const route = JSON.parse(row.route) as Incoming;
+        if (chat !== undefined && route.chat !== chat) continue;
+        if (group !== undefined && Boolean(route.group) !== group) continue;
+        if (channel === "weixin" && !route.context) continue;
+        return route;
+      } catch { /* 跳过格式异常记录 */ }
+    }
+    const taskRows = this.store.sql.exec<{ route: string }>(
+      "SELECT route FROM tasks WHERE json_extract(route,'$.channel')=? AND json_extract(route,'$.account')=? AND message_id NOT LIKE 'push:%' ORDER BY id DESC LIMIT 50",
+      channel, account).toArray();
+    for (const row of taskRows) {
+      try {
+        const route = JSON.parse(row.route) as Incoming;
+        if (chat !== undefined && route.chat !== chat) continue;
+        if (group !== undefined && Boolean(route.group) !== group) continue;
+        if (channel === "weixin" && !route.context) continue;
+        return route;
+      } catch { /* 跳过格式异常记录 */ }
+    }
+    return null;
   }
 
   private async bind(task: Task): Promise<NativeSession> {
@@ -60,23 +105,23 @@ export class NativeConversations {
     // instead start at their original boundary so an upgrade cannot lose a reply.
     const unfinished = this.store.sql.exec<{ baseline: number }>(
       "SELECT baseline FROM tasks WHERE conversation=? AND generation=? AND session=? AND state IN ('running','unknown','submitting')", task.conversation, task.generation, session).toArray();
-    const events = this.events(await this.history(session));
+    const events = this.events(await this.history(session, unfinished.length ? 100 : 20));
     const cursor = unfinished.length ? Math.min(...unfinished.map((row) => row.baseline)) : Math.max(0, ...events.map((event) => Number(event.seq)));
     this.store.sql.exec("INSERT INTO native_sessions(session,conversation,generation,route,cursor) VALUES (?,?,?,?,?)", session, task.conversation, task.generation, task.route, cursor);
     return this.store.sql.exec<NativeSession>("SELECT * FROM native_sessions WHERE session=?", session).one();
   }
 
   /** A successfully sent input never waits for an earlier assistant reply. */
-  async forward(task: Task) {
+  async forward(task: Task): Promise<string | null> {
     if (task.text.trim() === "/stop") {
       const row = this.store.sql.exec<{ session: string | null }>("SELECT session FROM conversations WHERE id=? AND generation=?", task.conversation, task.generation).toArray()[0];
       if (row?.session) {
         this.store.sql.exec("UPDATE tasks SET state='submitting',session=? WHERE id=?", row.session, task.id);
         try { await this.rpc((client) => client.call("/chat/cancel", 0, "POST", { session_id: row.session })); }
-        catch { this.store.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", task.id); return; }
+        catch { this.store.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", task.id); return row.session; }
       }
       this.commit(() => this.store.complete(task, row?.session ? "已向 Muse 发送停止请求。" : "当前没有已连接的 Muse 会话。"));
-      return;
+      return row?.session ?? null;
     }
     const binding = await this.bind(task);
     const device = "cf-managed-" + crypto.randomUUID();
@@ -97,6 +142,7 @@ export class NativeConversations {
       // Recovery only inspects this device receipt; it never resends this input.
       this.store.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", task.id);
     }
+    return binding.session;
   }
 
   /** Adopt any old in-flight transport receipt without resubmitting the message. */
@@ -112,11 +158,22 @@ export class NativeConversations {
    * The session itself may still be running; it is never a gate on delivery.
    */
   async collect(binding: NativeSession): Promise<boolean> {
-    this.watch(binding.session);
-    const events = this.events(await this.history(binding.session));
+    if (binding.awaiting) this.watch(binding.session);
+    const events = await this.historySince(binding.session, binding.cursor);
     const latest = new Map<string, Record<string, unknown>>();
-    const inputs = this.store.sql.exec<Task>("SELECT * FROM tasks WHERE session=? AND state IN ('submitted','unknown')", binding.session).toArray();
-    const devices = new Map(inputs.map((task) => [this.store.get<string>("device:" + task.id), task]));
+    const hasUserEvents = events.some((event) => event.event_name === "message.user");
+    const devices = new Map<string, Task>();
+    if (hasUserEvents) {
+      const inputs = this.store.sql.exec<Task>(
+        `SELECT * FROM tasks WHERE session=? AND state='unknown'
+         UNION ALL
+         SELECT * FROM (SELECT * FROM tasks WHERE session=? AND state='submitted' ORDER BY id DESC LIMIT 20)`,
+        binding.session, binding.session).toArray();
+      for (const task of inputs) {
+        const device = this.store.get<string>("device:" + task.id);
+        if (device) devices.set(device, task);
+      }
+    }
     for (const event of events) {
       const payload = object(event.payload);
       if (payload.session_id !== undefined && payload.session_id !== binding.session) continue;

@@ -122,6 +122,11 @@ export class MuseCredentials extends DurableObject<Env> {
   private record(kind: string, value: unknown) {
     this.ctx.storage.sql.exec("INSERT INTO service_events VALUES (?,?) ON CONFLICT(kind) DO UPDATE SET value=excluded.value", kind, JSON.stringify(value));
   }
+  private approvalPollIntervalMs() {
+    const raw = Number((this.env as Env & { AUTO_APPROVAL_POLL_MS?: string }).AUTO_APPROVAL_POLL_MS);
+    if (Number.isFinite(raw) && raw >= 15_000 && raw <= 300_000) return Math.floor(raw);
+    return 30_000;
+  }
   private async ensureAlarm() {
     if (this.env.AUTO_APPROVAL_ENABLED === "true" && await this.ctx.storage.getAlarm() === null) {
       await this.ctx.storage.setAlarm(Date.now() + 10000);
@@ -164,6 +169,6 @@ export class MuseCredentials extends DurableObject<Env> {
   async alarm() {
     if (this.env.AUTO_APPROVAL_ENABLED !== "true") return;
     try { await this.poll("durable_object_alarm"); }
-    finally { await this.ctx.storage.setAlarm(Date.now() + 30000); }
+    finally { await this.ctx.storage.setAlarm(Date.now() + this.approvalPollIntervalMs()); }
   }
 }

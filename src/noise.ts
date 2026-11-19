@@ -2,7 +2,20 @@ import { x25519 } from '@noble/curves/ed25519';
 import { bytesField as b, numberField as n, fields, getBytes, getNumber, join, utf8 } from './wire';
 
 const EMPTY: Uint8Array = new Uint8Array();
-function owned(value: Uint8Array): ArrayBuffer { return Uint8Array.from(value).buffer; }
+const MAX_SOCKET_QUEUE = 1024;
+const MAX_STREAM_QUEUE = 1024;
+type FrameFields = ReturnType<typeof fields>;
+interface StreamBuffer {
+  queue: FrameFields[];
+  waiter?: { resolve: (frame: FrameFields) => void; reject: (error: Error) => void };
+}
+/** 整块 ArrayBuffer 直接零拷贝透传，仅在切片视图时复制。 */
+function owned(value: Uint8Array): ArrayBuffer {
+  if (value.byteOffset === 0 && value.byteLength === value.buffer.byteLength && value.buffer instanceof ArrayBuffer) {
+    return value.buffer;
+  }
+  return Uint8Array.from(value).buffer;
+}
 async function hash(value: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', owned(value)));
 }
@@ -90,29 +103,38 @@ class SocketFrames {
       if (!(event.data instanceof ArrayBuffer)) { this.stop(); return; }
       const data = new Uint8Array(event.data);
       if (this.waiter) { const waiter = this.waiter; this.waiter = undefined; waiter.resolve(data); }
-      else if (this.queue.length < 128) this.queue.push(data);
+      else if (this.queue.length < MAX_SOCKET_QUEUE) this.queue.push(data);
       else this.stop();
     });
     socket.addEventListener('close', () => this.stop()); socket.addEventListener('error', () => this.stop());
     socket.accept();
   }
   private stop() { this.ended = true; this.waiter?.reject(new Error('noise_socket_closed')); this.waiter = undefined; }
+  /** timeout <= 0 表示持久等待（由上层 stream 独立管理超时）。 */
   read(timeout = 15000): Promise<Uint8Array> {
     const ready = this.queue.shift(); if (ready) return Promise.resolve(ready);
     if (this.ended) return Promise.reject(new Error('noise_socket_closed'));
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.waiter = undefined; reject(new Error('noise_read_timeout')); }, timeout);
-      this.waiter = { resolve: (data) => { clearTimeout(timer); resolve(data); }, reject: (error) => { clearTimeout(timer); reject(error); } };
+      const timer = timeout > 0 ? setTimeout(() => { this.waiter = undefined; reject(new Error('noise_read_timeout')); }, timeout) : undefined;
+      this.waiter = {
+        resolve: (data) => { if (timer !== undefined) clearTimeout(timer); resolve(data); },
+        reject: (error) => { if (timer !== undefined) clearTimeout(timer); reject(error); },
+      };
     });
   }
   close() { this.stop(); try { this.socket.close(1000, 'RPC complete'); } catch { /* Already closed. */ } }
 }
 
-/** Bounded unary Muse RPC used by Worker-owned approval polling and channel administration. */
+/** 支持流级多路复用与自动排空未订阅流响应的 Noise RPC 客户端。 */
 export class MuseRpc {
   private stream = 1;
   private fragments = new Map<string, { total: number; bytes: number; parts: Map<number, Uint8Array> }>();
-  private constructor(private frames: SocketFrames, private noise: NoiseXX) {}
+  private streams = new Map<number, StreamBuffer>();
+  private sendSerial: Promise<void> = Promise.resolve();
+  private closedError?: Error;
+  private constructor(private frames: SocketFrames, private noise: NoiseXX) {
+    void this.pumpIncoming();
+  }
   static async connect(socket: WebSocket): Promise<MuseRpc> {
     const frames = new SocketFrames(socket), noise = new NoiseXX();
     try {
@@ -121,10 +143,47 @@ export class MuseRpc {
       return new MuseRpc(frames, noise);
     } catch (error) { frames.close(); throw error; }
   }
-  close() { this.frames.close(); }
-  private async readFrame(timeout: number) {
+  close() {
+    this.failAll(new Error('noise_socket_closed'));
+    this.frames.close();
+  }
+  private failAll(error: Error) {
+    if (this.closedError) return;
+    this.closedError = error;
+    for (const buffer of this.streams.values()) {
+      const waiter = buffer.waiter;
+      buffer.waiter = undefined;
+      waiter?.reject(error);
+    }
+    this.streams.clear();
+    this.fragments.clear();
+  }
+  /** 后台单泵持续解密并按 stream_id 分发；无人消费的流（如 fire-and-forget /chat/stream）立即丢弃，避免积压撑爆队列。 */
+  private async pumpIncoming() {
+    try {
+      for (;;) {
+        const frame = await this.decodeNextFrame();
+        const streamId = Number(getNumber(frame, 1));
+        const target = this.streams.get(streamId);
+        if (!target) continue;
+        if (target.waiter) {
+          const waiter = target.waiter;
+          target.waiter = undefined;
+          waiter.resolve(frame);
+        } else if (target.queue.length < MAX_STREAM_QUEUE) {
+          target.queue.push(frame);
+        } else {
+          this.streams.delete(streamId);
+        }
+      }
+    } catch (error) {
+      this.failAll(error instanceof Error ? error : new Error('noise_socket_closed'));
+      this.frames.close();
+    }
+  }
+  private async decodeNextFrame(): Promise<FrameFields> {
     for (;;) {
-      const record = fields(await this.noise.decrypt(await this.frames.read(timeout)));
+      const record = fields(await this.noise.decrypt(await this.frames.read(0)));
       const total = Number(getNumber(record, 3)) || 1, index = Number(getNumber(record, 2));
       let payload = getBytes(record, 4);
       if (total > 1) {
@@ -142,74 +201,109 @@ export class MuseRpc {
       return fields(getBytes(serviceResponse, 1));
     }
   }
+  private readStream(stream: number, timeout: number): Promise<FrameFields> {
+    const target = this.streams.get(stream);
+    if (!target) return Promise.reject(this.closedError ?? new Error('noise_socket_closed'));
+    const ready = target.queue.shift();
+    if (ready) return Promise.resolve(ready);
+    if (this.closedError) return Promise.reject(this.closedError);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { target.waiter = undefined; reject(new Error('noise_read_timeout')); }, timeout);
+      target.waiter = {
+        resolve: (frame) => { clearTimeout(timer); resolve(frame); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      };
+    });
+  }
+  /** 串行化加密与发送，确保多路复用并发请求时发送端 AES-GCM nonce 严格有序。 */
+  private sendRequest(stream: number, path: string, service: number, method: string, body?: unknown): Promise<number> {
+    const work = this.sendSerial.then(async () => {
+      if (this.closedError) throw this.closedError;
+      let request = join(b(1, method), b(2, path), b(3, join(b(1, 'x-request-id'), b(2, crypto.randomUUID()))), n(5, 1));
+      if (body !== undefined) request = join(request, b(3, join(b(1, 'content-type'), b(2, 'application/json'))), b(4, JSON.stringify(body)));
+      const frame = join(n(1, stream), b(2, request));
+      const envelope = join(n(1, service), b(2, frame));
+      const transport = join(n(1, BigInt(stream)), n(2, 0), n(3, 1), b(4, envelope));
+      this.frames.socket.send(owned(await this.noise.encrypt(transport)));
+      return stream;
+    });
+    this.sendSerial = work.then(() => undefined, () => undefined);
+    return work;
+  }
   /** Send once. Caller must persist an intent before invoking this for a chat turn. */
-  async open(path: string, service = 0, method = 'POST', body?: unknown) {
+  open(path: string, service = 0, method = 'POST', body?: unknown) {
     const stream = this.stream++;
-    let request = join(b(1, method), b(2, path), b(3, join(b(1, 'x-request-id'), b(2, crypto.randomUUID()))), n(5, 1));
-    if (body !== undefined) request = join(request, b(3, join(b(1, 'content-type'), b(2, 'application/json'))), b(4, JSON.stringify(body)));
-    const frame = join(n(1, stream), b(2, request));
-    const envelope = join(n(1, service), b(2, frame));
-    const transport = join(n(1, BigInt(stream)), n(2, 0), n(3, 1), b(4, envelope));
-    this.frames.socket.send(owned(await this.noise.encrypt(transport)));
-    return stream;
+    return this.sendRequest(stream, path, service, method, body);
   }
 
-  /** A dedicated connection owns this subscription's receive loop. */
+  /** 订阅服务端事件流；读取前先注册 stream 缓冲避免极速回包竞态。 */
   async subscribe(path: string, body: unknown, onEvent: (event: unknown) => void) {
-    const stream = await this.open(path, 0, 'POST', body);
-    let buffer = '';
-    const decoder = new TextDecoder();
-    for (;;) {
-      const frame = await this.readFrame(120000);
-      if (Number(getNumber(frame, 1)) !== stream) continue;
-      if (frame.has(5)) throw new Error('rpc_stream_reset');
-      const response = frame.has(3) ? fields(getBytes(frame, 3)) : fields(getBytes(frame, 4));
-      if (frame.has(3)) {
-        const status = Number(getNumber(response, 1));
-        if (status < 200 || status >= 300) throw new Error('subscription_refused');
+    if (this.closedError) throw this.closedError;
+    const stream = this.stream++;
+    this.streams.set(stream, { queue: [] });
+    try {
+      await this.sendRequest(stream, path, 0, 'POST', body);
+      let buffer = '';
+      const decoder = new TextDecoder();
+      for (;;) {
+        const frame = await this.readStream(stream, 120000);
+        if (frame.has(5)) throw new Error('rpc_stream_reset');
+        const response = frame.has(3) ? fields(getBytes(frame, 3)) : fields(getBytes(frame, 4));
+        if (frame.has(3)) {
+          const status = Number(getNumber(response, 1));
+          if (status < 200 || status >= 300) throw new Error('subscription_refused');
+        }
+        buffer += decoder.decode(getBytes(response, frame.has(3) ? 3 : 1), { stream: true });
+        if (buffer.length > 2 * 1024 * 1024) throw new Error('subscription_limit');
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+          if (line.trim()) onEvent(JSON.parse(line));
+        }
+        if (Boolean(getNumber(response, frame.has(3) ? 4 : 2))) {
+          buffer += decoder.decode();
+          if (buffer.trim()) onEvent(JSON.parse(buffer));
+          return;
+        }
       }
-      buffer += decoder.decode(getBytes(response, frame.has(3) ? 3 : 1), { stream: true });
-      if (buffer.length > 2 * 1024 * 1024) throw new Error('subscription_limit');
-      let newline;
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
-        if (line.trim()) onEvent(JSON.parse(line));
-      }
-      if (Boolean(getNumber(response, frame.has(3) ? 4 : 2))) {
-        buffer += decoder.decode();
-        if (buffer.trim()) onEvent(JSON.parse(buffer));
-        return;
-      }
+    } finally {
+      this.streams.delete(stream);
     }
   }
   async call(path: string, service = 1, method = 'GET', body?: unknown, timeout = 20000): Promise<unknown> {
-    const stream = await this.open(path, service, method, body);
-    const deadline = Date.now() + timeout;
-    let status = 0, length = 0;
-    const chunks: Uint8Array[] = [];
-    while (Date.now() < deadline) {
-      const responseFrame = await this.readFrame(Math.max(1, deadline - Date.now()));
-      if (Number(getNumber(responseFrame, 1)) !== stream) continue;
-      if (responseFrame.has(5)) throw new Error('rpc_stream_reset');
-      let end = false, chunk = EMPTY;
-      if (responseFrame.has(3)) {
-        const response = fields(getBytes(responseFrame, 3)); status = Number(getNumber(response, 1));
-        chunk = getBytes(response, 3); end = Boolean(getNumber(response, 4));
-      } else if (responseFrame.has(4)) {
-        const response = fields(getBytes(responseFrame, 4)); chunk = getBytes(response, 1); end = Boolean(getNumber(response, 2));
-      }
-      length += chunk.length; if (length > 2 * 1024 * 1024) throw new Error('rpc_body_limit'); chunks.push(chunk);
-      if (end) {
-        if (status < 200 || status >= 300) throw new Error(`rpc_http_${status}`);
-        const parsed: unknown = length ? JSON.parse(new TextDecoder().decode(join(...chunks))) : {};
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          const object = parsed as Record<string, unknown>;
-          if (object.ok === false || object.error) throw new Error('rpc_application_error');
-          return object.result ?? parsed;
+    if (this.closedError) throw this.closedError;
+    const stream = this.stream++;
+    this.streams.set(stream, { queue: [] });
+    try {
+      await this.sendRequest(stream, path, service, method, body);
+      const deadline = Date.now() + timeout;
+      let status = 0, length = 0;
+      const chunks: Uint8Array[] = [];
+      while (Date.now() < deadline) {
+        const responseFrame = await this.readStream(stream, Math.max(1, deadline - Date.now()));
+        if (responseFrame.has(5)) throw new Error('rpc_stream_reset');
+        let end = false, chunk = EMPTY;
+        if (responseFrame.has(3)) {
+          const response = fields(getBytes(responseFrame, 3)); status = Number(getNumber(response, 1));
+          chunk = getBytes(response, 3); end = Boolean(getNumber(response, 4));
+        } else if (responseFrame.has(4)) {
+          const response = fields(getBytes(responseFrame, 4)); chunk = getBytes(response, 1); end = Boolean(getNumber(response, 2));
         }
-        return parsed;
+        length += chunk.length; if (length > 2 * 1024 * 1024) throw new Error('rpc_body_limit'); chunks.push(chunk);
+        if (end) {
+          if (status < 200 || status >= 300) throw new Error(`rpc_http_${status}`);
+          const parsed: unknown = length ? JSON.parse(new TextDecoder().decode(join(...chunks))) : {};
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const object = parsed as Record<string, unknown>;
+            if (object.ok === false || object.error) throw new Error('rpc_application_error');
+            return object.result ?? parsed;
+          }
+          return parsed;
+        }
       }
+      throw new Error('rpc_incomplete_body');
+    } finally {
+      this.streams.delete(stream);
     }
-    throw new Error('rpc_incomplete_body');
   }
 }

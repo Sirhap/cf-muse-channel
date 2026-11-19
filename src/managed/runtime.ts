@@ -3,8 +3,10 @@ import { json } from "../http";
 import { MuseRpc } from "../noise";
 import { ManagedStore, type Task, type Outbound } from "./store";
 import { NativeConversations } from "./native";
+import { channelReply } from "./reply";
 import { assertPlatformSuccess, boundedJson, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
 
+const IDLE_HISTORY_SCAN_MS = 60_000;
 interface Health { connected: boolean; last_ok: number | null; error: string | null; }
 interface Diagnostic {
   state: string;
@@ -19,13 +21,14 @@ export class ManagedChannels extends DurableObject<Env> {
   private native: NativeConversations;
   private muse?: MuseRpc;
   private museConnecting?: Promise<MuseRpc>;
-  private museSerial: Promise<void> = Promise.resolve();
   private wecom?: WebSocket;
   private wecomStarting?: Promise<void>;
   private wecomReady = false;
   private responses = new Map<string, { resolve: (response: Record<string, unknown>) => void; reject: () => void }>();
   private subscriptions = new Map<string, MuseRpc>();
   private watching = new Set<string>();
+  private dirtySessions = new Set<string>();
+  private pendingFullScan = false;
   private eventRevision = 0;
   private pumping?: Promise<void>;
   private polling?: Promise<void>;
@@ -70,6 +73,9 @@ export class ManagedChannels extends DurableObject<Env> {
       const replies = this.ctx.storage.sql.exec<{ id: number; text: string }>("SELECT id,text FROM tasks WHERE message_id LIKE 'native:%' ORDER BY id").toArray()
         .map((row) => ({ ...row, ...this.store.get<object>("native-output:" + row.id) }));
       return json({ state: inputs.every((row) => "confirmed_at" in row) && replies.length > 0 ? "succeeded" : "awaiting_native_receipts", inputs, replies });
+    }
+    if ((path === "/managed/push" || path === "/admin/managed/push") && request.method === "POST") {
+      return this.handlePush(request);
     }
     if (path === "/admin/managed/confirm-delivery" && request.method === "POST") {
       try {
@@ -136,7 +142,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261117-native-v1",
+        runtime_version: "managed-20261120-fast-push-v1",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -204,6 +210,119 @@ export class ManagedChannels extends DurableObject<Env> {
     return validConfig(JSON.parse(text + decoder.decode()));
   }
 
+  private async handlePush(request: Request): Promise<Response> {
+    if (this.env.MANAGED_CHANNELS_ENABLED !== "true") return json({ error: "managed_channels_disabled" }, 409);
+    let body: Record<string, unknown>;
+    try { body = await boundedJson(new Response(request.body), 32768); }
+    catch { return json({ error: "invalid_push_payload" }, 400); }
+    const text = string(body.text).trim();
+    const rawChannel = body.channel === undefined ? "auto" : string(body.channel);
+    const rawId = body.id === undefined ? "" : string(body.id).trim();
+    const rawChat = body.chat === undefined ? undefined : string(body.chat).trim();
+    const rawGroup = body.group === undefined ? undefined : body.group;
+    if (!text || text.length > 16000 || !["auto", "weixin", "wecom"].includes(rawChannel)
+      || (body.id !== undefined && (!rawId || rawId.length > 128))
+      || (body.chat !== undefined && (!rawChat || rawChat.length > 512))
+      || (rawGroup !== undefined && typeof rawGroup !== "boolean")
+      || (rawChannel === "weixin" && rawGroup === true)) {
+      return json({ error: "invalid_push_payload" }, 400);
+    }
+    const pushId = rawId || crypto.randomUUID();
+    const resolved = this.resolvePushRoute(rawChannel as Channel | "auto", pushId, text, rawChat, rawGroup as boolean | undefined);
+    if ("error" in resolved) return json({ error: resolved.error }, resolved.status);
+    const route = resolved.route;
+    let taskId = 0;
+    let deduplicated = false;
+    this.ctx.storage.transactionSync(() => {
+      const created = this.store.ingest(route);
+      if (created) {
+        this.store.complete(created, channelReply(text));
+        taskId = created.id;
+        return;
+      }
+      const conversation = JSON.stringify([route.channel, route.account, route.group, route.chat]);
+      const existing = this.ctx.storage.sql.exec<Task>(
+        "SELECT * FROM tasks WHERE message_id=? AND conversation=?", route.id, conversation).toArray()[0];
+      taskId = existing?.id ?? 0;
+      deduplicated = true;
+    });
+    if (!deduplicated) {
+      await this.deliver();
+      await this.ctx.storage.setAlarm(Date.now() + 15000);
+    }
+    const outbound = taskId
+      ? this.ctx.storage.sql.exec<Outbound>("SELECT * FROM outbound WHERE task_id=?", taskId).toArray()[0]
+      : undefined;
+    const deliveryState = outbound?.state ?? "pending";
+    return json({
+      ok: deliveryState !== "unknown",
+      id: pushId,
+      task_id: taskId,
+      channel: route.channel,
+      deduplicated,
+      delivery_state: deliveryState,
+    }, deliveryState === "unknown" ? 502 : 200);
+  }
+
+  /** 解析主动推送目标渠道与合法路由；严格遵守白名单，微信自动复用最新 context_token。 */
+  private resolvePushRoute(
+    preferred: Channel | "auto",
+    pushId: string,
+    text: string,
+    chat?: string,
+    group?: boolean,
+  ): { route: Incoming } | { error: string; status: number } {
+    const pick = (channel: Channel): { route: Incoming } | { error: string; status: number } => {
+      const config = this.config(channel);
+      if (!config?.enabled) return { error: "channel_not_enabled", status: 409 };
+      if (channel === "weixin" && group === true) return { error: "invalid_push_payload", status: 400 };
+      const recent = this.native.latestRoute(channel, config.account, chat, group);
+      if (chat !== undefined) {
+        if (group === true) {
+          if (!recent) return { error: "recipient_not_allowed", status: 403 };
+        } else if (!config.allowedSenders.includes(chat)) {
+          return { error: "recipient_not_allowed", status: 403 };
+        }
+      }
+      const targetChat = chat ?? recent?.chat ?? config.allowedSenders[0];
+      const targetGroup = group ?? (recent ? Boolean(recent.group) : false);
+      const targetSender = recent?.sender ?? config.allowedSenders[0];
+      const context = channel === "weixin" ? (recent?.context ?? "") : "";
+      if (channel === "weixin" && !context) return { error: "weixin_context_unavailable", status: 409 };
+      return {
+        route: {
+          id: "push:" + pushId,
+          channel,
+          account: config.account,
+          chat: targetChat,
+          sender: targetSender,
+          group: targetGroup,
+          text,
+          context,
+        },
+      };
+    };
+    if (preferred !== "auto") return pick(preferred);
+    const candidates: Channel[] = [];
+    const wx = this.config("weixin"), wc = this.config("wecom");
+    if (wx?.enabled) candidates.push("weixin");
+    if (wc?.enabled) candidates.push("wecom");
+    if (!candidates.length) return { error: "no_push_channel_available", status: 409 };
+    // 若两渠道均启用，优先有最新活跃会话路由的一方，否则回退到不依赖 context_token 的企微。
+    if (candidates.length === 2) {
+      const latest = this.ctx.storage.sql.exec<{ channel: string }>(
+        "SELECT json_extract(route,'$.channel') channel FROM native_sessions ORDER BY last_checked DESC LIMIT 1").toArray()[0]?.channel;
+      if (latest === "wecom") candidates.reverse();
+    }
+    let lastError: { error: string; status: number } = { error: "no_push_channel_available", status: 409 };
+    for (const channel of candidates) {
+      const result = pick(channel);
+      if ("route" in result) return result;
+      lastError = result;
+    }
+    return lastError;
+  }
+
   private async socket(): Promise<MuseRpc> {
     const response = await this.env.CREDENTIALS.getByName("primary-account").fetch(new Request("https://internal/ws", {
       headers: { Upgrade: "websocket" },
@@ -212,17 +331,22 @@ export class ManagedChannels extends DurableObject<Env> {
     return MuseRpc.connect(response.webSocket);
   }
 
+  /** 复用支持流级多路复用的热 MuseRpc 连接，仅对建连阶段去重，避免业务 RPC 串行排队。 */
   private async rpc<T>(operation: (client: MuseRpc) => Promise<T>): Promise<T> {
-    const work = this.museSerial.then(async () => {
-      if (!this.muse) {
-        this.museConnecting ??= this.socket().finally(() => { this.museConnecting = undefined; });
-        this.muse = await this.museConnecting;
-      }
-      try { return await operation(this.muse); }
-      catch (error) { this.muse.close(); this.muse = undefined; throw error; }
-    });
-    this.museSerial = work.then(() => {}, () => {});
-    return work;
+    let client = this.muse;
+    if (!client) {
+      this.museConnecting ??= this.socket().then((connected) => {
+        this.muse = connected;
+        return connected;
+      }).finally(() => { this.museConnecting = undefined; });
+      client = await this.museConnecting;
+    }
+    try { return await operation(client); }
+    catch (error) {
+      if (this.muse === client) this.muse = undefined;
+      client.close();
+      throw error;
+    }
   }
 
   private healthResult(channel: Channel, error?: string) {
@@ -254,7 +378,7 @@ export class ManagedChannels extends DurableObject<Env> {
       this.polling ??= this.pollWeixin(weixin).finally(() => { this.polling = undefined; });
       this.ctx.waitUntil(this.polling);
     }
-    await this.pump();
+    await this.pump(true);
     if (this.active()) await this.ctx.storage.setAlarm(Date.now() + 15000);
   }
 
@@ -384,9 +508,11 @@ export class ManagedChannels extends DurableObject<Env> {
     try { client = await this.socket(); }
     catch (error) { this.watching.delete(session); throw error; }
     const diagnostic = this.store.get<Diagnostic>("diagnostic");
-    const interested = this.ctx.storage.sql.exec<{ count: number }>(
-      "SELECT COUNT(*) count FROM tasks WHERE session=? AND state IN ('queued','submitting','submitted','running','unknown')", session).one().count > 0;
-    if (!interested && !(diagnostic?.session === session && diagnostic.state !== "succeeded")) {
+    const awaiting = this.ctx.storage.sql.exec<{ count: number }>(
+      "SELECT COUNT(*) count FROM native_sessions WHERE session=? AND awaiting=1", session).one().count > 0;
+    const pendingTask = this.ctx.storage.sql.exec<{ count: number }>(
+      "SELECT COUNT(*) count FROM tasks WHERE session=? AND state IN ('queued','submitting','running','unknown')", session).one().count > 0;
+    if (!awaiting && !pendingTask && !(diagnostic?.session === session && diagnostic.state !== "succeeded")) {
       this.watching.delete(session); client.close(); return;
     }
     this.subscriptions.set(session, client);
@@ -395,11 +521,13 @@ export class ManagedChannels extends DurableObject<Env> {
     }, (event) => {
       const record = object(event), payload = object(record.payload);
       if (payload.session_id !== session) return;
-      if (["delta.message_done", "delta.message_start", "sessions.updated", "message.assistant"].includes(string(record.event))) {
+      // 忽略 delta.message_start（此时回复尚未完成），仅在可能产生完成文本的事件时唤醒精准会话。
+      if (["delta.message_done", "sessions.updated", "message.assistant"].includes(string(record.event))) {
         const diagnostic = this.store.get<Diagnostic>("diagnostic");
         if (diagnostic?.session === session) this.store.set("diagnostic", { ...diagnostic, event_received: true });
+        this.dirtySessions.add(session);
         this.eventRevision++;
-        this.ctx.waitUntil(this.pump());
+        this.ctx.waitUntil(this.pump(false));
       }
     }).catch(() => {}).finally(() => {
       if (this.subscriptions.get(session) === client) this.subscriptions.delete(session);
@@ -408,7 +536,8 @@ export class ManagedChannels extends DurableObject<Env> {
     }));
   }
 
-  private pump(): Promise<void> {
+  private pump(fullScan = false): Promise<void> {
+    if (fullScan) this.pendingFullScan = true;
     if (this.pumping) {
       this.eventRevision++;
       return this.pumping;
@@ -425,6 +554,10 @@ export class ManagedChannels extends DurableObject<Env> {
     let loops = 0;
     do {
       revision = this.eventRevision;
+      const fullScan = this.pendingFullScan;
+      this.pendingFullScan = false;
+      const dirty = new Set(this.dirtySessions);
+      this.dirtySessions.clear();
       await this.deliver();
       await this.diagnostic();
       await this.native.recoverLegacy();
@@ -441,7 +574,21 @@ export class ManagedChannels extends DurableObject<Env> {
           break;
         }
       }
-      for (const binding of this.native.sessions()) {
+      const uncertainSessions = new Set(
+        this.ctx.storage.sql.exec<{ session: string }>(
+          "SELECT DISTINCT session FROM tasks WHERE state='unknown' AND session IS NOT NULL").toArray().map((row) => row.session),
+      );
+      const now = Date.now();
+      const targets = fullScan
+        ? this.native.sessions().filter((binding) =>
+            dirty.has(binding.session)
+            || uncertainSessions.has(binding.session)
+            || Boolean(binding.awaiting)
+            || now - binding.last_checked >= IDLE_HISTORY_SCAN_MS)
+        : Array.from(new Set([...dirty, ...uncertainSessions]))
+            .map((id) => this.native.session(id))
+            .filter((binding): binding is NonNullable<typeof binding> => Boolean(binding));
+      for (const binding of targets) {
         try {
           const produced = await this.native.collect(binding);
           await this.deliver();
@@ -453,7 +600,7 @@ export class ManagedChannels extends DurableObject<Env> {
       await this.deliver();
       if (!prepared) break;
       loops++;
-    } while (loops < 10 && (revision !== this.eventRevision || this.store.candidate()));
+    } while (loops < 10 && (revision !== this.eventRevision || this.dirtySessions.size > 0 || this.pendingFullScan || this.store.candidate()));
     if (this.active()) await this.ctx.storage.setAlarm(Date.now() + 15000);
   }
 

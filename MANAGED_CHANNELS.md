@@ -4,7 +4,15 @@
 
 转发前清理独占一行的 `[[hatch_widget:…]]` 交互组件标记，保留正文、普通方括号和行内示例。只有组件、没有正文时给出渠道不支持显示的说明。
 
-本版支持文字收发、发送者白名单、私聊会话隔离、企微群聊隔离和 `/ping`、`/help`、`/status`、`/queue`、`/new`、`/stop`。微信群消息不接收。图片、语音、文件和视频传输、扫码登录、原 Core 的全部扩展命令，以及 hook 备用暂未接入；非文字消息会收到范围提示。
+本版支持文字收发、发送者白名单、私聊会话隔离、企微群聊隔离、定时任务/脚本主动推送接口（`POST /managed/push` / `POST /admin/managed/push`）和 `/ping`、`/help`、`/status`、`/queue`、`/new`、`/stop`。微信群消息不接收。图片、语音、文件和视频传输、扫码登录、原 Core 的全部扩展命令，以及 hook 备用暂未接入；非文字消息会收到范围提示。
+
+## 定时任务主动推送
+
+切换 CF 托管后原虚机 `weixin-bot` / `wecom-bot` 已停用，虚机内写 `outbox.jsonl` 的定时任务不再被旧网关消费。定时任务或脚本可改用鉴权接口 `POST /managed/push`（请求头 `Authorization: Bearer <DEMO_KEY>`，JSON 请求体 `{"id":"可选幂等键","channel":"auto|weixin|wecom","chat":"可选白名单接收者","text":"正文"}`）实时推向已启用渠道：
+
+- `channel` 省略或为 `auto` 时优先选择最新活跃渠道，微信尚无可用 `context_token` 时自动回退到已启用的企微；
+- 微信主动推送自动继承该白名单用户最近一次入站保存的 `context_token`，尚无记录时返回 `409 weixin_context_unavailable`；
+- 传入相同 `id` 时按幂等键去重，复用同一发件边界与安全分片投递，绝不重复发送。
 
 ## 部署
 
