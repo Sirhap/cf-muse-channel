@@ -90,9 +90,16 @@ export function managedPage(local = false) {
         <details class="config-details" id="details-${channel}">
           <summary id="summary-${channel}">展开修改凭证与发送者白名单</summary>
           <form data-channel="${channel}" autocomplete="off">
-            <label>机器人账号<input name="account" required maxlength="512" placeholder="${channel === "weixin" ? "微信机器人 ilink_bot_id" : "企业微信 aibot_id"}"></label>
-            <label>${channel === "weixin" ? "iLink Bot Token" : "机器人 Secret"}<input name="secret" type="password" required maxlength="16384" autocomplete="new-password" placeholder="出于安全不回显已存密钥，修改配置需重新填入"></label>
-            <label>允许的发送者 ID<textarea name="senders" required placeholder="每行一个发送者 ID"></textarea></label>
+            <label>${channel === "weixin" ? "机器人账号（可选，默认 weixin-bot）" : "机器人账号"}<input name="account" ${channel === "weixin" ? "" : "required"} maxlength="512" placeholder="${channel === "weixin" ? "留空默认 weixin-bot（或填 ilink_bot_id）" : "企业微信 aibot_id"}"></label>
+            <label>${channel === "weixin" ? "iLink Bot Token" : "机器人 Secret"}
+              <div class="secret-field">
+                <input name="secret" type="password" required maxlength="16384" autocomplete="new-password" placeholder="首次配置需填写；已配置时默认加密展示">
+                <button class="secret-eye-btn" type="button" data-secret-eye="${channel}" aria-label="显示或隐藏密钥" aria-pressed="false" title="显示密钥">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                </button>
+              </div>
+            </label>
+            <label>允许的发送者 ID<textarea name="senders" required placeholder="每行一个发送者 ID（保存后默认回显）"></textarea></label>
             <label class="toggle"><input name="enabled" type="checkbox" checked>保存后立即启用此渠道</label>
             <div class="actions">
               <button class="primary" type="submit">保存配置</button>
@@ -158,7 +165,7 @@ export function managedPage(local = false) {
       </section>
     </div>
 
-    <footer class="footer"><span>${icon("lock")}渠道密钥与发送者 ID 仅加密存储于 DO SQLite，从不在状态接口回显</span><span>所有时间均为北京时间</span></footer>
+    <footer class="footer"><span>${icon("lock")}渠道密钥仅存储于 DO SQLite，从不向前端回显</span><span>所有时间均为北京时间</span></footer>
   </main>
 </div>
 <script nonce="${nonce}">
@@ -177,12 +184,70 @@ const fmtBytes = (b) => typeof b === "number" && b > 0
   ? (b >= 1048576 ? (b / 1048576).toFixed(2) + " MiB" : (b / 1024).toFixed(1) + " KiB") : "0 B";
 
 let latestStatus = null;
+const dirtyForms = { weixin: false, wecom: false };
+const secretMaskTimers = { weixin: null, wecom: null };
+const MASKED_SENTINEL = "••••••••••••••••";
+const EYE_OPEN_SVG = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_CLOSED_SVG = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.53 13.53 0 0 0 2 12s3.5 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" y1="2" x2="22" y2="22"/></svg>';
 
 function showBanner(el, text, tone = "") {
   if (!el) return;
   el.textContent = text;
   el.dataset.tone = tone;
   el.hidden = !text;
+}
+
+function setSecretMaskUI(ch, visible) {
+  const form = document.querySelector('form[data-channel="' + ch + '"]');
+  const eyeBtn = document.querySelector('[data-secret-eye="' + ch + '"]');
+  const secretInput = form?.elements.secret;
+  if (!secretInput || !eyeBtn) return;
+  secretInput.type = visible ? "text" : "password";
+  eyeBtn.innerHTML = visible ? EYE_CLOSED_SVG : EYE_OPEN_SVG;
+  eyeBtn.setAttribute("aria-pressed", visible ? "true" : "false");
+  eyeBtn.title = visible ? "隐藏密钥" : "显示密钥";
+}
+
+function applyChannelFormDefaults(ch, cfg, configured) {
+  const form = document.querySelector('form[data-channel="' + ch + '"]');
+  if (!form) return;
+  const secretInput = form.elements.secret;
+  if (secretInput) {
+    secretInput.required = !configured;
+    secretInput.placeholder = configured
+      ? "已保存密钥（点右侧小眼查看，或直接改写）"
+      : "首次配置需填入密钥";
+    if (configured && !dirtyForms[ch] && secretInput.type === "password" && secretInput.dataset.loaded !== "true") {
+      secretInput.value = MASKED_SENTINEL;
+      secretInput.dataset.masked = "true";
+    }
+  }
+  if (!cfg || dirtyForms[ch]) return;
+  if (typeof cfg.account === "string") form.elements.account.value = cfg.account;
+  if (Array.isArray(cfg.allowedSenders)) form.elements.senders.value = cfg.allowedSenders.join("\\n");
+  if (typeof cfg.enabled === "boolean") form.elements.enabled.checked = cfg.enabled;
+}
+
+async function loadChannelDefaults(force = false) {
+  if (!force && dirtyForms.weixin && dirtyForms.wecom) return;
+  try {
+    const r = await fetch("/admin/managed/reveal", {
+      method: "POST", cache: "no-store", credentials: "same-origin"
+    });
+    if (r.status === 401 || !r.ok) return;
+    const data = await r.json();
+    for (const ch of ["weixin", "wecom"]) {
+      const cfg = data[ch];
+      applyChannelFormDefaults(ch, cfg, Boolean(cfg?.configured));
+      if (cfg?.account) {
+        const metaEl = byId("meta-" + ch);
+        const curText = metaEl?.textContent || "";
+        if (metaEl && !curText.includes("账号：")) {
+          metaEl.textContent = "账号：" + cfg.account + " · " + curText;
+        }
+      }
+    }
+  } catch { /* ignore reveal failure */ }
 }
 
 function renderStatus(d) {
@@ -319,7 +384,9 @@ async function refresh() {
     const r = await fetch("/admin/managed/status", { cache: "no-store", credentials: "same-origin" });
     if (r.status === 401) { location.assign("/admin/login"); return; }
     if (!r.ok) { showBanner(byId("ops-feedback"), "状态读取失败（HTTP " + r.status + "）", "warning"); return; }
-    renderStatus(await r.json());
+    const statusData = await r.json();
+    renderStatus(statusData);
+    void loadChannelDefaults(false);
   } catch {
     showBanner(byId("ops-feedback"), "状态读取失败，请稍后重试。", "warning");
   }
@@ -373,20 +440,85 @@ for (const btn of document.querySelectorAll("[data-toggle]")) {
   });
 }
 
+for (const eyeBtn of document.querySelectorAll("[data-secret-eye]")) {
+  eyeBtn.addEventListener("click", async () => {
+    const ch = eyeBtn.dataset.secretEye;
+    const form = document.querySelector('form[data-channel="' + ch + '"]');
+    const secretInput = form?.elements.secret;
+    if (!secretInput) return;
+    if (secretInput.type === "text") {
+      clearTimeout(secretMaskTimers[ch]);
+      setSecretMaskUI(ch, false);
+      return;
+    }
+    if (secretInput.dataset.masked === "true") {
+      eyeBtn.disabled = true;
+      try {
+        const r = await fetch("/admin/managed/reveal", {
+          method: "POST", cache: "no-store", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ channel: ch, revealSecret: true })
+        });
+        if (r.status === 401) { location.assign("/admin/login"); return; }
+        if (!r.ok) {
+          showBanner(form.querySelector("output"), "暂无法读取已存密钥（HTTP " + r.status + "）。", "warning");
+          return;
+        }
+        const data = await r.json();
+        if (typeof data.secret === "string") {
+          secretInput.value = data.secret;
+          delete secretInput.dataset.masked;
+          secretInput.dataset.loaded = "true";
+        }
+      } catch {
+        showBanner(form.querySelector("output"), "读取密钥请求失败，请稍后重试。", "warning");
+        return;
+      } finally {
+        eyeBtn.disabled = false;
+      }
+    }
+    setSecretMaskUI(ch, true);
+    clearTimeout(secretMaskTimers[ch]);
+    secretMaskTimers[ch] = setTimeout(() => setSecretMaskUI(ch, false), 60000);
+  });
+}
+
 for (const form of document.querySelectorAll("form[data-channel]")) {
+  const ch = form.dataset.channel;
+  const secretInput = form.elements.secret;
+  if (secretInput) {
+    secretInput.addEventListener("beforeinput", () => {
+      if (secretInput.dataset.masked === "true") {
+        secretInput.value = "";
+        delete secretInput.dataset.masked;
+      }
+    });
+    secretInput.addEventListener("input", () => {
+      if (secretInput.dataset.masked === "true") {
+        secretInput.value = secretInput.value.replace(/•/g, "");
+        delete secretInput.dataset.masked;
+      }
+    });
+  }
+  for (const el of form.querySelectorAll("input, textarea")) {
+    el.addEventListener("input", () => { dirtyForms[ch] = true; });
+    el.addEventListener("change", () => { dirtyForms[ch] = true; });
+  }
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const button = form.querySelector("button[type=submit]");
     const output = form.querySelector("output");
     button.disabled = true;
     try {
+      const accountVal = form.elements.account.value.trim();
+      const rawSecret = form.elements.secret.dataset.masked === "true" ? "" : form.elements.secret.value;
       const body = {
-        account: form.elements.account.value.trim(),
-        secret: form.elements.secret.value,
-        allowedSenders: form.elements.senders.value.split(/\s+/).filter(Boolean),
+        account: ch === "weixin" && !accountVal ? "weixin-bot" : accountVal,
+        secret: rawSecret,
+        allowedSenders: form.elements.senders.value.split(/\\s+/).filter(Boolean),
         enabled: form.elements.enabled.checked
       };
-      const r = await fetch("/admin/managed/" + form.dataset.channel, {
+      const r = await fetch("/admin/managed/" + ch, {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
@@ -397,8 +529,13 @@ for (const form of document.querySelectorAll("form[data-channel]")) {
         : "配置保存失败，请检查输入格式。";
       showBanner(output, msg, r.ok ? "good" : "warning");
       if (r.ok) {
-        form.elements.secret.value = "";
+        dirtyForms[ch] = false;
+        delete form.elements.secret.dataset.loaded;
+        setSecretMaskUI(ch, false);
+        form.elements.secret.value = MASKED_SENTINEL;
+        form.elements.secret.dataset.masked = "true";
         await refresh();
+        await loadChannelDefaults(true);
       }
     } catch {
       showBanner(output, "未收到保存结果，请先刷新状态再决定是否重试。", "warning");

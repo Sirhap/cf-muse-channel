@@ -25,7 +25,7 @@ export function adminPage(local = false, signedIn = false): Response {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cookie 管理 · Muse Relay</title>
+<title>Cookie 账号池 · Muse Relay</title>
 <style nonce="${nonce}">${adminStyles}</style>
 </head>
 <body data-authenticated="${signedIn}">
@@ -42,122 +42,181 @@ export function adminPage(local = false, signedIn = false): Response {
 
   <main class="main">
     <div class="topbar">
-      <div class="breadcrumb"><span>控制台</span><span aria-hidden="true">/</span><strong>Cookie 管理</strong></div>
+      <div class="breadcrumb"><span>控制台</span><span aria-hidden="true">/</span><strong>Cookie 账号池</strong></div>
       <div class="account-actions">${signedIn ? '<a class="login-link" href="/admin/managed">渠道托管</a>' : ""}<span class="environment"><span aria-hidden="true"></span>${local ? "本地预览" : "生产环境"}</span>
       ${signedIn ? '<form action="/admin/logout" method="post"><button class="quiet" type="submit">退出登录</button></form>' : '<a class="login-link" href="/admin/login">登录管理</a>'}</div>
     </div>
-    <header class="heading">
-      <h1>Cookie 管理</h1>
-      <p>管理 Muse 凭证与自动续期</p>
+
+    <header class="heading heading-bar">
+      <div>
+        <h1>Cookie 账号池</h1>
+        <p>支持同时开启多个 Muse 账号加入调度池，自动负载均衡、故障冷却切换与每日保活续期</p>
+      </div>
+      <div class="heading-actions">
+        <button class="secondary" id="open-batch-import" type="button" ${signedIn ? "" : "disabled"}>批量导入</button>
+        <button class="primary" id="open-add-account" type="button" ${signedIn ? "" : "disabled"}>＋ 新增账号</button>
+      </div>
     </header>
 
     <section class="metrics" aria-label="凭证与续期概览">
       <article class="panel metric">
-        <div class="metric-label">Cookie 状态</div>
+        <div class="metric-top">
+          <div class="metric-label">账号池状态</div>
+          <span class="tag" id="selected-account-badge">主账号 (primary-account)</span>
+        </div>
         <div class="metric-value"><span id="cookie-icon" class="health-icon" hidden>${icon("check")}</span><span id="cookie-state">查询中</span></div>
         <div class="metric-note" id="cookie-note">最近一次验证结果</div>
       </article>
       <article class="panel metric">
-        <div class="metric-label">每日续期</div>
-        <div class="metric-value metric-time">04:54</div>
-        <div class="metric-note">北京时间</div>
+        <div class="metric-top">
+          <div class="metric-label">每日自动续期</div>
+          <span class="tag">北京时间 04:54</span>
+        </div>
+        <div class="metric-value metric-time" id="renewal-time">—</div>
+        <div class="metric-note" id="renewal-note">登录后查看最近续期记录</div>
       </article>
       <article class="panel metric">
-        <div class="metric-label">最近续期</div>
-        <div class="metric-value metric-time" id="renewal-time">—</div>
-        <div class="metric-note" id="renewal-note">登录后查看</div>
+        <div class="metric-top">
+          <div class="metric-label">Worker 自动审批</div>
+          <button class="secondary btn-sm" id="poll-approvals" type="button" ${signedIn ? "" : "disabled"}>立即轮询</button>
+        </div>
+        <div class="metric-value approval-metric-val">${icon("play")}<span id="approval-state">待查询</span></div>
+        <div class="metric-note" id="approval-note">仅自动处理符合白名单规则的请求</div>
+        <div class="chip-row" id="approval-stats" hidden></div>
       </article>
     </section>
 
-    <section class="panel overview section-block" id="accounts-panel" aria-labelledby="accounts-title" ${signedIn ? "" : "hidden"}>
-      <div class="panel-heading">
-        <div>
-          <h2 id="accounts-title">Muse 账号池（多 Cookie 管理）</h2>
-          <p class="muted">每个账号拥有独立 Durable Object 存储与自动续期；设为“默认使用”的账号将服务于微信/企微托管渠道与默认 <code>/ws</code> 连接。</p>
+    <section class="panel overview section-block" id="accounts-panel" aria-labelledby="accounts-title">
+      <div class="pool-toolbar">
+        <div class="pool-title-group">
+          <div class="heading-with-badge">
+            <h2 id="accounts-title">Muse 账号池（多开调度）</h2>
+            <div class="pool-stats-pills" id="pool-stats-pills" ${signedIn ? "" : "hidden"}>
+              <span class="tag" id="pool-stat-enabled">已开启 —</span>
+              <span class="tag" id="pool-stat-healthy">健康可用 —</span>
+              <span class="tag" id="pool-stat-alert" hidden></span>
+            </div>
+          </div>
+          <p class="muted">打开任意多个账号开关即可同时启用并加入调度池；遇连接异常或冷却会自动故障切换到下一个已开启账号。</p>
         </div>
-        <button class="secondary btn-sm" id="refresh-accounts" type="button">${icon("refresh")}刷新账号池</button>
+
+        <div class="pool-controls" ${signedIn ? "" : "hidden"}>
+          <label class="strategy-picker" title="参考 muse2api 多账号调度策略">
+            <span>调度策略</span>
+            <select id="pool-strategy">
+              <option value="failover">首选优先 + 故障切换</option>
+              <option value="round_robin">轮询均衡 (Round Robin)</option>
+              <option value="lru">最少使用优先 (LRU)</option>
+            </select>
+          </label>
+          <button class="secondary btn-sm" id="renew-all-btn" type="button">全部续期</button>
+          <button class="secondary btn-sm" id="check" type="button">${icon("refresh")}刷新</button>
+        </div>
       </div>
-      <div class="table-wrap">
+
+      ${signedIn ? "" : '<p class="login-prompt">登录后可以开启多个账号、调整调度策略、弹窗更换 Cookie 与测活。<a href="/admin/login">前往登录 →</a></p>'}
+      <div class="table-wrap" ${signedIn ? "" : "hidden"}>
         <table class="data-table">
-          <thead><tr><th>账号名称 / ID</th><th>角色</th><th>Cookie 状态</th><th>最近验证</th><th>操作</th></tr></thead>
-          <tbody id="accounts-table-body"><tr><td colspan="5" class="muted">正在加载账号列表…</td></tr></tbody>
+          <thead>
+            <tr>
+              <th class="col-toggle">启用</th>
+              <th>账号名称 / VM</th>
+              <th>健康状态</th>
+              <th>调用统计 / 最近验证</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody id="accounts-table-body"><tr><td colspan="5" class="muted">正在加载账号池…</td></tr></tbody>
         </table>
       </div>
-      <details class="config-details" id="add-account-details">
-        <summary>＋ 新增 Muse 账号（支持多 Cookie 独立保活与热切换）</summary>
-        <form id="add-account-form" autocomplete="off">
-          <div class="inline-fields">
-            <label>账号备注名称<input name="label" required maxlength="40" placeholder="例如：备用二号 / 工作号"></label>
-            <label>账号标识 ID（可选）<input name="id" maxlength="31" placeholder="留空自动生成，或填字母数字如 muse-2"></label>
-          </div>
-          <label>新账号 Cookie（可选，填写则创建时立即验证并入库）
-            <textarea name="cookie" maxlength="${MAX_COOKIE_LENGTH + 8}" autocomplete="off" spellcheck="false" placeholder="粘贴该 Muse 账号的 Cookie 请求头；也可留空先创建槽位，再在下方编辑器中导入…"></textarea>
-          </label>
-          <label class="toggle"><input name="set_default" type="checkbox">若 Cookie 验证通过，立即将此账号设为全局默认使用账号</label>
-          <div class="actions">
-            <button class="primary" type="submit">创建 Muse 账号</button>
-          </div>
-          <output id="account-feedback" class="status-banner" role="status" hidden></output>
-        </form>
-      </details>
+      <output id="feedback" role="status" aria-live="polite"></output>
+      <output id="account-feedback" class="status-banner" role="status" hidden></output>
+      <noscript>请开启 JavaScript 后使用管理页。</noscript>
     </section>
 
-    <div class="content-grid">
-      <section class="panel editor" aria-labelledby="edit-title">
-        <div class="panel-heading">
-          <h2 id="edit-title">手动更换 Cookie</h2>
-          <span class="tag" id="selected-account-badge">主账号 (primary-account)</span>
-          <p>验证通过后才会替换当前选中账号的 Cookie。</p>
+    <section class="panel overview section-block" aria-labelledby="channels-title">
+      <div class="panel-heading">
+        <div>
+          <h2 id="channels-title">渠道网关连接状态</h2>
+          <p class="muted">实时展示关联渠道的网关连接健康度；实际消息收发以渠道回执为准。</p>
         </div>
-        ${signedIn ? "" : '<p class="login-prompt">登录后可以查看和更换 Cookie。<a href="/admin/login">前往登录</a></p>'}
+        ${signedIn ? '<a class="secondary btn-sm link-btn" href="/admin/managed">进入渠道托管控制台 →</a>' : `<span class="relay-mark">${icon("relay")}</span>`}
+      </div>
+      <ul class="channels channels-grid">
+        <li>${icon("wechat")}<div><strong>微信网关</strong><span class="channel-detail" id="weixin-detail">Worker 中转</span></div><span class="tag" id="weixin-state">查询中</span></li>
+        <li>${icon("wecom")}<div><strong>企业微信网关</strong><span class="channel-detail" id="wecom-detail">Worker 中转</span></div><span class="tag" id="wecom-state">查询中</span></li>
+      </ul>
+    </section>
+
+    <div class="modal-backdrop" id="cookie-modal" role="dialog" aria-modal="true" aria-labelledby="edit-title" hidden>
+      <div class="modal-dialog panel">
+        <div class="modal-header">
+          <div class="heading-with-badge">
+            <h2 id="edit-title">更换账号 Cookie</h2>
+            <span class="tag" id="modal-account-badge">主账号 (primary-account)</span>
+          </div>
+          <button class="quiet btn-sm modal-close" id="close-cookie-modal" type="button" aria-label="关闭弹窗">✕ 关闭</button>
+        </div>
         <form id="editor" method="post" autocomplete="off">
           <fieldset ${signedIn ? "" : "disabled"}>
-          <div class="current-cookie">
-            <div class="current-cookie-bar">
-              <label for="current-cookie">当前 Cookie</label>
-              <button class="quiet" id="reveal-cookie" type="button" aria-controls="current-cookie" aria-expanded="false">显示</button>
-              <button class="quiet" id="copy-cookie" type="button" hidden>复制</button>
+            <div id="modal-new-account-fields" class="modal-account-fields" hidden>
+              <div class="inline-fields">
+                <label>账号备注名称<input id="new-account-label" name="label" maxlength="40" placeholder="例如：备用二号 / 工作号"></label>
+                <label>账号标识 ID（可选）<input id="new-account-id" name="id" maxlength="31" placeholder="留空自动生成，或填字母数字如 muse-2"></label>
+              </div>
+              <div class="modal-toggles-row">
+                <label class="toggle"><input id="new-account-enabled" name="enabled" type="checkbox" checked>验证通过后立即开启（加入多开调度池）</label>
+                <label class="toggle"><input id="new-account-default" name="set_default" type="checkbox">设为首选兜底账号</label>
+              </div>
             </div>
-            <textarea id="current-cookie" readonly hidden autocomplete="off" spellcheck="false"></textarea>
-          </div>
-          <label for="cookie">新 Cookie</label>
-          <textarea id="cookie" placeholder="粘贴 Cookie 请求头…" maxlength="${MAX_COOKIE_LENGTH + 8}" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="hint" required></textarea>
-          <small id="hint">格式：<code>名称=值; 名称2=值2</code></small>
-          <div class="actions">
-            <button class="primary" type="submit">验证并保存</button>
-            <button class="secondary" id="renew-now" type="button">立即续期</button>
-            <button class="secondary" id="probe-rpc" type="button">RPC 自检</button>
-            <button class="secondary" id="clear" type="button">清空</button>
-            <button class="quiet" id="check" type="button">${icon("refresh")}查看状态</button>
-          </div>
-          </fieldset>
-          <output id="feedback" role="status" aria-live="polite"></output>
-          <noscript>请开启 JavaScript 后使用管理页。</noscript>
-        </form>
-      </section>
 
-      <aside class="side-panels" aria-label="渠道与审批">
-        <section class="panel overview" aria-labelledby="channels-title">
-          <div class="panel-heading">
-            <h2 id="channels-title">渠道连接</h2>
-            <span class="relay-mark">${icon("relay")}</span>
-          </div>
-          <ul class="channels">
-            <li>${icon("wechat")}<div><strong>微信</strong><span class="channel-detail" id="weixin-detail">Worker 中转</span></div><span class="tag" id="weixin-state">查询中</span></li>
-            <li>${icon("wecom")}<div><strong>企业微信</strong><span class="channel-detail" id="wecom-detail">Worker 中转</span></div><span class="tag" id="wecom-state">查询中</span></li>
-          </ul>
-          <p class="muted">显示网关连接状态；实际收发以渠道回执为准。${signedIn ? ' <a class="login-link" href="/admin/managed">进入渠道控制台 →</a>' : ""}</p>
-        </section>
-        <section class="panel overview approvals" aria-labelledby="approvals-title">
-          <div class="panel-heading">
-            <h2 id="approvals-title">Worker 自动审批</h2>
-            <button class="secondary btn-sm" id="poll-approvals" type="button" ${signedIn ? "" : "disabled"}>立即轮询</button>
-          </div>
-          <div class="approval-state">${icon("play")}<strong id="approval-state">待查询</strong></div>
-          <p class="muted" id="approval-note">仅自动处理符合规则的请求。</p>
-          <div class="chip-row" id="approval-stats" hidden></div>
-        </section>
-      </aside>
+            <div class="current-cookie" id="modal-current-cookie-wrap">
+              <div class="current-cookie-bar">
+                <label for="current-cookie">当前已存 Cookie</label>
+                <button class="quiet btn-sm" id="reveal-cookie" type="button" aria-controls="current-cookie" aria-expanded="false">显示已存 Cookie</button>
+                <button class="quiet btn-sm" id="copy-cookie" type="button" hidden>复制</button>
+              </div>
+              <textarea id="current-cookie" readonly hidden autocomplete="off" spellcheck="false"></textarea>
+            </div>
+
+            <div class="modal-split-grid">
+              <div class="modal-input-pane">
+                <div class="cookie-label-bar">
+                  <label for="cookie" id="cookie-input-label">粘贴扩展 JSON 或 Cookie</label>
+                  <div class="cookie-quick-tools">
+                    <button class="secondary btn-sm" type="button" data-cookie-paste="main">📋 粘贴剪贴板</button>
+                    <button class="secondary btn-sm" type="button" data-cookie-file-btn="main">📂 导入 JSON</button>
+                    <input type="file" accept=".json,application/json,.txt" data-cookie-file="main" hidden>
+                    <button class="quiet btn-sm" id="clear" type="button">清空</button>
+                  </div>
+                </div>
+                <textarea id="cookie" placeholder="在此粘贴浏览器扩展复制的 cookies.json / muse-credentials.json，或单行 Cookie 请求头…" maxlength="${MAX_COOKIE_LENGTH * 10}" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="hint"></textarea>
+                <small id="hint">支持直接粘贴扩展复制的 JSON 或 <code>名称=值; 名称2=值2</code>，右侧实时同步预览</small>
+              </div>
+
+              <div class="modal-preview-pane">
+                <div class="cookie-label-bar">
+                  <label>实时解析预览</label>
+                  <span class="tag" id="preview-status-badge">等待输入</span>
+                </div>
+                <div class="cookie-preview-card" id="main-cookie-preview">
+                  <div class="cookie-preview-empty">
+                    <strong>等待粘贴或导入 JSON 凭证</strong>
+                    <p>在左侧粘贴浏览器扩展导出的 <code>cookies.json</code> / <code>muse-credentials.json</code> 或 Cookie 请求头，此处将实时展示识别状态、<code>HttpOnly</code> 统计、虚拟机 ID 与脱敏键值胶囊。</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <output id="modal-feedback" class="status-banner" role="status" aria-live="polite" hidden></output>
+
+            <div class="modal-footer">
+              <button class="secondary" id="cancel-cookie-modal" type="button">取消</button>
+              <button class="primary" id="modal-submit-btn" type="submit">验证并保存</button>
+            </div>
+          </fieldset>
+        </form>
+      </div>
     </div>
 
     <footer class="footer"><span>${icon("lock")}凭证仅用于 Muse 验证与连接</span><span>所有时间均为北京时间</span></footer>

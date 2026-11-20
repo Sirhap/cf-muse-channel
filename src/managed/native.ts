@@ -1,8 +1,12 @@
 import type { MuseRpc } from "../noise";
-import { downloadAndDecryptInbound, extractOutboundFiles, writeSandboxFile } from "./media";
+import { bytesToBase64, downloadAndDecryptInbound, extractOutboundFiles, imageMimeForExtension, MAX_INLINE_IMAGE_BYTES, writeSandboxFile } from "./media";
 import { object, string, type Incoming } from "./protocol";
 import { channelReply } from "./reply";
 import { ManagedStore, type Task } from "./store";
+
+type StreamItem =
+  | { type: "text"; text: string }
+  | { type: "image"; mime_type: string; filename: string; data_base64: string };
 
 export interface NativeSession extends Record<string, SqlStorageValue> {
   session: string;
@@ -126,7 +130,7 @@ export class NativeConversations {
     }
     const binding = await this.bind(task);
     const route = JSON.parse(task.route) as Incoming;
-    const promptText = await this.stageInboundMedia(task, route);
+    const streamItems = await this.stageInboundMedia(task, route);
     const device = "cf-managed-" + crypto.randomUUID();
     this.commit(() => {
       this.store.set("device:" + task.id, device);
@@ -137,7 +141,7 @@ export class NativeConversations {
     this.watch(binding.session);
     try {
       await this.rpc((client) => client.open("/chat/stream", 0, "POST", {
-        session_id: binding.session, node_id: device, capabilities: {}, items: [{ type: "text", text: promptText }],
+        session_id: binding.session, node_id: device, capabilities: {}, items: streamItems,
       }));
       this.store.sql.exec("UPDATE tasks SET state='submitted' WHERE id=?", task.id);
       this.store.set("native-input:" + task.id, { ...this.store.get<object>("native-input:" + task.id), submitted_at: Date.now() });
@@ -148,27 +152,46 @@ export class NativeConversations {
     return binding.session;
   }
 
-  /** 将微信/企微入站图片或文件下载解密后写入 Muse 沙箱，并在消息文本中附上沙箱绝对路径供 Muse 直接查看。 */
-  private async stageInboundMedia(task: Task, route: Incoming): Promise<string> {
-    if (!route.media?.length) return task.text;
+  /** 将微信/企微入站媒体下载解密后写入 Muse 沙箱；对 1.5MB 以内的图片同时附上 Muse 原生 image item 以便多模态直接识别。 */
+  private async stageInboundMedia(task: Task, route: Incoming): Promise<StreamItem[]> {
+    if (!route.media?.length) return [{ type: "text", text: task.text }];
     const notes: string[] = [];
+    const imageItems: StreamItem[] = [];
     const safeId = task.message_id.replace(/[^A-Za-z0-9_-]/g, "").slice(-24) || String(task.id);
     for (let index = 0; index < route.media.length; index++) {
       const item = route.media[index];
       const label = item.kind === "image" ? "图片" : item.kind === "video" ? "视频" : "文件";
       try {
         const { bytes, ext } = await downloadAndDecryptInbound(item);
-        const relPath = `workspace/cf-inbound-media/${safeId}_${index}.${ext}`;
+        const filename = `${safeId}_${index}.${ext}`;
+        const relPath = `workspace/cf-inbound-media/${filename}`;
         await writeSandboxFile(this.rpc, relPath, bytes);
-        notes.push(`[已附${label}，已保存到沙箱路径：/home/hatch/${relPath}（${bytes.length} 字节）]`);
+        const mime = item.kind === "image" ? imageMimeForExtension(ext) : null;
+        if (mime && bytes.length <= MAX_INLINE_IMAGE_BYTES) {
+          imageItems.push({
+            type: "image",
+            mime_type: mime,
+            filename,
+            data_base64: bytesToBase64(bytes),
+          });
+          notes.push(`[已附${label}，已内联传入并保存到沙箱路径：/home/hatch/${relPath}（${bytes.length} 字节）]`);
+        } else {
+          const oversizeHint = mime && bytes.length > MAX_INLINE_IMAGE_BYTES ? "；图片较大未内联，请直接读取沙箱路径查看" : "";
+          notes.push(`[已附${label}，已保存到沙箱路径：/home/hatch/${relPath}（${bytes.length} 字节）${oversizeHint}]`);
+        }
       } catch (error) {
-        const reason = error instanceof Error && error.message === "media_too_large"
+        const code = error instanceof Error ? error.message : "unknown_error";
+        const reason = code === "media_too_large"
           ? "超过 CF 托管 6MB 单文件上限"
-          : "下载或解密失败";
+          : `下载或解密失败（${code}）`;
         notes.push(`[用户发送的${label}未能转存到沙箱：${reason}]`);
       }
     }
-    return notes.length ? `${task.text}\n\n${notes.join("\n")}` : task.text;
+    const baseText = task.text === "[图片]" && imageItems.length > 0
+      ? "请识别并查看用户发送的图片。"
+      : task.text;
+    const promptText = notes.length ? `${baseText}\n\n${notes.join("\n")}` : baseText;
+    return [{ type: "text", text: promptText }, ...imageItems];
   }
 
   /** Adopt any old in-flight transport receipt without resubmitting the message. */
@@ -206,7 +229,13 @@ export class NativeConversations {
       if (event.event_name === "message.user") {
         const device = string(object(payload.metadata).client_device_id) || string(object(payload.chat_context).device_id);
         const task = device ? devices.get(device) : undefined;
-        if (task && (payload.display_text === task.text || payload.content === task.text)) {
+        const textMatches = task && (
+          payload.display_text === task.text
+          || payload.content === task.text
+          || (typeof payload.display_text === "string" && payload.display_text.includes(task.text))
+          || (task.text === "[图片]" && typeof payload.display_text === "string" && payload.display_text.includes("[已附图片"))
+        );
+        if (task && textMatches) {
           const receipt = this.store.get<Record<string, unknown>>("native-input:" + task.id) ?? {};
           if (!receipt.confirmed_at) {
             this.store.set("native-input:" + task.id, { ...receipt, confirmed_at: Date.now(), event_seq: event.seq,

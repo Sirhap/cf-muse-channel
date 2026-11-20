@@ -69,10 +69,11 @@ export function weixinMessages(value: unknown, config: ChannelConfig): Incoming[
         const nodeKey = kind === 2 ? "image_item" : kind === 4 ? "file_item" : "video_item";
         const mediaKind = kind === 2 ? "image" : kind === 4 ? "file" : "video";
         const sub = object(item[nodeKey]);
-        const mediaNode = object(sub.media);
-        const url = weixinDownloadUrl(string(mediaNode.full_url), string(mediaNode.encrypt_query_param));
+        const mediaNode = object(sub.media ?? sub.hd_media ?? sub.mid_media ?? sub.thumb_media);
+        const rawFullUrl = string(mediaNode.full_url) || string(sub.url) || string(sub.mid_url);
+        const url = weixinDownloadUrl(rawFullUrl, string(mediaNode.encrypt_query_param));
         const hexKey = string(sub.aeskey).trim();
-        const b64Key = string(mediaNode.aes_key).trim();
+        const b64Key = string(mediaNode.aes_key).trim() || string(sub.aes_key).trim();
         if (url && (hexKey || b64Key)) {
           media.push({
             kind: mediaKind,

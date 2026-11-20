@@ -218,12 +218,49 @@ export class ManagedChannels extends DurableObject<Env> {
         return json({ error: "invalid_toggle_payload" }, 400);
       }
     }
+    if (request.method === "POST" && path === "/admin/managed/reveal") {
+      let body: Record<string, unknown> = {};
+      try {
+        if (request.body) body = await boundedJson(new Response(request.body), 2048);
+      } catch {
+        body = {};
+      }
+      const wantSecret = body.revealSecret === true;
+      const targetChannel = string(body.channel);
+      if (wantSecret) {
+        if (targetChannel !== "weixin" && targetChannel !== "wecom") {
+          return json({ error: "invalid_channel" }, 400);
+        }
+        const cfg = this.config(targetChannel);
+        if (!cfg) return json({ error: "channel_not_configured" }, 404);
+        return new Response(JSON.stringify({ channel: targetChannel, secret: cfg.secret }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+        });
+      }
+      return json({
+        weixin: this.config("weixin") ? {
+          configured: true,
+          enabled: this.config("weixin")!.enabled,
+          account: this.config("weixin")!.account,
+          allowedSenders: this.config("weixin")!.allowedSenders,
+          hasSecret: Boolean(this.config("weixin")!.secret),
+        } : null,
+        wecom: this.config("wecom") ? {
+          configured: true,
+          enabled: this.config("wecom")!.enabled,
+          account: this.config("wecom")!.account,
+          allowedSenders: this.config("wecom")!.allowedSenders,
+          hasSecret: Boolean(this.config("wecom")!.secret),
+        } : null,
+      });
+    }
     if (request.method === "POST" && (path === "/admin/managed/weixin" || path === "/admin/managed/wecom")) {
       const channel: Channel = path.endsWith("/weixin") ? "weixin" : "wecom";
       try {
-        const data = await this.readConfig(request);
-        if (data.enabled && this.env.MANAGED_CHANNELS_ENABLED !== "true") return json({ error: "staging_channels_disabled" }, 409);
         const previous = this.config(channel);
+        const data = await this.readConfig(request, channel, previous);
+        if (data.enabled && this.env.MANAGED_CHANNELS_ENABLED !== "true") return json({ error: "staging_channels_disabled" }, 409);
         const replacing = !previous || previous.account !== data.account || previous.secret !== data.secret
           || JSON.stringify(previous.allowedSenders) !== JSON.stringify(data.allowedSenders) || data.initialCursor !== undefined;
         const outstanding = this.ctx.storage.sql.exec<{ count: number }>(
@@ -245,7 +282,7 @@ export class ManagedChannels extends DurableObject<Env> {
     return json({ error: "not_found" }, 404);
   }
 
-  private async readConfig(request: Request) {
+  private async readConfig(request: Request, channel: Channel, previous: ChannelConfig | null) {
     if (request.headers.get("Content-Type")?.split(";")[0] !== "application/json") throw new Error("json_required");
     const reader = request.body?.getReader();
     if (!reader) throw new Error("body_required");
@@ -261,7 +298,16 @@ export class ManagedChannels extends DurableObject<Env> {
         text += decoder.decode(part.value, { stream: true });
       }
     } finally { reader.releaseLock(); }
-    return validConfig(JSON.parse(text + decoder.decode()));
+    const raw = JSON.parse(text + decoder.decode()) as Record<string, unknown>;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      if (channel === "weixin" && !string(raw.account).trim()) {
+        raw.account = previous?.account || "weixin-bot";
+      }
+      if (previous && !string(raw.secret)) {
+        raw.secret = previous.secret;
+      }
+    }
+    return validConfig(raw);
   }
 
   private async handlePush(request: Request): Promise<Response> {

@@ -19,4 +19,6 @@
 - `src/noise.ts` / `src/wire.ts`：`NoiseXX` 握手与支持流级多路复用/自动排空未消费流的 `MuseRpc`。
 - `src/managed/`：`ManagedChannels` DO（`runtime.ts`、`native.ts`、`outbox.ts`、`media.ts`、`crypto.ts`、`store.ts`、`protocol.ts`、`reply.ts`、`page.ts`），负责微信/企微文字与 6MB 内媒体双向托管、事件精准唤醒、纯 CF 侧 `outbox.jsonl` Range 增量追踪、主动推送与企微兜底。
 - `client/`：Python Noise 中转与审批客户端（`probe.py`、`events.py`、`bridge.py`、`ws_transport.py`、`approvals.py`）。
-- 常用命令：`npm run test:all`（类型检查 + Vitest + Python 单测 + 重启恢复测试）、`npm run build`（Wrangler dry-run 打包）。
+- `scripts/`：运维与验证脚本（`deploy.py` 并发快速部署与防 Wrangler 驻留回收/安全 DO `immediate` 切版、`secrets.py` 凭证导入准备、`live_smoke.py` 线上冒烟、`prepare_channel_integration.py` 渠道桥接补丁）。
+- `muse-cookice-extension/`：Muse Cookie 导出/导入浏览器扩展（`manifest.json`、`popup.html`、`popup.js`、`popup.css`）。
+- 常用命令：`npm run test:all`（类型检查 + Vitest + Python 单测 + 重启恢复测试）、`npm run build`（Wrangler dry-run 打包）、`npm run deploy:fast`（`scripts/deploy.py` 快速部署）。

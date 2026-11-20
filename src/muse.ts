@@ -30,6 +30,7 @@ interface CookieSession {
   header(): string;
   apply(headers: string[]): void;
   verified(): void;
+  setVmId?(vmId: string): void;
 }
 
 /** 负责串行保护持久化 Cookie 轮换；WebSocket 升级与 Noise RPC 移出互斥锁以避免互相阻塞。 */
@@ -114,6 +115,12 @@ export class CookieController {
         checkpoint(next);
         Object.assign(state, next);
       },
+      setVmId: (vmId: string) => {
+        if (!vmId || state.vmId === vmId) return;
+        const next = { ...state, vmId };
+        checkpoint(next);
+        Object.assign(state, next);
+      },
     };
   }
 
@@ -121,6 +128,7 @@ export class CookieController {
     return {
       ok: state.lastVerifiedAt !== null && state.lastError === null && !state.needsLogin,
       configured: true, needs_login: state.needsLogin,
+      vm_id: state.vmId ?? null,
       last_checked_at: state.lastCheckedAt, last_verified_at: state.lastVerifiedAt,
       last_rotated_at: state.lastRotatedAt, last_error: state.lastError,
       last_imported_at: state.importedAt ?? null,
@@ -150,18 +158,29 @@ export class CookieController {
     });
   }
 
+  private async recordExternalSuccess(seed: string): Promise<void> {
+    await this.exclusive(async () => {
+      const current = this.store.load();
+      if (!current || current.seed !== seed || !current.lastError) return;
+      const now = Date.now();
+      this.persist({ ...current, lastCheckedAt: now, lastVerifiedAt: now, lastError: null, needsLogin: false });
+    });
+  }
+
   /** 在串行边界内换取短期 Noise 建连 URL（含 Cookie 轮换落盘），之后立即释放锁。 */
   private async prepareNoiseUrl(
     session: CookieSession,
     seed: string,
     allowAccessCache: boolean,
     persistedVmId?: string,
-  ): Promise<{ url: URL; vmId: string; accessToken: string }> {
+  ): Promise<{ url: URL; vmId: string; accessToken: string; cookieHeader: string }> {
     const envVmId = this.isIsolated() ? "" : (this.env.MUSE_VM_ID ?? "");
     let vmId = envVmId || persistedVmId || (this.cachedVmId?.seed === seed ? this.cachedVmId.id : "");
+    let fromCache = Boolean(vmId && !envVmId);
     if (!vmId) {
       const info = await authJson("/api/session", session);
-      vmId = requiredString(info, "vm_id", "/api/session");
+      vmId = extractVmId(info);
+      session.setVmId?.(vmId);
     }
     const cachedToken = allowAccessCache && this.cachedAccess?.seed === seed && Date.now() < this.cachedAccess.expiresAt
       ? this.cachedAccess.token : null;
@@ -175,6 +194,13 @@ export class CookieController {
           this.cachedAccess = undefined;
           accessToken = null;
           hatch = {};
+        } else if (error instanceof ProbeError && fromCache && (error.upstreamStatus === 400 || error.upstreamStatus === 404)) {
+          this.cachedVmId = undefined;
+          const info = await authJson("/api/session", session);
+          vmId = extractVmId(info);
+          session.setVmId?.(vmId);
+          fromCache = false;
+          hatch = await requestHatchToken(session, vmId, accessToken);
         } else {
           throw error;
         }
@@ -186,12 +212,24 @@ export class CookieController {
       const auth = await authJson("/api/auth/check", session, { method: "POST", body: "" });
       accessToken = requiredString(auth, "access_token", "/api/auth/check");
       session.verified();
-      hatch = await requestHatchToken(session, vmId, accessToken);
+      try {
+        hatch = await requestHatchToken(session, vmId, accessToken);
+      } catch (error) {
+        if (error instanceof ProbeError && fromCache && (error.upstreamStatus === 400 || error.upstreamStatus === 404)) {
+          this.cachedVmId = undefined;
+          const info = await authJson("/api/session", session);
+          vmId = extractVmId(info);
+          session.setVmId?.(vmId);
+          hatch = await requestHatchToken(session, vmId, accessToken);
+        } else {
+          throw error;
+        }
+      }
     }
     const url = new URL("/v1/noise", GATEWAY_ORIGIN);
     url.searchParams.set("vm_id", vmId);
     url.searchParams.set("auth_token", requiredString(hatch, "token", "/api/hatch/token"));
-    return { url, vmId, accessToken };
+    return { url, vmId, accessToken, cookieHeader: session.header() };
   }
 
   /** Verify the candidate in memory. Publish the entire new jar in one write after a real RPC. */
@@ -205,12 +243,22 @@ export class CookieController {
           lastRotatedAt: null, lastError: null, needsLogin: false,
         };
         const prepared = await this.prepareNoiseUrl(this.session(candidate, () => {}), seed, false);
-        const upstream = await openNoiseWebSocket(prepared.url);
+        let vmSleeping = false;
         try {
-          rpc = await MuseRpc.connect(upstream.webSocket!);
-          await rpc.call("/api/session/list", 0);
-        } catch {
-          throw new ProbeError("noise_rpc", "verification_failed");
+          const upstream = await openNoiseWithAutoWake(prepared.url, prepared.vmId, prepared.cookieHeader, prepared.accessToken);
+          try {
+            rpc = await MuseRpc.connect(upstream.webSocket!);
+            await rpc.call("/api/session/list", 0);
+          } catch {
+            throw new ProbeError("noise_rpc", "verification_failed");
+          }
+        } catch (wsError) {
+          if (isVmSleepingError(wsError)) {
+            // Cookie 已通过 /api/auth/check、/api/session 与 /api/hatch/token 校验，502/503/504 仅表示该账号 VM 容器当前休眠或冷启动中
+            vmSleeping = true;
+          } else {
+            throw wsError;
+          }
         }
         candidate.vmId = prepared.vmId;
         candidate.importedAt = Date.now();
@@ -219,7 +267,7 @@ export class CookieController {
         this.persist(candidate);
         this.cachedVmId = { seed, id: prepared.vmId };
         this.cachedAccess = { seed, token: prepared.accessToken, expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS };
-        return json(this.status(candidate));
+        return json({ ...this.status(candidate), ...(vmSleeping ? { vm_sleeping: true } : {}) });
       } catch (error) {
         const failure = this.failure(error);
         return json({ ok: false, error: "cookie_not_saved",
@@ -297,7 +345,13 @@ export class CookieController {
         const result = await this.prepareNoiseUrl(this.session(state), state.seed, true, state.vmId);
         this.cachedVmId = { seed: state.seed, id: result.vmId };
         this.cachedAccess = { seed: state.seed, token: result.accessToken, expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS };
-        return { url: result.url, seed: state.seed };
+        return {
+          url: result.url,
+          vmId: result.vmId,
+          cookieHeader: result.cookieHeader,
+          accessToken: result.accessToken,
+          seed: state.seed,
+        };
       } catch (error) {
         const failure = this.failure(error);
         if (state && failure.code !== "cookie_requires_login") this.failed(state, failure);
@@ -307,9 +361,11 @@ export class CookieController {
     });
     let rpc: MuseRpc | undefined;
     try {
-      const upstream = await openNoiseWebSocket(prepared.url);
+      const upstream = await openNoiseWithAutoWake(prepared.url, prepared.vmId, prepared.cookieHeader, prepared.accessToken);
       rpc = await MuseRpc.connect(upstream.webSocket!);
-      return await operation(rpc);
+      const outcome = await operation(rpc);
+      await this.recordExternalSuccess(prepared.seed);
+      return outcome;
     } catch (error) {
       await this.recordExternalFailure(prepared.seed, this.failure(error));
       throw new Error("worker_rpc_failed");
@@ -322,7 +378,7 @@ export class CookieController {
       return this.refresh().then((status) => json(status, status.ok ? 200 : 502));
     }
     const isProbe = pathname === "/probe/cookie";
-    const step = await this.exclusive(async (): Promise<{ response: Response } | { url: URL; seed: string }> => {
+    const step = await this.exclusive(async (): Promise<{ response: Response } | { url: URL; vmId: string; cookieHeader: string; accessToken: string; seed: string }> => {
       let state: CredentialState | undefined;
       try {
         state = await this.state();
@@ -331,7 +387,13 @@ export class CookieController {
         const result = await this.prepareNoiseUrl(this.session(state), state.seed, !isProbe, state.vmId);
         this.cachedVmId = { seed: state.seed, id: result.vmId };
         this.cachedAccess = { seed: state.seed, token: result.accessToken, expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS };
-        return { url: result.url, seed: state.seed };
+        return {
+          url: result.url,
+          vmId: result.vmId,
+          cookieHeader: result.cookieHeader,
+          accessToken: result.accessToken,
+          seed: state.seed,
+        };
       } catch (error) {
         const failure = this.failure(error);
         if (state) this.failed(state, failure);
@@ -341,7 +403,8 @@ export class CookieController {
     });
     if ("response" in step) return step.response;
     try {
-      const upstream = await openNoiseWebSocket(step.url);
+      const upstream = await openNoiseWithAutoWake(step.url, step.vmId, step.cookieHeader, step.accessToken);
+      await this.recordExternalSuccess(step.seed);
       if (isProbe) {
         upstream.webSocket!.accept();
         upstream.webSocket!.close(1000, "Probe complete");
@@ -368,11 +431,10 @@ export class ProbeError extends Error {
   }
 }
 
-/** Read bounded auth JSON. Upstream payloads and exception messages never leave this boundary. */
-async function authJson(path: string, session: CookieSession, init: RequestInit = {}): Promise<Record<string, unknown>> {
-  const headers = new Headers(init.headers);
-  headers.set("Cookie", session.header());
-  // Match the existing pinned Muse client's HTTP contract.
+/** 构造符合 Muse 官方同源校验（含 Sec-Fetch-* 与 pinned UA）的请求头。 */
+function museRequestHeaders(cookieHeaderValue: string, extra?: HeadersInit): Headers {
+  const headers = new Headers(extra);
+  headers.set("Cookie", cookieHeaderValue);
   headers.set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36");
   headers.set("Origin", MUSE_ORIGIN);
   headers.set("Referer", `${MUSE_ORIGIN}/`);
@@ -381,6 +443,12 @@ async function authJson(path: string, session: CookieSession, init: RequestInit 
   headers.set("Sec-Fetch-Dest", "empty");
   headers.set("Accept", "application/json");
   headers.set("Content-Type", "application/json");
+  return headers;
+}
+
+/** Read bounded auth JSON. Upstream payloads and exception messages never leave this boundary. */
+async function authJson(path: string, session: CookieSession, init: RequestInit = {}): Promise<Record<string, unknown>> {
+  const headers = museRequestHeaders(session.header(), init.headers);
   let response: Response;
   try {
     response = await fetch(`${MUSE_ORIGIN}${path}`, {
@@ -433,12 +501,54 @@ function requiredString(record: Record<string, unknown>, field: string, stage: s
   return value;
 }
 
+/** 从 /api/session 响应中提取 vm_id，兼容顶层 vm_id 与 vms[] 列表结构。 */
+function extractVmId(record: Record<string, unknown>): string {
+  if (typeof record.vm_id === "string" && record.vm_id.trim()) {
+    return record.vm_id.trim();
+  }
+  if (Array.isArray(record.vms)) {
+    const items = record.vms.filter((v): v is Record<string, unknown> => Boolean(v && typeof v === "object"));
+    const preferred = items.find((v) => v.is_preferred === true) ?? items[0];
+    const nested = preferred && (typeof preferred.vm_id === "string" ? preferred.vm_id : typeof preferred.id === "string" ? preferred.id : "");
+    if (nested && nested.trim()) return nested.trim();
+  }
+  throw new ProbeError("/api/session", "missing_vm_id");
+}
+
+function isVmSleepingError(error: unknown): boolean {
+  return (
+    error instanceof ProbeError
+    && error.stage === "websocket"
+    && (error.upstreamStatus === 502 || error.upstreamStatus === 503 || error.upstreamStatus === 504)
+  );
+}
+
 /** 使用 access_token 换取一次性的 Noise 网关接入令牌。 */
 function requestHatchToken(session: CookieSession, vmId: string, accessToken: string) {
   return authJson("/api/hatch/token", session, {
     method: "POST", headers: { Authorization: `Bearer ${accessToken}` },
     body: JSON.stringify({ vmAddress: `wss://${vmId}.metaaivm.com/`, vmName: vmId }),
   });
+}
+
+/** 触发 Muse 官方休眠 VM 唤醒接口（POST /api/hatch/vm/wake）。 */
+async function wakeMuseVm(vmId: string, cookieHeaderValue: string, accessToken?: string): Promise<boolean> {
+  if (!vmId || !cookieHeaderValue) return false;
+  const headers = museRequestHeaders(cookieHeaderValue);
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  try {
+    const resp = await fetch(`${MUSE_ORIGIN}/api/hatch/vm/wake`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ vm_id: vmId }),
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+    });
+    await resp.body?.cancel();
+    return resp.ok;
+  } catch {
+    return false;
+  }
 }
 
 /** 仅执行不带 Cookie 的 Noise WebSocket 升级，可在互斥锁外并发进行。 */
@@ -461,4 +571,31 @@ async function openNoiseWebSocket(url: URL): Promise<Response> {
     throw new ProbeError("websocket", "upgrade_failed", upstream.status);
   }
   return upstream;
+}
+
+/** 建立 Noise WebSocket 连接；当检测到休眠 VM (502/503/504) 时自动调用官方 /api/hatch/vm/wake 唤醒并重试。 */
+async function openNoiseWithAutoWake(
+  url: URL,
+  vmId: string,
+  cookieHeaderValue: string,
+  accessToken?: string,
+): Promise<Response> {
+  try {
+    return await openNoiseWebSocket(url);
+  } catch (error) {
+    if (!isVmSleepingError(error)) throw error;
+    const woke = await wakeMuseVm(vmId, cookieHeaderValue, accessToken);
+    if (!woke) throw error;
+    let lastError: unknown = error;
+    for (const delayMs of [2000, 3000]) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      try {
+        return await openNoiseWebSocket(url);
+      } catch (retryError) {
+        lastError = retryError;
+        if (!isVmSleepingError(retryError)) throw retryError;
+      }
+    }
+    throw lastError;
+  }
 }

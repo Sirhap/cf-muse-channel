@@ -58,7 +58,7 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
     || (request.method === "POST" && path === "/admin/managed/connectivity")
     || (request.method === "POST" && path === "/admin/managed/confirm-delivery")
     || (request.method === "POST" && path === "/admin/managed/push")
-    || (request.method === "POST" && ["/admin/managed/toggle", "/admin/managed/wake"].includes(path))
+    || (request.method === "POST" && ["/admin/managed/toggle", "/admin/managed/wake", "/admin/managed/reveal"].includes(path))
     || (request.method === "POST" && ["/admin/managed/weixin", "/admin/managed/wecom"].includes(path))
     || (request.method === "POST" && ["/admin/renew", "/admin/approvals/poll", "/admin/probe-rpc"].includes(path))
     || (["GET", "POST"].includes(request.method) && path === "/admin/accounts")

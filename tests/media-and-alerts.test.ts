@@ -142,9 +142,16 @@ describe("微信/企微入站媒体与语音转文字解析 + 沙箱写入", () 
       expect(String(writes[0].path)).toMatch(/^workspace\/cf-inbound-media\/img-msg-1_0\.png$/);
       expect(writes[0].overwrite).toBe(true);
       expect(writes[0].create_parent).toBe(true);
-      const sentText = ((streamBodies[0].items as { text: string }[])[0]).text;
+      const sentItems = streamBodies[0].items as Array<Record<string, unknown>>;
+      const sentText = String(sentItems[0].text);
       expect(sentText).toContain("看看图片内容");
       expect(sentText).toContain("/home/hatch/workspace/cf-inbound-media/img-msg-1_0.png");
+      expect(sentItems[1]).toMatchObject({
+        type: "image",
+        mime_type: "image/png",
+        filename: "img-msg-1_0.png",
+        data_base64: expect.any(String),
+      });
     });
   });
 });
@@ -388,6 +395,13 @@ describe("MuseCredentials 非白名单审批提醒与 Cookie 过期告警去重"
     expect(pageHtml).toContain("主动消息推送 / 渠道测试台");
     expect(pageHtml).toContain("网关连通性探测");
     expect(pageHtml).toContain("最近入站任务");
+    expect(pageHtml).toContain('data-secret-eye="weixin"');
+    expect(pageHtml).toContain('data-secret-eye="wecom"');
+    const scriptMatch = pageHtml.match(/<script[^>]*>([\s\S]*?)<\/script>/);
+    expect(scriptMatch?.[1]).toBeTruthy();
+    expect(scriptMatch?.[1]).toContain('split(/\\s+/)');
+    expect(scriptMatch?.[1]).toContain("MASKED_SENTINEL");
+    expect(() => new Function(scriptMatch![1])).not.toThrow();
 
     await runInDurableObject(env.MOBILE.getByName("admin-toggle-test"), async (_instance, state) => {
       const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
@@ -410,6 +424,35 @@ describe("MuseCredentials 非白名单审批提醒与 Cookie 过期告警去重"
       expect(togOff.status).toBe(200);
       const st2 = await (await runtime.fetch(new Request("https://internal/admin/managed/status"))).json() as { channels: { weixin: { enabled: boolean } } };
       expect(st2.channels.weixin.enabled).toBe(false);
+
+      const rev1 = await (await runtime.fetch(new Request("https://internal/admin/managed/reveal", { method: "POST" }))).text();
+      expect(rev1).not.toContain("top-secret-tok");
+      expect(JSON.parse(rev1)).toMatchObject({
+        weixin: { configured: true, enabled: false, account: "wx-bot", allowedSenders: ["u1", "u2"], hasSecret: true },
+        wecom: null,
+      });
+
+      const revSecret = await runtime.fetch(new Request("https://internal/admin/managed/reveal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: "weixin", revealSecret: true }),
+      }));
+      expect(revSecret.status).toBe(200);
+      expect(revSecret.headers.get("Cache-Control")).toBe("no-store");
+      expect(await revSecret.json()).toEqual({ channel: "weixin", secret: "top-secret-tok" });
+
+      const keepSecretRes = await runtime.fetch(new Request("https://internal/admin/managed/weixin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true, account: "", secret: "", allowedSenders: ["u1", "u2", "u3"] }),
+      }));
+      expect(keepSecretRes.status).toBe(200);
+      const rev2 = await (await runtime.fetch(new Request("https://internal/admin/managed/reveal", { method: "POST" }))).json() as {
+        weixin: { account: string; allowedSenders: string[] };
+      };
+      expect(rev2.weixin).toMatchObject({ account: "wx-bot", allowedSenders: ["u1", "u2", "u3"] });
+      const storedRow = state.storage.sql.exec<{ value: string }>("SELECT value FROM config WHERE channel='weixin'").one();
+      expect(JSON.parse(storedRow.value).secret).toBe("top-secret-tok");
     });
   });
 

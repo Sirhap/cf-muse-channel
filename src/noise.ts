@@ -4,6 +4,8 @@ import { bytesField as b, numberField as n, fields, getBytes, getNumber, join, u
 const EMPTY: Uint8Array = new Uint8Array();
 const MAX_SOCKET_QUEUE = 1024;
 const MAX_STREAM_QUEUE = 1024;
+/** Noise 单条加密消息规范上限为 65535 字节；发送端按 48 KiB 切片以支持内联图片与大文件写入。 */
+const NOISE_SEND_CHUNK = 48 * 1024;
 type FrameFields = ReturnType<typeof fields>;
 interface StreamBuffer {
   queue: FrameFields[];
@@ -238,8 +240,12 @@ export class MuseRpc {
       if (body !== undefined) request = join(request, b(3, join(b(1, 'content-type'), b(2, 'application/json'))), b(4, JSON.stringify(body)));
       const frame = join(n(1, stream), b(2, request));
       const envelope = join(n(1, service), b(2, frame));
-      const transport = join(n(1, BigInt(stream)), n(2, 0), n(3, 1), b(4, envelope));
-      this.frames.socket.send(owned(await this.noise.encrypt(transport)));
+      const total = Math.max(1, Math.ceil(envelope.length / NOISE_SEND_CHUNK));
+      for (let index = 0; index < total; index++) {
+        const slice = envelope.subarray(index * NOISE_SEND_CHUNK, Math.min(envelope.length, (index + 1) * NOISE_SEND_CHUNK));
+        const transport = join(n(1, BigInt(stream)), n(2, index), n(3, total), b(4, slice));
+        this.frames.socket.send(owned(await this.noise.encrypt(transport)));
+      }
       return stream;
     });
     this.sendSerial = work.then(() => undefined, () => undefined);

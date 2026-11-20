@@ -131,6 +131,16 @@ python3 scripts/secrets.py prepare
 npx wrangler secret bulk .local/worker-secrets.json --config wrangler.production.jsonc
 ```
 
+需要同时部署多份本地配置、规避 Wrangler 版本检查挂起或在确认无在途任务后执行 Durable Object `immediate` 切版时，可使用 `scripts/deploy.py`：
+
+```sh
+# 本地打包预检（不修改线上资源）
+.venv/bin/python scripts/deploy.py --config wrangler.jsonc --dry-run
+
+# 并发部署本地生产与托管配置，并在无在途任务时即时切换托管 DO 代码与验收健康状态
+.venv/bin/python scripts/deploy.py --all-local --profile <名称> --immediate --verify
+```
+
 使用部署输出的 HTTPS 地址替换上述 `--url`，依次测试 network、cookie、rpc、chat。已有独立验证站点是 <https://muse-demo.sirhao.top/health>；它是此前部署的 demo，不会因 Git 推送而更新。
 
 旧项目的 `/ws/main` JSON 协议、HTTP 房间 API、MCP 和 hook 均不再存在。新 `/ws` 使用 Noise 二进制协议；旧客户端不能直接连接。仓库替换不迁移或删除线上旧房间、消息与在途任务，也不停止原有服务。

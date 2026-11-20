@@ -5,10 +5,23 @@ import { string, weixinCall, type ChannelConfig } from "./protocol";
 export { aes128EcbDecrypt, aes128EcbEncrypt, aes256CbcDecrypt, base64ToBytes, bytesToBase64, bytesToHex, hexToBytes, md5Hex };
 
 export const MAX_MEDIA_BYTES = 6 * 1024 * 1024; // 6 MiB：兼顾图片/文档/小视频与 CF Workers 128MB 内存上限
+export const MAX_INLINE_IMAGE_BYTES = 1_500_000; // 1.5 MiB：base64 后约 2.0MB，契合 Muse /chat/stream 单请求上限
 const WEIXIN_CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
-const SANDBOX_WRITE_CHUNK = 512 * 1024;
+const SANDBOX_WRITE_CHUNK = 256 * 1024;
 const SANDBOX_READ_CHUNK = 512 * 1024;
 const WECOM_UPLOAD_CHUNK = 512 * 1024;
+
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  gif: "image/gif",
+  webp: "image/webp",
+};
+
+export function imageMimeForExtension(ext: string): string | null {
+  return IMAGE_MIME_BY_EXT[ext.trim().toLowerCase()] ?? null;
+}
 
 export interface InboundMedia {
   kind: "image" | "file" | "video";
@@ -41,14 +54,13 @@ export function weixinDownloadUrl(fullUrl: string, encryptQueryParam: string): s
   return `${WEIXIN_CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
 }
 
-/** 解析微信 CDN 16 字节 AES-128 密钥（支持 32 位 hex、base64(16B) 或 base64(32位hex)）。 */
-export function parseWeixinAesKey(raw: string, isHex = false): Uint8Array {
-  if (isHex) {
-    const key = hexToBytes(raw.trim());
-    if (key.length !== 16) throw new Error("invalid_weixin_aes_key");
-    return key;
+/** 解析微信 CDN 16 字节 AES-128 密钥（自动兼容 32 位 hex、base64(16B) 或 base64(32位hex)）。 */
+export function parseWeixinAesKey(raw: string, _isHex = false): Uint8Array {
+  const trimmed = raw.trim();
+  if (/^[0-9a-fA-F]{32}$/.test(trimmed)) {
+    return hexToBytes(trimmed);
   }
-  const decoded = base64ToBytes(raw.trim());
+  const decoded = base64ToBytes(trimmed);
   if (decoded.length === 16) return decoded;
   if (decoded.length === 32) {
     const asText = new TextDecoder().decode(decoded);
