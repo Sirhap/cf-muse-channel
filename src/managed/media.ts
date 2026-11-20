@@ -81,6 +81,7 @@ export function normalizeAllowedSandboxPath(rawPath: string): string | null {
   const trimmed = rawPath.trim();
   if (!trimmed || trimmed.includes("\0")) return null;
   let rel = trimmed;
+  if (rel.startsWith("sandbox://")) rel = rel.slice("sandbox://".length);
   if (rel.startsWith("/home/hatch/workspace/")) rel = rel.slice("/home/hatch/".length);
   else if (rel.startsWith("~/workspace/")) rel = rel.slice("~/".length);
   else if (rel.startsWith("/workspace/")) rel = rel.slice(1);

@@ -52,13 +52,16 @@ describe("媒体加解密跨实现互操作与安全边界", () => {
     expect(isAllowedTencentMediaUrl("https://169.254.169.254/latest")).toBe(false);
 
     expect(normalizeAllowedSandboxPath("/home/hatch/workspace/charts/a.png")).toBe("workspace/charts/a.png");
+    expect(normalizeAllowedSandboxPath("sandbox://workspace/cf-inbound-media/a.png")).toBe("workspace/cf-inbound-media/a.png");
+    expect(normalizeAllowedSandboxPath("sandbox:///home/hatch/workspace/charts/a.png")).toBe("workspace/charts/a.png");
     expect(normalizeAllowedSandboxPath("~/workspace/out/clip.mp4")).toBe("workspace/out/clip.mp4");
     expect(normalizeAllowedSandboxPath("/home/hatch/workspace/../.ssh/id_rsa")).toBeNull();
+    expect(normalizeAllowedSandboxPath("sandbox://workspace/../.ssh/id_rsa")).toBeNull();
     expect(normalizeAllowedSandboxPath("/home/hatch/.config/weixin-bot/credentials.env")).toBeNull();
     expect(normalizeAllowedSandboxPath("workspace/secret_token.json")).toBeNull();
 
-    const parsed = extractOutboundFiles("图表已生成\n[[FILE:/home/hatch/workspace/charts/a.png]]\n[[FILE:/etc/passwd]]\n请查收");
-    expect(parsed).toEqual({ text: "图表已生成\n请查收", files: ["workspace/charts/a.png"] });
+    const parsed = extractOutboundFiles("图表已生成\n[[FILE:/home/hatch/workspace/charts/a.png]]\n[[FILE:sandbox://workspace/cf-inbound-media/b.png]]\n[[FILE:/etc/passwd]]\n请查收");
+    expect(parsed).toEqual({ text: "图表已生成\n请查收", files: ["workspace/charts/a.png", "workspace/cf-inbound-media/b.png"] });
   });
 });
 
