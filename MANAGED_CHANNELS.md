@@ -8,11 +8,10 @@
 
 ## 定时任务主动推送
 
-切换 CF 托管后原虚机 `weixin-bot` / `wecom-bot` 已停用，虚机内写 `outbox.jsonl` 的定时任务不再被旧网关消费。定时任务或脚本可改用鉴权接口 `POST /managed/push`（请求头 `Authorization: Bearer <DEMO_KEY>`，JSON 请求体 `{"id":"可选幂等键","channel":"auto|weixin|wecom","chat":"可选白名单接收者","text":"正文"}`）实时推向已启用渠道：
+切换 CF 托管后原虚机 `weixin-bot` / `wecom-bot` 已停用，`ManagedChannels` 通过以下两种方式支持定时任务推送：
 
-- `channel` 省略或为 `auto` 时优先选择最新活跃渠道，微信尚无可用 `context_token` 时自动回退到已启用的企微；
-- 微信主动推送自动继承该白名单用户最近一次入站保存的 `context_token`，尚无记录时返回 `409 weixin_context_unavailable`；
-- 传入相同 `id` 时按幂等键去重，复用同一发件边界与安全分片投递，绝不重复发送。
+1. **零改虚机自动追踪（默认开启）**：在每轮 alarm 中通过既有 Noise 连接调用轻量 `POST /fs/stats` 检查已启用渠道的 `workspace/<channel>-bot/state/outbox.jsonl` 字节大小。首次仅记录末尾高水位（不重放历史旧行）；仅当文件增长时才用 `HTTP Range: bytes=<offset>-` 拉取新增片段，过滤 `mode="send"` 且符合白名单的新行，与新偏移量在同一 SQLite 事务提交后推送。
+2. **直推接口（可选）**：定时任务或脚本也可直接调用 `POST /managed/push`（`Authorization: Bearer <DEMO_KEY>`，JSON `{"id":"可选幂等键","channel":"auto|weixin|wecom","chat":"可选白名单接收者","text":"正文"}`）秒级送达；`channel` 为 `auto` 时优先最新活跃渠道，微信无可用 `context_token` 时自动回退到已启用的企微，相同 `id` 严格幂等去重。
 
 ## 部署
 

@@ -3,6 +3,7 @@ import { json } from "../http";
 import { MuseRpc } from "../noise";
 import { ManagedStore, type Task, type Outbound } from "./store";
 import { NativeConversations } from "./native";
+import { OutboxRelay } from "./outbox";
 import { channelReply } from "./reply";
 import { assertPlatformSuccess, boundedJson, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
 
@@ -19,6 +20,7 @@ interface Diagnostic {
 export class ManagedChannels extends DurableObject<Env> {
   private store: ManagedStore;
   private native: NativeConversations;
+  private outbox: OutboxRelay;
   private muse?: MuseRpc;
   private museConnecting?: Promise<MuseRpc>;
   private wecom?: WebSocket;
@@ -43,6 +45,9 @@ export class ManagedChannels extends DurableObject<Env> {
     this.native = new NativeConversations(this.store, (operation) => this.rpc(operation),
       (operation) => ctx.storage.transactionSync(operation),
       (session) => ctx.waitUntil(this.watch(session).catch(() => {})));
+    this.outbox = new OutboxRelay(this.store, (operation) => this.rpc(operation),
+      (operation) => ctx.storage.transactionSync(operation),
+      (channel, account, chat, group) => this.native.latestRoute(channel, account, chat, group));
     // A worker may have died after sending. Such tasks always require reconciliation.
     ctx.storage.sql.exec("UPDATE tasks SET state='unknown' WHERE state='submitting'");
     ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE state='sending'");
@@ -145,7 +150,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261120-fast-push-v1",
+        runtime_version: "managed-20261120-outbox-v1",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -164,6 +169,7 @@ export class ManagedChannels extends DurableObject<Env> {
           "SELECT id,task_id,state FROM outbound ORDER BY id DESC LIMIT 10").toArray()
           .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id) })),
         native_sessions: this.ctx.storage.sql.exec("SELECT COUNT(*) count,SUM(awaiting) active FROM native_sessions").one(),
+        outbox_offsets: { weixin: this.outbox.offset("weixin"), wecom: this.outbox.offset("wecom") },
         scope: "text",
       });
     }
@@ -608,6 +614,12 @@ export class ManagedChannels extends DurableObject<Env> {
             await this.native.refreshActivity(binding);
           }
         } catch { this.store.set("native-error:" + binding.session, { code: "native_history_check_failed", at: Date.now() }); }
+      }
+      if (fullScan) {
+        try {
+          const pulled = await this.outbox.sync({ weixin: this.config("weixin"), wecom: this.config("wecom") });
+          if (pulled > 0) await this.deliver();
+        } catch { /* VM outbox 增量同步独立于实时对话，单次失败不阻塞主流程 */ }
       }
       await this.deliver();
       if (!prepared) break;

@@ -5,6 +5,7 @@ import { handleRequest } from "../src/index";
 import { ManagedChannels } from "../src/managed/runtime";
 import { ManagedStore } from "../src/managed/store";
 import { NativeConversations } from "../src/managed/native";
+import { OutboxRelay } from "../src/managed/outbox";
 import type { Incoming } from "../src/managed/protocol";
 import { CookieController, type CredentialState } from "../src/muse";
 import { MuseRpc } from "../src/noise";
@@ -150,6 +151,10 @@ describe("MuseRpc 多路复用与未消费流自动排空", () => {
       if (path === "/fast") {
         await sendFrame(streamId, JSON.stringify({ ok: true, result: { which: "fast" } }), true);
         releaseFirst();
+        return;
+      }
+      if (path === "/range-test") {
+        await sendFrame(streamId, "gold", true, 206);
       }
     });
 
@@ -157,12 +162,15 @@ describe("MuseRpc 多路复用与未消费流自动排空", () => {
     try {
       await rpc.open("/chat/stream", 0, "POST", { text: "hello" });
       // 并发发起慢请求与快请求，服务端先回 /fast 再回 /slow
-      const [slow, fast] = await Promise.all([
+      const [slow, fast, partial] = await Promise.all([
         rpc.call("/slow", 0, "GET"),
         rpc.call("/fast", 0, "GET"),
+        rpc.raw("/range-test", 0, "GET", { range: "bytes=0-3" }),
       ]);
       expect(slow).toEqual({ which: "slow" });
       expect(fast).toEqual({ which: "fast" });
+      expect(partial.status).toBe(206);
+      expect(new TextDecoder().decode(partial.body)).toBe("gold");
     } finally {
       rpc.close();
       serverSocket.close();
@@ -442,6 +450,89 @@ describe("ManagedChannels 主动推送 (/managed/push) 与事件唤醒优化", (
       expect(res.status).toBe(200);
       const body = await res.json<{ next_alarm_at: number | null }>();
       expect(body.next_alarm_at).not.toBeNull();
+    });
+  });
+});
+
+describe("OutboxRelay 纯 CF 侧 Range 增量同步 VM 定时任务发件箱", () => {
+  it("首次仅记高水位不重放历史，后续仅 Range 拉增量、防半行截断、严格白名单与幂等去重", async () => {
+    await runInDurableObject(env.MOBILE.getByName("outbox-range-sync"), async (_instance, state) => {
+      const store = new ManagedStore(state.storage.sql);
+      const native = new NativeConversations(store, async () => { throw new Error("unused"); }, (op) => state.storage.transactionSync(op), vi.fn());
+      // 先留一条微信入站记录，提供最新 context_token
+      store.ingest({
+        id: "wx-in-1", channel: "weixin", account: "wx-bot", chat: "alice", sender: "alice",
+        group: false, text: "hi", context: "ctx-latest",
+      });
+
+      const files: Record<string, Uint8Array> = {
+        "workspace/weixin-bot/state/outbox.jsonl": new TextEncoder().encode('{"id":"old-1","mode":"send","to_user_id":"alice","content":"旧历史"}\n'),
+        "workspace/wecom-bot/state/outbox.jsonl": new TextEncoder().encode('{"id":"old-2","mode":"send","chatid":"alice","content":"旧企微"}\n'),
+      };
+      const ranges: string[] = [];
+      const call = vi.fn(async (path: string, _svc?: number, _method?: string, body?: unknown) => {
+        expect(path).toBe("/fs/stats");
+        const paths = (body as { paths: string[] }).paths;
+        return {
+          entries: paths.map((p) => ({ path: "/" + p, kind: "file", size: files[p].length })),
+        };
+      });
+      const raw = vi.fn(async (path: string, _svc?: number, _method?: string, headers?: Record<string, string>) => {
+        const range = headers?.range ?? "";
+        ranges.push(range);
+        const match = /^bytes=(\d+)-(\d+)$/.exec(range)!;
+        const start = Number(match[1]), end = Number(match[2]);
+        const key = path.replace(/^\/media\/raw\//, "");
+        return { status: 206, body: files[key].slice(start, end + 1) };
+      });
+      const client = { call, raw } as unknown as MuseRpc;
+      const relay = new OutboxRelay(
+        store,
+        (op) => op(client),
+        (op) => state.storage.transactionSync(op),
+        (ch, acc, chat, grp) => native.latestRoute(ch, acc, chat, grp),
+      );
+      const configs = {
+        weixin: { enabled: true, account: "wx-bot", secret: "s1", allowedSenders: ["alice"] },
+        wecom: { enabled: true, account: "wc-bot", secret: "s2", allowedSenders: ["alice"] },
+      };
+
+      // 1. 首次同步：仅记录高水位，0 次 raw 下载，0 条入队
+      expect(await relay.sync(configs)).toBe(0);
+      expect(raw).not.toHaveBeenCalled();
+      expect(relay.offset("weixin")).toBe(files["workspace/weixin-bot/state/outbox.jsonl"].length);
+      expect(relay.offset("wecom")).toBe(files["workspace/wecom-bot/state/outbox.jsonl"].length);
+
+      // 2. 定时任务追加新行（含一条 reply、一条非白名单、一条完整 send 和一条未写完的半行）
+      const wxAdd = [
+        '{"id":"r1","mode":"reply","to_user_id":"alice","content":"忽略reply"}\n',
+        '{"id":"s-bad","mode":"send","to_user_id":"stranger","content":"忽略陌生人"}\n',
+        '{"id":"gold-1","mode":"send","to_user_id":"alice","content":"【黄金波动提醒】现价760"}\n',
+        '{"id":"gold-half","mode":"send","to_user_id":"alice","content":"半截',
+      ].join("");
+      const wcAdd = '{"id":"gold-wc-1","mode":"send","chatid":"alice","chat_type":1,"content":"【黄金波动提醒】现价760"}\n';
+      files["workspace/weixin-bot/state/outbox.jsonl"] = join(files["workspace/weixin-bot/state/outbox.jsonl"], new TextEncoder().encode(wxAdd));
+      files["workspace/wecom-bot/state/outbox.jsonl"] = join(files["workspace/wecom-bot/state/outbox.jsonl"], new TextEncoder().encode(wcAdd));
+
+      expect(await relay.sync(configs)).toBe(2);
+      expect(ranges).toHaveLength(2);
+      const outbounds = state.storage.sql.exec<{ text: string; route: string }>("SELECT text,route FROM outbound ORDER BY id").toArray();
+      expect(outbounds.map((r) => r.text)).toEqual(["【黄金波动提醒】现价760", "【黄金波动提醒】现价760"]);
+      expect(JSON.parse(outbounds[0].route).context).toBe("ctx-latest");
+
+      // 3. 补全半行的剩余字节，下一次 sync 精准接续消费
+      files["workspace/weixin-bot/state/outbox.jsonl"] = join(
+        files["workspace/weixin-bot/state/outbox.jsonl"],
+        new TextEncoder().encode('补完"}\n'),
+      );
+      expect(await relay.sync(configs)).toBe(1);
+      const texts = state.storage.sql.exec<{ text: string }>("SELECT text FROM outbound ORDER BY id").toArray().map((r) => r.text);
+      expect(texts).toEqual(["【黄金波动提醒】现价760", "【黄金波动提醒】现价760", "半截补完"]);
+
+      // 4. 文件无新增时 0 次 raw 下载
+      const prevCalls = raw.mock.calls.length;
+      expect(await relay.sync(configs)).toBe(0);
+      expect(raw).toHaveBeenCalledTimes(prevCalls);
     });
   });
 });

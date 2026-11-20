@@ -216,10 +216,22 @@ export class MuseRpc {
     });
   }
   /** 串行化加密与发送，确保多路复用并发请求时发送端 AES-GCM nonce 严格有序。 */
-  private sendRequest(stream: number, path: string, service: number, method: string, body?: unknown): Promise<number> {
+  private sendRequest(
+    stream: number,
+    path: string,
+    service: number,
+    method: string,
+    body?: unknown,
+    headers?: Record<string, string>,
+  ): Promise<number> {
     const work = this.sendSerial.then(async () => {
       if (this.closedError) throw this.closedError;
       let request = join(b(1, method), b(2, path), b(3, join(b(1, 'x-request-id'), b(2, crypto.randomUUID()))), n(5, 1));
+      if (headers) {
+        for (const [key, value] of Object.entries(headers)) {
+          request = join(request, b(3, join(b(1, key), b(2, value))));
+        }
+      }
       if (body !== undefined) request = join(request, b(3, join(b(1, 'content-type'), b(2, 'application/json'))), b(4, JSON.stringify(body)));
       const frame = join(n(1, stream), b(2, request));
       const envelope = join(n(1, service), b(2, frame));
@@ -229,6 +241,44 @@ export class MuseRpc {
     });
     this.sendSerial = work.then(() => undefined, () => undefined);
     return work;
+  }
+  /** 读取原始二进制响应（支持 HTTP Range 206 局部拉取）。 */
+  async raw(
+    path: string,
+    service = 0,
+    method = 'GET',
+    headers?: Record<string, string>,
+    timeout = 20000,
+    maxBytes = 512 * 1024,
+  ): Promise<{ status: number; body: Uint8Array }> {
+    if (this.closedError) throw this.closedError;
+    const stream = this.stream++;
+    this.streams.set(stream, { queue: [] });
+    try {
+      await this.sendRequest(stream, path, service, method, undefined, headers);
+      const deadline = Date.now() + timeout;
+      let status = 0, length = 0;
+      const chunks: Uint8Array[] = [];
+      while (Date.now() < deadline) {
+        const responseFrame = await this.readStream(stream, Math.max(1, deadline - Date.now()));
+        if (responseFrame.has(5)) throw new Error('rpc_stream_reset');
+        let end = false, chunk = EMPTY;
+        if (responseFrame.has(3)) {
+          const response = fields(getBytes(responseFrame, 3)); status = Number(getNumber(response, 1));
+          chunk = getBytes(response, 3); end = Boolean(getNumber(response, 4));
+        } else if (responseFrame.has(4)) {
+          const response = fields(getBytes(responseFrame, 4)); chunk = getBytes(response, 1); end = Boolean(getNumber(response, 2));
+        }
+        length += chunk.length; if (length > maxBytes) throw new Error('rpc_body_limit'); chunks.push(chunk);
+        if (end) {
+          if (status < 200 || status >= 300) throw new Error(`rpc_http_${status}`);
+          return { status, body: length ? join(...chunks) : EMPTY };
+        }
+      }
+      throw new Error('rpc_incomplete_body');
+    } finally {
+      this.streams.delete(stream);
+    }
   }
   /** Send once. Caller must persist an intent before invoking this for a chat turn. */
   open(path: string, service = 0, method = 'POST', body?: unknown) {
