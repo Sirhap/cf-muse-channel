@@ -31,6 +31,8 @@ export class ManagedChannels extends DurableObject<Env> {
   private watching = new Set<string>();
   private dirtySessions = new Set<string>();
   private pendingFullScan = false;
+  private lastWecomPing = 0;
+  private lastOutboxSync = 0;
   private eventRevision = 0;
   private pumping?: Promise<void>;
   private polling?: Promise<void>;
@@ -150,7 +152,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261120-outbox-v1",
+        runtime_version: "managed-20261120-outbox-v2",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -385,10 +387,11 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     // Schedule before I/O so an interrupted invocation has a durable recovery trigger.
     await this.ctx.storage.setAlarm(Date.now() + 30000);
-    if (wecom?.enabled) {
+    if (wecom?.enabled && (!this.wecomReady || this.wecom?.readyState !== WebSocket.OPEN || Date.now() - this.lastWecomPing >= 25_000)) {
       try {
         await this.ensureWecom(wecom);
         assertPlatformSuccess(await this.frame({ cmd: "ping", headers: { req_id: crypto.randomUUID() } }));
+        this.lastWecomPing = Date.now();
         this.healthResult("wecom");
       } catch (error) { this.healthResult("wecom", failureCode(error)); this.closeWecom(); }
     }
@@ -409,6 +412,7 @@ export class ManagedChannels extends DurableObject<Env> {
 
   private async pollWeixin(config: ChannelConfig) {
     const deadline = Date.now() + 120000;
+    let failed = false;
     while (Date.now() < deadline && this.config("weixin")?.enabled) {
       try {
         const started = Date.now();
@@ -424,14 +428,22 @@ export class ManagedChannels extends DurableObject<Env> {
           if (typeof data.get_updates_buf === "string") this.store.set("weixin_cursor", data.get_updates_buf);
         });
         this.healthResult("weixin");
-        this.ctx.waitUntil(this.pump());
+        if (messages.length) this.ctx.waitUntil(this.pump(false));
         // An unexpectedly immediate empty response must not create a busy poll loop.
         if (!messages.length && Date.now() - started < 500) await new Promise((resolve) => setTimeout(resolve, 500));
       } catch (error) {
         if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) continue;
         this.healthResult("weixin", failureCode(error));
+        failed = true;
         break;
       }
+    }
+    // 消除 120 秒长轮询退出到下一次 30 秒 alarm 之间的微信收消息空窗期。
+    const still = this.config("weixin");
+    if (still?.enabled && still.account === config.account && still.secret === config.secret) {
+      const target = Date.now() + (failed ? 3000 : 50);
+      const scheduled = await this.ctx.storage.getAlarm();
+      if (scheduled === null || scheduled > target) await this.ctx.storage.setAlarm(target);
     }
   }
 
@@ -615,7 +627,8 @@ export class ManagedChannels extends DurableObject<Env> {
           }
         } catch { this.store.set("native-error:" + binding.session, { code: "native_history_check_failed", at: Date.now() }); }
       }
-      if (fullScan) {
+      if (fullScan && Date.now() - this.lastOutboxSync >= 25_000) {
+        this.lastOutboxSync = Date.now();
         try {
           const pulled = await this.outbox.sync({ weixin: this.config("weixin"), wecom: this.config("wecom") });
           if (pulled > 0) await this.deliver();
