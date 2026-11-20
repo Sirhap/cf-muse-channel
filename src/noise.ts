@@ -143,6 +143,9 @@ export class MuseRpc {
       return new MuseRpc(frames, noise);
     } catch (error) { frames.close(); throw error; }
   }
+  get alive(): boolean {
+    return !this.closedError;
+  }
   close() {
     this.failAll(new Error('noise_socket_closed'));
     this.frames.close();

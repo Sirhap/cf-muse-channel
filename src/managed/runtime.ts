@@ -152,7 +152,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261120-outbox-v2",
+        runtime_version: "managed-20261120-outbox-v3",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -342,8 +342,12 @@ export class ManagedChannels extends DurableObject<Env> {
     return MuseRpc.connect(response.webSocket);
   }
 
-  /** 复用支持流级多路复用的热 MuseRpc 连接，仅对建连阶段去重，避免业务 RPC 串行排队。 */
+  /** 复用支持流级多路复用的热 MuseRpc 连接；发送前主动剔除空闲期间已断的死连接，避免误把未发出的消息标成 unknown。 */
   private async rpc<T>(operation: (client: MuseRpc) => Promise<T>): Promise<T> {
+    if (this.muse && this.muse.alive === false) {
+      this.muse.close();
+      this.muse = undefined;
+    }
     let client = this.muse;
     if (!client) {
       this.museConnecting ??= this.socket().then((connected) => {
@@ -623,11 +627,12 @@ export class ManagedChannels extends DurableObject<Env> {
           const produced = await this.native.collect(binding);
           await this.deliver();
           if (produced || binding.awaiting && Date.now() - binding.last_checked > 15000) {
-            await this.native.refreshActivity(binding);
+            // 会话状态刷新仅影响后续补查节拍，放后台异步执行避免阻塞紧随其后的新消息与本地指令。
+            this.ctx.waitUntil(this.native.refreshActivity(binding).catch(() => {}));
           }
         } catch { this.store.set("native-error:" + binding.session, { code: "native_history_check_failed", at: Date.now() }); }
       }
-      if (fullScan && Date.now() - this.lastOutboxSync >= 25_000) {
+      if (fullScan && Date.now() - this.lastOutboxSync >= 10_000) {
         this.lastOutboxSync = Date.now();
         try {
           const pulled = await this.outbox.sync({ weixin: this.config("weixin"), wecom: this.config("wecom") });

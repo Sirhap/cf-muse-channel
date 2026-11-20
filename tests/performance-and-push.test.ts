@@ -452,6 +452,30 @@ describe("ManagedChannels 主动推送 (/managed/push) 与事件唤醒优化", (
       expect(body.next_alarm_at).not.toBeNull();
     });
   });
+
+  it("空闲断开的 MuseRpc 连接(alive=false)会在下次 rpc() 前自动重建，不误把新消息标成 unknown", async () => {
+    await runInDurableObject(env.MOBILE.getByName("managed-dead-rpc-evict"), async (_instance, state) => {
+      const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
+      const internal = runtime as unknown as {
+        muse?: MuseRpc;
+        socket: () => Promise<MuseRpc>;
+        rpc: <T>(op: (client: MuseRpc) => Promise<T>) => Promise<T>;
+      };
+      const deadClose = vi.fn();
+      const deadCall = vi.fn(async () => { throw new Error("should_not_use_dead_socket"); });
+      internal.muse = { alive: false, close: deadClose, call: deadCall } as unknown as MuseRpc;
+
+      const freshCall = vi.fn(async () => ({ ok: true }));
+      const freshSocket = vi.spyOn(internal, "socket").mockResolvedValue({ alive: true, close: vi.fn(), call: freshCall } as unknown as MuseRpc);
+
+      const res = await internal.rpc((client) => client.call("/api/session/list", 0));
+      expect(res).toEqual({ ok: true });
+      expect(deadClose).toHaveBeenCalledTimes(1);
+      expect(deadCall).not.toHaveBeenCalled();
+      expect(freshSocket).toHaveBeenCalledTimes(1);
+      expect(freshCall).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 describe("OutboxRelay 纯 CF 侧 Range 增量同步 VM 定时任务发件箱", () => {
