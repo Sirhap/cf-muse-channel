@@ -65,6 +65,24 @@ export class MuseCredentials extends DurableObject<Env> {
         throw error;
       }
     }
+    if (path === "/admin/renew" && request.method === "POST") {
+      await this.scheduledRenewal(Date.now(), "manual_admin");
+      return this.dashboard(await this.controller.adminStatus());
+    }
+    if (path === "/admin/approvals/poll" && request.method === "POST") {
+      const pollResult = await this.poll("manual_admin");
+      const dash = await (await this.dashboard(await this.controller.adminStatus())).json<Record<string, unknown>>();
+      return json({ ...dash, poll_result: pollResult });
+    }
+    if (path === "/admin/probe-rpc" && request.method === "POST") {
+      const started = Date.now();
+      try {
+        await this.controller.useRpc((rpc) => rpc.call("/api/session/list", 0));
+        return json({ ok: true, stage: "worker_owned_noise_rpc", latency_ms: Date.now() - started });
+      } catch {
+        return json({ ok: false, error: "worker_rpc_failed", latency_ms: Date.now() - started }, 502);
+      }
+    }
     if (path === "/approvals/status" || path === "/renewal/scheduled-status") return json(await this.serviceStatus(path));
     if (path === "/approvals/poll") return json(await this.poll());
     if (path === "/probe/worker-rpc") {

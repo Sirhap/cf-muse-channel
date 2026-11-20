@@ -14,7 +14,7 @@ const paths = {
   wecom: '<path d="M14 18a10 10 0 0 1-5.2.5L4 21l.8-4a7.6 7.6 0 0 1-2.3-5.3c0-4.1 3.6-7.4 8-7.4 4.5 0 8.1 3.3 8.1 7.4"/><circle cx="17.5" cy="16" r="2"/><circle cx="21" cy="19.5" r="1.6"/><circle cx="14.3" cy="21" r="1.6"/><path d="m16.7 17.9-1.6 1.8m3.7-2.4 1.1 1"/>',
 };
 
-function icon(name: keyof typeof paths) {
+export function icon(name: keyof typeof paths) {
   return `<svg class="icon" viewBox="0 0 26 26" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">${paths[name]}</svg>`;
 }
 
@@ -33,7 +33,10 @@ export function adminPage(local = false, signedIn = false): Response {
   <aside class="sidebar" aria-label="控制台导航">
     <div class="brand">${icon("relay")}<span>Muse Relay</span></div>
     <div class="sidebar-label">运行控制台</div>
-    <nav><a href="/admin" aria-current="page">${icon("key")}<span>Cookie 管理</span></a></nav>
+    <nav>
+      <a href="/admin" aria-current="page">${icon("key")}<span>Cookie 管理</span></a>
+      <a href="/admin/managed">${icon("wechat")}<span>渠道托管</span></a>
+    </nav>
     <div class="sidebar-footer">${icon("cloud")}<span>Cloudflare Worker</span></div>
   </aside>
 
@@ -88,6 +91,8 @@ export function adminPage(local = false, signedIn = false): Response {
           <small id="hint">格式：<code>名称=值; 名称2=值2</code></small>
           <div class="actions">
             <button class="primary" type="submit">验证并保存</button>
+            <button class="secondary" id="renew-now" type="button">立即续期</button>
+            <button class="secondary" id="probe-rpc" type="button">RPC 自检</button>
             <button class="secondary" id="clear" type="button">清空</button>
             <button class="quiet" id="check" type="button">${icon("refresh")}查看状态</button>
           </div>
@@ -107,12 +112,16 @@ export function adminPage(local = false, signedIn = false): Response {
             <li>${icon("wechat")}<div><strong>微信</strong><span class="channel-detail" id="weixin-detail">Worker 中转</span></div><span class="tag" id="weixin-state">查询中</span></li>
             <li>${icon("wecom")}<div><strong>企业微信</strong><span class="channel-detail" id="wecom-detail">Worker 中转</span></div><span class="tag" id="wecom-state">查询中</span></li>
           </ul>
-          <p class="muted">显示网关连接状态；实际收发以渠道回执为准。</p>
+          <p class="muted">显示网关连接状态；实际收发以渠道回执为准。${signedIn ? ' <a class="login-link" href="/admin/managed">进入渠道控制台 →</a>' : ""}</p>
         </section>
         <section class="panel overview approvals" aria-labelledby="approvals-title">
-          <div class="panel-heading"><h2 id="approvals-title">Worker 自动审批</h2></div>
+          <div class="panel-heading">
+            <h2 id="approvals-title">Worker 自动审批</h2>
+            <button class="secondary btn-sm" id="poll-approvals" type="button" ${signedIn ? "" : "disabled"}>立即轮询</button>
+          </div>
           <div class="approval-state">${icon("play")}<strong id="approval-state">待查询</strong></div>
           <p class="muted" id="approval-note">仅自动处理符合规则的请求。</p>
+          <div class="chip-row" id="approval-stats" hidden></div>
         </section>
       </aside>
     </div>

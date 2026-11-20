@@ -381,4 +381,35 @@ describe("MuseCredentials 非白名单审批提醒与 Cookie 过期告警去重"
       expect(String(pushed[0].text)).toContain("Cookie 已过期");
     });
   });
+
+  it("支持管理台快捷续期、免密一键启停渠道与脱敏状态读取", async () => {
+    const { managedPage } = await import("../src/managed/page");
+    const pageHtml = await managedPage(true).text();
+    expect(pageHtml).toContain("主动消息推送 / 渠道测试台");
+    expect(pageHtml).toContain("网关连通性探测");
+    expect(pageHtml).toContain("最近入站任务");
+
+    await runInDurableObject(env.MOBILE.getByName("admin-toggle-test"), async (_instance, state) => {
+      const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
+      await runtime.fetch(new Request("https://internal/admin/managed/weixin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true, account: "wx-bot", secret: "top-secret-tok", allowedSenders: ["u1", "u2"] }),
+      }));
+
+      const st1 = await (await runtime.fetch(new Request("https://internal/admin/managed/status"))).text();
+      expect(st1).not.toContain("top-secret-tok");
+      expect(st1).not.toContain("u1");
+      expect(JSON.parse(st1).channels.weixin).toMatchObject({ configured: true, enabled: true, sender_count: 2 });
+
+      const togOff = await runtime.fetch(new Request("https://internal/admin/managed/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: "weixin", enabled: false }),
+      }));
+      expect(togOff.status).toBe(200);
+      const st2 = await (await runtime.fetch(new Request("https://internal/admin/managed/status"))).json() as { channels: { weixin: { enabled: boolean } } };
+      expect(st2.channels.weixin.enabled).toBe(false);
+    });
+  });
 });

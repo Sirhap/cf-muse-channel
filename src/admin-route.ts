@@ -44,7 +44,7 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
   }
 
   if (path === "/admin/managed" && request.method === "GET") {
-    return await signedIn() ? managedPage() : adminSessionRedirect("/admin/login");
+    return await signedIn() ? managedPage(local) : adminSessionRedirect("/admin/login");
   }
 
   if (path === "/admin/logout" && request.method === "POST") {
@@ -58,7 +58,9 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
     || (request.method === "POST" && path === "/admin/managed/connectivity")
     || (request.method === "POST" && path === "/admin/managed/confirm-delivery")
     || (request.method === "POST" && path === "/admin/managed/push")
+    || (request.method === "POST" && ["/admin/managed/toggle", "/admin/managed/wake"].includes(path))
     || (request.method === "POST" && ["/admin/managed/weixin", "/admin/managed/wecom"].includes(path))
+    || (request.method === "POST" && ["/admin/renew", "/admin/approvals/poll", "/admin/probe-rpc"].includes(path))
     || request.method === "GET" && path === "/admin/channels"
     || request.method === "POST" && path === "/admin/current-cookie"
     || ["GET", "POST"].includes(request.method) && path === "/admin/cookie";

@@ -153,14 +153,20 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261120-media-alerts-v2",
+        runtime_version: "managed-20261120-admin-ui-v3",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
         last_pump_error: this.store.get("last_pump_error"),
+        connectivity: this.store.get("connectivity"),
         channels: Object.fromEntries((["weixin", "wecom"] as const).map((channel) => {
           const config = this.config(channel);
-          return [channel, { configured: Boolean(config), enabled: config?.enabled ?? false, ...this.health[channel] }];
+          return [channel, {
+            configured: Boolean(config),
+            enabled: config?.enabled ?? false,
+            sender_count: config?.allowedSenders.length ?? 0,
+            ...this.health[channel],
+          }];
         })),
         tasks: this.ctx.storage.sql.exec("SELECT state,COUNT(*) count FROM tasks GROUP BY state").toArray(),
         outbound: this.ctx.storage.sql.exec("SELECT state,COUNT(*) count FROM outbound GROUP BY state").toArray(),
@@ -175,6 +181,34 @@ export class ManagedChannels extends DurableObject<Env> {
         outbox_offsets: { weixin: this.outbox.offset("weixin"), wecom: this.outbox.offset("wecom") },
         scope: "text+media",
       });
+    }
+    if (request.method === "POST" && path === "/admin/managed/wake") {
+      await this.ensureAlarm();
+      await this.ctx.storage.setAlarm(Date.now() + 100);
+      await this.pump(true);
+      return json({ ok: true, woken_at: Date.now(), outbox_offsets: { weixin: this.outbox.offset("weixin"), wecom: this.outbox.offset("wecom") } });
+    }
+    if (request.method === "POST" && path === "/admin/managed/toggle") {
+      try {
+        const body = await boundedJson(new Response(request.body), 2048);
+        const channel = string(body.channel);
+        if ((channel !== "weixin" && channel !== "wecom") || typeof body.enabled !== "boolean") {
+          return json({ error: "invalid_toggle_payload" }, 400);
+        }
+        if (body.enabled && this.env.MANAGED_CHANNELS_ENABLED !== "true") {
+          return json({ error: "staging_channels_disabled" }, 409);
+        }
+        const existing = this.config(channel);
+        if (!existing) return json({ error: "channel_not_configured" }, 404);
+        const updated: ChannelConfig = { ...existing, enabled: body.enabled };
+        this.ctx.storage.sql.exec("INSERT INTO config VALUES (?,?) ON CONFLICT(channel) DO UPDATE SET value=excluded.value", channel, JSON.stringify(updated));
+        if (channel === "wecom" && !body.enabled) this.closeWecom();
+        await this.ctx.storage.setAlarm(Date.now() + 100);
+        if (body.enabled) this.ctx.waitUntil(this.pump());
+        return json({ ok: true, channel, enabled: body.enabled });
+      } catch {
+        return json({ error: "invalid_toggle_payload" }, 400);
+      }
     }
     if (request.method === "POST" && (path === "/admin/managed/weixin" || path === "/admin/managed/wecom")) {
       const channel: Channel = path.endsWith("/weixin") ? "weixin" : "wecom";

@@ -184,14 +184,14 @@ export const adminScript = String.raw`
 
     const renewal = result.renewal;
     const event = renewal?.last_event;
-    const daily = event?.source === "cloudflare_scheduled" && event.cron === renewal.daily_cron_utc;
-    const latest = daily && (event.completed_at ?? event.scheduled_time);
+    const latest = event && (event.completed_at ?? event.scheduled_time);
     if (hasTime(latest)) {
+      const sourceLabel = event.cron === "manual_admin" ? "手动续期" : "每日续期";
       label("renewal-time", clock.format(latest));
-      label("renewal-note", date.format(latest) + " · " + (event.result?.ok ? "已成功" : "续期失败"), event.result?.ok ? "good" : "warning");
+      label("renewal-note", date.format(latest) + " · " + sourceLabel + (event.result?.ok ? "已成功" : "失败"), event.result?.ok ? "good" : "warning");
     } else {
       label("renewal-time", "—");
-      label("renewal-note", renewal ? "暂无每日续期记录" : "暂时无法读取续期记录");
+      label("renewal-note", renewal ? "暂无续期记录" : "暂时无法读取续期记录");
     }
 
     const approval = result.approval;
@@ -204,6 +204,25 @@ export const adminScript = String.raw`
     else if (lastPoll.ok) label("approval-state", "运行中", "good");
     else label("approval-state", "最近轮询失败", "warning");
     label("approval-note", approval?.enabled && hasTime(observedAt) ? "最近轮询 " + stamp(observedAt) : "仅自动处理符合规则的请求。");
+
+    const statsEl = byId("approval-stats");
+    if (statsEl) {
+      const decisions = Array.isArray(approval?.decisions) ? approval.decisions : [];
+      const acceptedCount = decisions.find((d) => d.state === "rpc_accepted")?.count ?? 0;
+      const chips = [];
+      if (acceptedCount > 0) chips.push("累计自动放行 " + acceptedCount);
+      if (lastPoll && typeof lastPoll.pending === "number") {
+        chips.push("最近待审 " + lastPoll.pending + " · 放行 " + (lastPoll.approved ?? 0) + " · 保留 " + (lastPoll.held ?? 0));
+      }
+      statsEl.innerHTML = "";
+      for (const text of chips) {
+        const span = document.createElement("span");
+        span.className = "chip";
+        span.textContent = text;
+        statsEl.appendChild(span);
+      }
+      statsEl.hidden = chips.length === 0;
+    }
   }
 
   async function run(save) {
@@ -254,8 +273,60 @@ export const adminScript = String.raw`
     }
   }
 
+  async function runQuickAction(endpoint, progressText, formatSuccess) {
+    if (!signedIn) { location.assign("/admin/login"); return; }
+    buttons.forEach((button) => button.disabled = true);
+    const pollBtn = byId("poll-approvals");
+    if (pollBtn) pollBtn.disabled = true;
+    label("feedback", progressText);
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST", cache: "no-store", credentials: "same-origin", redirect: "error",
+      });
+      if (response.status === 401) {
+        clearStatus();
+        location.assign("/admin/login");
+        label("feedback", "登录已过期，请重新登录。", "warning");
+        return;
+      }
+      const data = await response.json();
+      if (!response.ok) {
+        label("feedback", "操作未成功（状态码 " + response.status + "），请检查 Cookie 与上游连接。", "warning");
+        return;
+      }
+      if ("configured" in data) renderSummary(data);
+      const msg = formatSuccess(data);
+      label("feedback", msg.text, msg.tone ?? "good");
+    } catch {
+      label("feedback", "请求超时或网络异常，请稍后重试。", "warning");
+    } finally {
+      buttons.forEach((button) => button.disabled = false);
+      if (pollBtn) pollBtn.disabled = false;
+    }
+  }
+
   form.addEventListener("submit", (event) => { event.preventDefault(); void run(true); });
   byId("check").addEventListener("click", () => void run(false));
+  byId("renew-now")?.addEventListener("click", () => void runQuickAction(
+    "/admin/renew",
+    "正在向 Muse 发起 Cookie 立即续期…",
+    (d) => ({ text: d.ok ? "手动续期成功，凭证与短效令牌已刷新。" : "续期未通过，请检查 Cookie 状态。", tone: d.ok ? "good" : "warning" }),
+  ));
+  byId("probe-rpc")?.addEventListener("click", () => void runQuickAction(
+    "/admin/probe-rpc",
+    "正在测试 Worker → Muse Noise RPC 加密通道…",
+    (d) => ({ text: "Noise RPC 连通正常（耗时 " + (d.latency_ms ?? "—") + " ms）。", tone: "good" }),
+  ));
+  byId("poll-approvals")?.addEventListener("click", () => void runQuickAction(
+    "/admin/approvals/poll",
+    "正在轮询 Muse 待审批请求…",
+    (d) => {
+      const p = d.poll_result;
+      if (!p?.enabled) return { text: "当前 Worker 未启用自动审批（AUTO_APPROVAL_ENABLED=false）。", tone: "" };
+      if (!p.ok) return { text: "审批轮询失败，请稍后重试。", tone: "warning" };
+      return { text: "审批轮询完成：待审 " + (p.pending ?? 0) + " 项，自动放行 " + (p.approved ?? 0) + " 项，保留待人工 " + (p.held ?? 0) + " 项。", tone: "good" };
+    },
+  ));
   revealCookie.addEventListener("click", () => void toggleCurrentCookie());
   copyCookie.addEventListener("click", () => void copyCurrentCookie());
   byId("clear").addEventListener("click", () => { cookie.value = ""; label("feedback", "已清空新 Cookie 输入。"); cookie.focus(); });

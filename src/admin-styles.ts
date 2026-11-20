@@ -26,10 +26,13 @@ export const adminStyles = `
   .brand { display: flex; align-items: center; gap: 12px; padding-inline: 6px; font: 700 clamp(23px, 2.35vw, 34px)/1.1 var(--serif); white-space: nowrap; letter-spacing: -.025em; }
   .brand .icon { color: #f68370; width: 1.35em; height: 1.35em; }
   .sidebar-label { color: #d2bfc8; margin: 47px 0 15px 12px; font-size: 12px; letter-spacing: .24em; }
+  nav { display: grid; gap: 8px; }
   nav a {
     display: flex; align-items: center; gap: 10px; padding: 12px 14px; color: inherit; text-decoration: none;
-    background: #4b2935; border-left: 5px solid #f47d69; border-radius: 6px; font-weight: 600;
+    border-left: 5px solid transparent; border-radius: 6px; font-weight: 600; opacity: .84; transition: background .15s, opacity .15s;
   }
+  nav a:hover { background: rgba(255, 255, 255, .07); opacity: 1; }
+  nav a[aria-current="page"] { background: #4b2935; border-left-color: #f47d69; opacity: 1; }
   nav a .icon { color: #f8a18e; }
   .sidebar-footer { display: flex; align-items: center; gap: 10px; margin: auto 0 0 7px; color: #edddd8; font-size: 14px; }
   .main { width: 100%; max-width: 1540px; min-width: 0; margin-inline: auto; padding: 0 clamp(22px, 3vw, 45px); }
@@ -75,11 +78,11 @@ export const adminStyles = `
   .panel-heading p { flex-basis: 100%; color: var(--muted); }
   form { margin-top: 19px; }
   label { display: block; margin-bottom: 5px; font-size: 14px; font-weight: 700; }
-  input, textarea {
+  input, textarea, select {
     display: block; width: 100%; color: var(--ink); background: #fcf7f2; padding: 10px 12px;
     border: 1px solid #a99c93; border-radius: 8px; font: inherit; font-size: 16px;
   }
-  input { margin-bottom: 15px; }
+  input, select { margin-bottom: 15px; }
   textarea { min-height: 126px; resize: vertical; line-height: 1.65; }
   .current-cookie { padding: 7px 11px; margin-bottom: 15px; background: #f2ebe4; border-radius: 8px; }
   .current-cookie-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
@@ -115,18 +118,39 @@ export const adminStyles = `
   [data-tone="warning"] { color: var(--warning); }
   .footer { border-top: 1px solid var(--line); margin: 24px 0 14px; padding: 10px 0; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; color: var(--muted); font-size: 12px; }
   .footer span:first-child { display: inline-flex; align-items: center; gap: 6px; }
+  .metrics-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-bottom: 20px; }
+  .section-block { margin-bottom: 20px; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 6px; background: #eee6de; font-size: 13px; font-weight: 600; }
+  .table-wrap { overflow-x: auto; margin-top: 12px; }
+  .data-table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+  .data-table th, .data-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  .data-table th { color: var(--muted); font-weight: 650; font-size: 12px; white-space: nowrap; }
+  .data-table tr:last-child td { border-bottom: 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .btn-sm { min-height: 30px; padding: 4px 10px; font-size: 12px; border-radius: 6px; }
+  .status-banner { margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: #f2ebe4; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .inline-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  label.toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; margin: 4px 0 12px; }
+  label.toggle input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--coral); }
+  details.config-details { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 12px; }
+  details.config-details > summary { cursor: pointer; font-weight: 650; font-size: 14px; color: var(--coral); user-select: none; }
   @media (max-width: 1100px) {
     .shell { grid-template-columns: 192px minmax(0, 1fr); }
     .sidebar { padding-inline: 14px; }
     .brand { font-size: 23px; }
     .editor, .overview { padding: 18px; }
     .metric { padding-inline: 15px; }
+    .metrics-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 880px) {
     .shell { grid-template-columns: 1fr; }
     .sidebar { position: static; height: auto; flex-direction: row; align-items: center; justify-content: space-between; padding: 12px 16px; }
     .sidebar-label, .sidebar-footer { display: none; }
+    nav { display: flex; gap: 6px; }
     nav a { padding: 7px 9px; font-size: 13px; }
+    .grid-2, .inline-fields { grid-template-columns: 1fr; }
   }
   @media (max-width: 650px) {
     .main { padding-inline: 14px; }
