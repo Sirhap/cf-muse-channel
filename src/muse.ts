@@ -12,6 +12,7 @@ type SafeFailure = { stage: string; error: string; upstream_status?: number };
 export interface CredentialState {
   seed: string;
   cookies: CookieJar;
+  vmId?: string;
   importedAt?: number;
   lastCheckedAt: number | null;
   lastVerifiedAt: number | null;
@@ -38,7 +39,11 @@ export class CookieController {
   private cachedVmId?: { seed: string; id: string };
   private cachedAccess?: { seed: string; token: string; expiresAt: number };
 
-  constructor(private readonly env: Env, private readonly store: CredentialStore) {}
+  constructor(
+    private readonly env: Env,
+    private readonly store: CredentialStore,
+    private readonly isIsolated: () => boolean = () => false,
+  ) {}
 
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.pending.then(operation, operation);
@@ -61,6 +66,9 @@ export class CookieController {
   }
 
   private async seedConfig() {
+    if (this.isIsolated()) {
+      return { cookie: "", seed: "isolated-account-seed" };
+    }
     const hasParts = Boolean(this.env.MUSE_COOKIE_PART_1);
     if (hasParts && typeof this.env.MUSE_COOKIE_PART_2 !== "string") {
       throw new ProbeError("configuration", "cookie_parts_incomplete");
@@ -147,8 +155,10 @@ export class CookieController {
     session: CookieSession,
     seed: string,
     allowAccessCache: boolean,
+    persistedVmId?: string,
   ): Promise<{ url: URL; vmId: string; accessToken: string }> {
-    let vmId = this.env.MUSE_VM_ID || (this.cachedVmId?.seed === seed ? this.cachedVmId.id : "");
+    const envVmId = this.isIsolated() ? "" : (this.env.MUSE_VM_ID ?? "");
+    let vmId = envVmId || persistedVmId || (this.cachedVmId?.seed === seed ? this.cachedVmId.id : "");
     if (!vmId) {
       const info = await authJson("/api/session", session);
       vmId = requiredString(info, "vm_id", "/api/session");
@@ -202,6 +212,7 @@ export class CookieController {
         } catch {
           throw new ProbeError("noise_rpc", "verification_failed");
         }
+        candidate.vmId = prepared.vmId;
         candidate.importedAt = Date.now();
         candidate.lastCheckedAt = candidate.importedAt;
         candidate.lastVerifiedAt = candidate.importedAt;
@@ -283,7 +294,7 @@ export class CookieController {
       try {
         state = await this.state();
         if (state.needsLogin) throw new ProbeError("configuration", "cookie_requires_login");
-        const result = await this.prepareNoiseUrl(this.session(state), state.seed, true);
+        const result = await this.prepareNoiseUrl(this.session(state), state.seed, true, state.vmId);
         this.cachedVmId = { seed: state.seed, id: result.vmId };
         this.cachedAccess = { seed: state.seed, token: result.accessToken, expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS };
         return { url: result.url, seed: state.seed };
@@ -317,7 +328,7 @@ export class CookieController {
         state = await this.state();
         if (pathname === "/credentials/status") return { response: json(this.status(state)) };
         if (state.needsLogin) return { response: json({ ok: false, error: "cookie_requires_login", needs_login: true }, 503) };
-        const result = await this.prepareNoiseUrl(this.session(state), state.seed, !isProbe);
+        const result = await this.prepareNoiseUrl(this.session(state), state.seed, !isProbe, state.vmId);
         this.cachedVmId = { seed: state.seed, id: result.vmId };
         this.cachedAccess = { seed: state.seed, token: result.accessToken, expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS };
         return { url: result.url, seed: state.seed };

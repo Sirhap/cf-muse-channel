@@ -153,7 +153,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261120-admin-ui-v3",
+        runtime_version: "managed-20261120-multi-account-v4",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -181,6 +181,14 @@ export class ManagedChannels extends DurableObject<Env> {
         outbox_offsets: { weixin: this.outbox.offset("weixin"), wecom: this.outbox.offset("wecom") },
         scope: "text+media",
       });
+    }
+    if (request.method === "POST" && path === "/admin/managed/reconnect-muse") {
+      this.muse?.close();
+      this.muse = undefined;
+      for (const sub of this.subscriptions.values()) sub.close();
+      this.subscriptions.clear();
+      this.watching.clear();
+      return json({ ok: true });
     }
     if (request.method === "POST" && path === "/admin/managed/wake") {
       await this.ensureAlarm();

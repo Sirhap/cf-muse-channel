@@ -69,11 +69,45 @@ export function adminPage(local = false, signedIn = false): Response {
       </article>
     </section>
 
+    <section class="panel overview section-block" id="accounts-panel" aria-labelledby="accounts-title" ${signedIn ? "" : "hidden"}>
+      <div class="panel-heading">
+        <div>
+          <h2 id="accounts-title">Muse 账号池（多 Cookie 管理）</h2>
+          <p class="muted">每个账号拥有独立 Durable Object 存储与自动续期；设为“默认使用”的账号将服务于微信/企微托管渠道与默认 <code>/ws</code> 连接。</p>
+        </div>
+        <button class="secondary btn-sm" id="refresh-accounts" type="button">${icon("refresh")}刷新账号池</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th>账号名称 / ID</th><th>角色</th><th>Cookie 状态</th><th>最近验证</th><th>操作</th></tr></thead>
+          <tbody id="accounts-table-body"><tr><td colspan="5" class="muted">正在加载账号列表…</td></tr></tbody>
+        </table>
+      </div>
+      <details class="config-details" id="add-account-details">
+        <summary>＋ 新增 Muse 账号（支持多 Cookie 独立保活与热切换）</summary>
+        <form id="add-account-form" autocomplete="off">
+          <div class="inline-fields">
+            <label>账号备注名称<input name="label" required maxlength="40" placeholder="例如：备用二号 / 工作号"></label>
+            <label>账号标识 ID（可选）<input name="id" maxlength="31" placeholder="留空自动生成，或填字母数字如 muse-2"></label>
+          </div>
+          <label>新账号 Cookie（可选，填写则创建时立即验证并入库）
+            <textarea name="cookie" maxlength="${MAX_COOKIE_LENGTH + 8}" autocomplete="off" spellcheck="false" placeholder="粘贴该 Muse 账号的 Cookie 请求头；也可留空先创建槽位，再在下方编辑器中导入…"></textarea>
+          </label>
+          <label class="toggle"><input name="set_default" type="checkbox">若 Cookie 验证通过，立即将此账号设为全局默认使用账号</label>
+          <div class="actions">
+            <button class="primary" type="submit">创建 Muse 账号</button>
+          </div>
+          <output id="account-feedback" class="status-banner" role="status" hidden></output>
+        </form>
+      </details>
+    </section>
+
     <div class="content-grid">
       <section class="panel editor" aria-labelledby="edit-title">
         <div class="panel-heading">
           <h2 id="edit-title">手动更换 Cookie</h2>
-          <p>验证通过后才会替换当前 Cookie。</p>
+          <span class="tag" id="selected-account-badge">主账号 (primary-account)</span>
+          <p>验证通过后才会替换当前选中账号的 Cookie。</p>
         </div>
         ${signedIn ? "" : '<p class="login-prompt">登录后可以查看和更换 Cookie。<a href="/admin/login">前往登录</a></p>'}
         <form id="editor" method="post" autocomplete="off">

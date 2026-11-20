@@ -16,6 +16,10 @@ export const adminScript = String.raw`
   let publicCookieState = "loading";
   let cookieRequest = null;
   let hideTimer = null;
+  let selectedAccount = "primary-account";
+  let defaultAccount = "primary-account";
+  let accountList = [];
+  const accountHeaders = (extra = {}) => selectedAccount ? { ...extra, "X-Muse-Account": selectedAccount } : { ...extra };
   const local = { timeZone: "Asia/Shanghai", hourCycle: "h23" };
   const clock = new Intl.DateTimeFormat("zh-CN", { ...local, hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const date = new Intl.DateTimeFormat("zh-CN", { ...local, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -116,6 +120,7 @@ export const adminScript = String.raw`
     try {
       const response = await fetch("/admin/current-cookie", {
         method: "POST",
+        headers: accountHeaders(),
         cache: "no-store", credentials: "same-origin", redirect: "error", signal: request.signal,
       });
       const data = await response.json();
@@ -234,7 +239,7 @@ export const adminScript = String.raw`
     cookie.readOnly = true;
     label("feedback", save ? "正在验证 Muse 连接，请稍候…" : "正在查询状态…");
     try {
-      const headers = {};
+      const headers = accountHeaders();
       const options = { method: save ? "POST" : "GET", headers, cache: "no-store", credentials: "same-origin", redirect: "error" };
       if (save) {
         headers["Content-Type"] = "application/json";
@@ -263,6 +268,7 @@ export const adminScript = String.raw`
       if (save) cookie.value = "";
       renderSummary(result);
       void refreshChannels();
+      void loadAccounts();
       const imported = hasTime(result.last_imported_at) ? "\n最近手动更换：" + stamp(result.last_imported_at) : "";
       label("feedback", (save ? "新 Cookie 已验证并保存。" : "状态已更新。") + imported, save ? "good" : "");
     } catch {
@@ -281,7 +287,7 @@ export const adminScript = String.raw`
     label("feedback", progressText);
     try {
       const response = await fetch(endpoint, {
-        method: "POST", cache: "no-store", credentials: "same-origin", redirect: "error",
+        method: "POST", headers: accountHeaders(), cache: "no-store", credentials: "same-origin", redirect: "error",
       });
       if (response.status === 401) {
         clearStatus();
@@ -295,6 +301,7 @@ export const adminScript = String.raw`
         return;
       }
       if ("configured" in data) renderSummary(data);
+      void loadAccounts();
       const msg = formatSuccess(data);
       label("feedback", msg.text, msg.tone ?? "good");
     } catch {
@@ -341,7 +348,161 @@ export const adminScript = String.raw`
   });
   addEventListener("pagehide", () => { form.reset(); clearStatus(); });
   addEventListener("pageshow", (event) => { if (event.persisted) location.reload(); });
+  function updateSelectedBadge() {
+    const badge = byId("selected-account-badge");
+    if (!badge) return;
+    const found = accountList.find((a) => a.id === selectedAccount);
+    const title = found ? (found.label + " (" + found.id + ")") : selectedAccount;
+    badge.textContent = "当前操作：" + title + (selectedAccount === defaultAccount ? " · 默认使用中" : "");
+    badge.dataset.tone = selectedAccount === defaultAccount ? "good" : "";
+  }
+
+  function renderAccountsTable() {
+    const tbody = byId("accounts-table-body");
+    if (!tbody) return;
+    updateSelectedBadge();
+    tbody.innerHTML = "";
+    if (!accountList.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无账号数据</td></tr>';
+      return;
+    }
+    for (const acc of accountList) {
+      const tr = document.createElement("tr");
+      const stateText = !acc.configured ? "尚未配置" : acc.needs_login ? "需要重新登录" : acc.ok ? "正常" : "待验证";
+      const stateTone = acc.ok ? "good" : acc.needs_login ? "warning" : "";
+      const roleText = acc.is_default ? "默认使用中" : "备用账号";
+      const roleTone = acc.is_default ? "good" : "";
+      const verifiedText = hasTime(acc.last_verified_at) ? stamp(acc.last_verified_at) : "—";
+
+      tr.innerHTML = '<td><strong></strong> <span class="mono muted"></span></td>'
+        + '<td><span class="tag" data-tone="' + roleTone + '">' + roleText + '</span></td>'
+        + '<td><span class="tag" data-tone="' + stateTone + '">' + stateText + '</span></td>'
+        + '<td>' + verifiedText + '</td>'
+        + '<td><div class="actions"></div></td>';
+      tr.children[0].children[0].textContent = acc.label;
+      tr.children[0].children[1].textContent = "(" + acc.id + ")";
+
+      const actionWrap = tr.children[4].children[0];
+      const selectBtn = document.createElement("button");
+      selectBtn.type = "button";
+      selectBtn.className = "secondary btn-sm";
+      selectBtn.textContent = acc.id === selectedAccount ? "正在管理" : "切换管理";
+      selectBtn.disabled = acc.id === selectedAccount;
+      selectBtn.addEventListener("click", () => {
+        hideCurrentCookie();
+        selectedAccount = acc.id;
+        renderAccountsTable();
+        void run(false);
+      });
+      actionWrap.appendChild(selectBtn);
+
+      if (!acc.is_default && acc.configured) {
+        const actBtn = document.createElement("button");
+        actBtn.type = "button";
+        actBtn.className = "secondary btn-sm";
+        actBtn.textContent = "设为默认";
+        actBtn.addEventListener("click", () => void mutateAccount({ action: "activate", id: acc.id }, "已将 [" + acc.label + "] 设为全局默认使用账号。"));
+        actionWrap.appendChild(actBtn);
+      }
+
+      if (acc.id !== "primary-account" && !acc.is_default) {
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "quiet btn-sm";
+        delBtn.textContent = "删除";
+        delBtn.addEventListener("click", () => void mutateAccount({ action: "delete", id: acc.id }, "已删除副账号 [" + acc.label + "]。"));
+        actionWrap.appendChild(delBtn);
+      }
+      tbody.appendChild(tr);
+    }
+  }
+
+  async function loadAccounts() {
+    if (!signedIn) return;
+    try {
+      const response = await fetch("/admin/accounts", { cache: "no-store", credentials: "same-origin" });
+      if (response.status === 401) { clearStatus(); location.assign("/admin/login"); return; }
+      if (!response.ok) return;
+      const data = await response.json();
+      defaultAccount = data.default_account || "primary-account";
+      accountList = Array.isArray(data.accounts) ? data.accounts : [];
+      if (!accountList.some((a) => a.id === selectedAccount)) {
+        selectedAccount = defaultAccount;
+      }
+      renderAccountsTable();
+    } catch { /* ignore background account poll failure */ }
+  }
+
+  async function mutateAccount(payload, successMessage) {
+    if (!signedIn) { location.assign("/admin/login"); return; }
+    const out = byId("account-feedback");
+    if (out) { out.hidden = false; out.textContent = "正在处理账号操作…"; out.dataset.tone = ""; }
+    try {
+      const response = await fetch("/admin/accounts", {
+        method: "POST", cache: "no-store", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (response.status === 401) { clearStatus(); location.assign("/admin/login"); return; }
+      const data = await response.json();
+      if (!response.ok) {
+        const msg = data.error === "cookie_not_saved" ? "新账号 Cookie 未通过 Muse 连接验证，账号未创建。"
+          : data.error === "account_already_exists" ? "该账号标识 ID 已存在，请换一个 ID。"
+          : data.error === "account_cookie_not_configured" ? "请先为该账号导入有效 Cookie，再将其设为默认账号。"
+          : "账号操作未成功（" + (data.error ?? response.status) + "）。";
+        if (out) { out.hidden = false; out.textContent = msg; out.dataset.tone = "warning"; }
+        label("feedback", msg, "warning");
+        return false;
+      }
+      defaultAccount = data.default_account || "primary-account";
+      accountList = Array.isArray(data.accounts) ? data.accounts : [];
+      if (payload.action === "delete" && selectedAccount === payload.id) {
+        selectedAccount = defaultAccount;
+        void run(false);
+      } else if (payload.action === "activate") {
+        selectedAccount = defaultAccount;
+        void run(false);
+      }
+      renderAccountsTable();
+      if (out) { out.hidden = false; out.textContent = successMessage; out.dataset.tone = "good"; }
+      label("feedback", successMessage, "good");
+      return true;
+    } catch {
+      if (out) { out.hidden = false; out.textContent = "账号操作网络异常，请稍后重试。"; out.dataset.tone = "warning"; }
+      return false;
+    }
+  }
+
+  byId("refresh-accounts")?.addEventListener("click", () => void loadAccounts());
+  const addAccountForm = byId("add-account-form");
+  addAccountForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submitBtn = addAccountForm.querySelector("button[type=submit]");
+    submitBtn.disabled = true;
+    try {
+      const labelText = addAccountForm.elements.label.value.trim();
+      const idText = addAccountForm.elements.id.value.trim().toLowerCase();
+      const cookieText = addAccountForm.elements.cookie.value.trim();
+      const setDefault = addAccountForm.elements.set_default.checked;
+      const ok = await mutateAccount(
+        { action: "create", label: labelText, id: idText || undefined, cookie: cookieText || undefined, set_default: setDefault },
+        "已成功创建 Muse 账号 [" + labelText + "]" + (cookieText ? " 并完成 Cookie 验证入库。" : "（请切换到该账号导入 Cookie）。"),
+      );
+      if (ok) {
+        addAccountForm.reset();
+        const created = accountList[accountList.length - 1];
+        if (created) {
+          selectedAccount = created.id;
+          renderAccountsTable();
+          void run(false);
+        }
+      }
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+
   void loadPublicChannels();
   void loadPublicCookie();
-  if (signedIn) void run(false);
+  if (signedIn) { void loadAccounts(); void run(false); }
 `;

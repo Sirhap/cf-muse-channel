@@ -412,4 +412,50 @@ describe("MuseCredentials 非白名单审批提醒与 Cookie 过期告警去重"
       expect(st2.channels.weixin.enabled).toBe(false);
     });
   });
+
+  it("支持多 Muse 账号（多 Cookie 池）独立隔离存储、动态 vm_id 探测、切换默认账号与删除", async () => {
+    const coord = env.CREDENTIALS.getByName("multi-account-coord");
+    const createRes = await coord.fetch(new Request("https://internal/admin/accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "create", id: "muse-backup", label: "备用二号" }),
+    }));
+    expect(createRes.status).toBe(200);
+    const list1 = await createRes.json() as {
+      default_account: string;
+      accounts: Array<{ id: string; label: string; is_default: boolean; configured: boolean }>;
+    };
+    expect(list1.default_account).toBe("primary-account");
+    expect(list1.accounts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "primary-account", is_default: true }),
+      expect.objectContaining({ id: "muse-backup", label: "备用二号", is_default: false, configured: false }),
+    ]));
+
+    // 副账号尚未导入 Cookie 时不能被设为默认账号
+    const badActivate = await coord.fetch(new Request("https://internal/admin/accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "activate", id: "muse-backup" }),
+    }));
+    expect(badActivate.status).toBe(409);
+
+    // 能够正常重命名与删除非默认的副账号
+    const renameRes = await coord.fetch(new Request("https://internal/admin/accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "rename", id: "muse-backup", label: "二号工作机" }),
+    }));
+    expect(renameRes.status).toBe(200);
+    const list2 = await renameRes.json() as { accounts: Array<{ id: string; label: string }> };
+    expect(list2.accounts.find((a) => a.id === "muse-backup")?.label).toBe("二号工作机");
+
+    const delRes = await coord.fetch(new Request("https://internal/admin/accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "delete", id: "muse-backup" }),
+    }));
+    expect(delRes.status).toBe(200);
+    const list3 = await delRes.json() as { accounts: Array<{ id: string }> };
+    expect(list3.accounts.some((a) => a.id === "muse-backup")).toBe(false);
+  });
 });
