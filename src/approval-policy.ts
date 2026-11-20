@@ -38,9 +38,18 @@ export function approvalMatch(record: Record<string, unknown>, rules: ApprovalRu
     && (!rule.thread_ids || (typeof trace?.thread_id === 'string' && rule.thread_ids.includes(trace.thread_id))));
 }
 export interface ApprovalRpc { call(path: string, service?: number, method?: string, body?: unknown): Promise<unknown> }
+export interface HeldApproval {
+  id: string;
+  host: string;
+  port: number;
+  method: string;
+  scheme: string;
+  expiresAt: number;
+}
 export interface DecisionAudit {
   claim(id: string, host: string, port: number): boolean;
   accepted(id: string): void;
+  held?(approval: HeldApproval): void;
 }
 /** Fresh detail, exact rule, durable unknown-before-send. There is deliberately no replay branch. */
 export async function pollApprovals(rpc: ApprovalRpc, rules: ApprovalRule[], audit: DecisionAudit) {
@@ -54,7 +63,26 @@ export async function pollApprovals(rpc: ApprovalRpc, rules: ApprovalRule[], aud
     const id = unwrapRecord(row).approval_id;
     if (typeof id !== 'string' || !/^[A-Za-z0-9_.:-]{1,160}$/.test(id)) { outcome.held++; continue; }
     const detail = unwrapRecord(await rpc.call(`/approvals/${encodeURIComponent(id)}`, 1));
-    if (detail.approval_id !== id || !approvalMatch(detail, rules)) { outcome.held++; continue; }
+    if (detail.approval_id !== id || !approvalMatch(detail, rules)) {
+      outcome.held++;
+      // 仅对格式合法且未过期的非白名单待审批记录发出一次手机提醒，避免脏数据触发噪音。
+      const host = typeof detail.host === 'string' ? detail.host.trim() : '';
+      const port = Number(detail.port);
+      const expiresAt = typeof detail.request_expires_at_ms === 'number' ? detail.request_expires_at_ms : 0;
+      const statusOk = detail.status === undefined || ['pending', 'awaiting_approval'].includes(String(detail.status));
+      if (detail.approval_id === id && statusOk && host && !/[/@%?#:\s]/.test(host)
+        && Number.isSafeInteger(port) && port > 0 && port <= 65535 && expiresAt > Date.now()) {
+        audit.held?.({
+          id,
+          host,
+          port,
+          method: typeof detail.method === 'string' ? detail.method.toUpperCase() : 'UNKNOWN',
+          scheme: typeof detail.scheme === 'string' ? detail.scheme.toLowerCase() : 'unknown',
+          expiresAt,
+        });
+      }
+      continue;
+    }
     if (!audit.claim(id, String(detail.host), Number(detail.port))) { outcome.held++; continue; }
     try {
       const result = await rpc.call(`/approvals/${encodeURIComponent(id)}/decide`, 1, 'POST', { decision: 'allow_once' });

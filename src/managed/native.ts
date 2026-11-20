@@ -1,4 +1,5 @@
 import type { MuseRpc } from "../noise";
+import { downloadAndDecryptInbound, extractOutboundFiles, writeSandboxFile } from "./media";
 import { object, string, type Incoming } from "./protocol";
 import { channelReply } from "./reply";
 import { ManagedStore, type Task } from "./store";
@@ -124,6 +125,8 @@ export class NativeConversations {
       return row?.session ?? null;
     }
     const binding = await this.bind(task);
+    const route = JSON.parse(task.route) as Incoming;
+    const promptText = await this.stageInboundMedia(task, route);
     const device = "cf-managed-" + crypto.randomUUID();
     this.commit(() => {
       this.store.set("device:" + task.id, device);
@@ -134,7 +137,7 @@ export class NativeConversations {
     this.watch(binding.session);
     try {
       await this.rpc((client) => client.open("/chat/stream", 0, "POST", {
-        session_id: binding.session, node_id: device, capabilities: {}, items: [{ type: "text", text: task.text }],
+        session_id: binding.session, node_id: device, capabilities: {}, items: [{ type: "text", text: promptText }],
       }));
       this.store.sql.exec("UPDATE tasks SET state='submitted' WHERE id=?", task.id);
       this.store.set("native-input:" + task.id, { ...this.store.get<object>("native-input:" + task.id), submitted_at: Date.now() });
@@ -143,6 +146,29 @@ export class NativeConversations {
       this.store.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", task.id);
     }
     return binding.session;
+  }
+
+  /** 将微信/企微入站图片或文件下载解密后写入 Muse 沙箱，并在消息文本中附上沙箱绝对路径供 Muse 直接查看。 */
+  private async stageInboundMedia(task: Task, route: Incoming): Promise<string> {
+    if (!route.media?.length) return task.text;
+    const notes: string[] = [];
+    const safeId = task.message_id.replace(/[^A-Za-z0-9_-]/g, "").slice(-24) || String(task.id);
+    for (let index = 0; index < route.media.length; index++) {
+      const item = route.media[index];
+      const label = item.kind === "image" ? "图片" : item.kind === "video" ? "视频" : "文件";
+      try {
+        const { bytes, ext } = await downloadAndDecryptInbound(item);
+        const relPath = `workspace/cf-inbound-media/${safeId}_${index}.${ext}`;
+        await writeSandboxFile(this.rpc, relPath, bytes);
+        notes.push(`[已附${label}，已保存到沙箱路径：/home/hatch/${relPath}（${bytes.length} 字节）]`);
+      } catch (error) {
+        const reason = error instanceof Error && error.message === "media_too_large"
+          ? "超过 CF 托管 6MB 单文件上限"
+          : "下载或解密失败";
+        notes.push(`[用户发送的${label}未能转存到沙箱：${reason}]`);
+      }
+    }
+    return notes.length ? `${task.text}\n\n${notes.join("\n")}` : task.text;
   }
 
   /** Adopt any old in-flight transport receipt without resubmitting the message. */
@@ -213,7 +239,10 @@ export class NativeConversations {
         const rows = this.store.sql.exec<Task>(`INSERT OR IGNORE INTO tasks(message_id,route,conversation,generation,text,state,session,baseline,created_at)
           VALUES (?,?,?,?,?,'queued',?,?,?) RETURNING *`, id, binding.route, binding.conversation, binding.generation, output.text, binding.session, output.seq, Date.now()).toArray();
         if (rows[0]) {
-          this.store.complete(rows[0], channelReply(output.text));
+          const extracted = extractOutboundFiles(output.text);
+          const replyText = extracted.text ? channelReply(extracted.text) : (extracted.files.length ? "" : channelReply(output.text));
+          this.store.complete(rows[0], replyText);
+          if (extracted.files.length) this.store.set("outbound-files:" + rows[0].id, extracted.files);
           this.store.set("native-output:" + rows[0].id, { message_id: output.identity, muse_completed_at: output.completedAt, captured_at: Date.now() });
           produced = true;
         }

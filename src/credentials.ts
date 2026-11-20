@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AdminInputError, readCookieInput } from "./admin-input";
 import { ADMIN_SESSION_SECONDS } from "./admin-session";
-import { parsePolicy, pollApprovals } from "./approval-policy";
+import { parsePolicy, pollApprovals, type HeldApproval } from "./approval-policy";
 import { inspectChannels, publishedChannelStates, unknownChannels, type ChannelHealthReport } from "./channel-health";
 import { json } from "./http";
 import { CookieController, type CredentialState, type CredentialStore } from "./muse";
@@ -25,6 +25,7 @@ export class MuseCredentials extends DurableObject<Env> {
     };
     this.controller = new CookieController(env, store);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS approval_decisions (id TEXT PRIMARY KEY, state TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, started INTEGER NOT NULL, finished INTEGER)");
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS approval_notifications (id TEXT PRIMARY KEY, notified_at INTEGER NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS service_events (kind TEXT PRIMARY KEY, value TEXT NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS admin_sessions (hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)");
   }
@@ -132,16 +133,44 @@ export class MuseCredentials extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now() + 10000);
     }
   }
+  /** 通过托管渠道发送低噪音一次性告警（审批待办 / Cookie 失效），失败不阻断凭证主流程。 */
+  private async pushAlert(id: string, text: string) {
+    if (this.env.MANAGED_CHANNELS_ENABLED !== "true" || !this.env.MOBILE) return;
+    try {
+      await this.env.MOBILE.getByName("channels").fetch(new Request("https://internal/managed/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, channel: "auto", text }),
+      }));
+    } catch { /* 告警通道异常不得影响凭证与审批主逻辑 */ }
+  }
+
+  private async checkCookieExpiryAlert() {
+    const state = await this.controller.publicCookieState().catch(() => "unverified");
+    const alerted = this.event<{ at: number }>("cookie_expired_alert");
+    if (state === "needs_login") {
+      if (!alerted) {
+        const at = Date.now();
+        this.record("cookie_expired_alert", { at });
+        await this.pushAlert("cookie-expired-" + at, "⚠️ Muse Cookie 已过期（401），请登录管理台 /admin 重新导入新 Cookie。");
+      }
+    } else if (state === "healthy" && alerted) {
+      this.ctx.storage.sql.exec("DELETE FROM service_events WHERE kind='cookie_expired_alert'");
+    }
+  }
+
   async scheduledRenewal(scheduledTime: number, cron: string) {
     const started = Date.now();
     const result = await this.controller.refresh();
     this.record("scheduled_renewal", { source: "cloudflare_scheduled", scheduled_time: scheduledTime, cron, started_at: started, completed_at: Date.now(), result });
+    await this.checkCookieExpiryAlert();
     await this.ensureAlarm();
     return result;
   }
   async poll(source = "manual") {
     if (this.env.AUTO_APPROVAL_ENABLED !== "true") return { ok: true, enabled: false };
     const started = Date.now();
+    const heldItems: HeldApproval[] = [];
     try {
       const rules = parsePolicy(this.env.AUTO_APPROVAL_POLICY_JSON);
       if (!rules.length) throw new Error("empty_approval_policy");
@@ -151,6 +180,7 @@ export class MuseCredentials extends DurableObject<Env> {
             return this.ctx.storage.sql.exec("INSERT OR IGNORE INTO approval_decisions VALUES (?,'decision_unknown',?,?,?,NULL) RETURNING id", id, host, port, Date.now()).toArray().length === 1;
           },
           accepted: (id) => { this.ctx.storage.sql.exec("UPDATE approval_decisions SET state='rpc_accepted',finished=? WHERE id=?", Date.now(), id); },
+          held: (item) => { heldItems.push(item); },
         });
         // Piggyback on the existing scheduled session. Anonymous reads can never start one.
         if (this.env.MANAGED_CHANNELS_ENABLED !== "true" && source === "durable_object_alarm"
@@ -159,9 +189,26 @@ export class MuseCredentials extends DurableObject<Env> {
         }
         return result;
       });
+      if (heldItems.length) {
+        const now = Date.now();
+        this.ctx.storage.sql.exec("DELETE FROM approval_notifications WHERE notified_at < ?", now - 7 * 24 * 3600 * 1000);
+        for (const item of heldItems) {
+          const inserted = this.ctx.storage.sql.exec(
+            "INSERT OR IGNORE INTO approval_notifications VALUES (?,?) RETURNING id", item.id, now,
+          ).toArray().length === 1;
+          if (!inserted) continue;
+          const remainMin = Math.max(1, Math.round((item.expiresAt - now) / 60_000));
+          await this.pushAlert(
+            "approval-" + item.id,
+            `⚠️ Muse 有待人工确认的外网访问审批\n目标：${item.method} ${item.host}:${item.port} (${item.scheme})\n剩余约 ${remainMin} 分钟过期，未在自动放行白名单内，请到 Muse 确认。`,
+          );
+        }
+      }
+      await this.checkCookieExpiryAlert();
       const status = { ok: true, enabled: true, source, started_at: started, completed_at: Date.now(), ...result };
       this.record("approval_poll", status); return status;
     } catch {
+      await this.checkCookieExpiryAlert();
       const status = { ok: false, enabled: true, source, started_at: started, completed_at: Date.now(), error: "approval_poll_failed" };
       this.record("approval_poll", status); return status;
     }

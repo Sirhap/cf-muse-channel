@@ -1,3 +1,5 @@
+import { weixinDownloadUrl, type InboundMedia } from "./media";
+
 export type Channel = "weixin" | "wecom";
 export interface ChannelConfig {
   enabled: boolean;
@@ -15,6 +17,7 @@ export interface Incoming {
   group: boolean;
   text: string;
   context: string;
+  media?: InboundMedia[];
 }
 export function object(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -47,10 +50,65 @@ export function weixinMessages(value: unknown, config: ChannelConfig): Incoming[
     const sender = string(row.from_user_id);
     if (!id || !sender || !config.allowedSenders.includes(sender) || row.message_type === 2 || row.group_id) return [];
     const items = Array.isArray(row.item_list) ? row.item_list : [];
-    const text = items.map((item) => string(object(object(item).text_item).text)).filter(Boolean).join("\n");
-    const supported = items.length > 0 && items.every((item) => object(item).type === 1);
-    return [{ id, channel: "weixin" as const, account: config.account, sender, chat: sender,
-      group: false, text: supported ? text : "/unsupported-media", context: string(row.context_token) }];
+    const parts: string[] = [];
+    const media: InboundMedia[] = [];
+    let hasVoice = false;
+    let hasUnsupported = false;
+
+    for (const rawItem of items) {
+      const item = object(rawItem);
+      const kind = item.type;
+      if (kind === 1) {
+        const t = string(object(item.text_item).text).trim();
+        if (t) parts.push(t);
+      } else if (kind === 3) {
+        hasVoice = true;
+        const vt = string(object(item.voice_item).text).trim();
+        if (vt) parts.push(vt);
+      } else if (kind === 2 || kind === 4 || kind === 5) {
+        const nodeKey = kind === 2 ? "image_item" : kind === 4 ? "file_item" : "video_item";
+        const mediaKind = kind === 2 ? "image" : kind === 4 ? "file" : "video";
+        const sub = object(item[nodeKey]);
+        const mediaNode = object(sub.media);
+        const url = weixinDownloadUrl(string(mediaNode.full_url), string(mediaNode.encrypt_query_param));
+        const hexKey = string(sub.aeskey).trim();
+        const b64Key = string(mediaNode.aes_key).trim();
+        if (url && (hexKey || b64Key)) {
+          media.push({
+            kind: mediaKind,
+            channel: "weixin",
+            url,
+            aesKey: hexKey || b64Key,
+            aesKeyHex: Boolean(hexKey),
+            fileName: string(sub.file_name) || undefined,
+          });
+        } else {
+          hasUnsupported = true;
+        }
+      } else {
+        hasUnsupported = true;
+      }
+    }
+
+    let text = parts.join("\n").trim();
+    if (!text && !media.length) {
+      if (hasVoice && !hasUnsupported) text = "/voice-empty";
+      else text = "/unsupported-media";
+    } else if (!text && media.length) {
+      const labels = media.map((m) => m.kind === "image" ? "[图片]" : m.kind === "video" ? "[视频]" : `[文件${m.fileName ? " " + m.fileName : ""}]`);
+      text = labels.join(" ");
+    }
+    return [{
+      id,
+      channel: "weixin" as const,
+      account: config.account,
+      sender,
+      chat: sender,
+      group: false,
+      text,
+      context: string(row.context_token),
+      ...(media.length ? { media } : {}),
+    }];
   });
 }
 export function wecomMessage(value: unknown, config: ChannelConfig): Incoming | null {
@@ -60,8 +118,69 @@ export function wecomMessage(value: unknown, config: ChannelConfig): Incoming | 
   const id = string(body.msgid), sender = string(object(body.from).userid);
   const chat = string(body.chatid) || sender;
   if (!id || !sender || !chat || !config.allowedSenders.includes(sender)) return null;
-  return { id, channel: "wecom", account: config.account, sender, chat, group: body.chattype === "group" || body.chattype === 2,
-    text: body.msgtype === "text" ? string(object(body.text).content) : "/unsupported-media", context: "" };
+
+  const msgtype = string(body.msgtype);
+  const parts: string[] = [];
+  const media: InboundMedia[] = [];
+  const collectMedia = (kind: "image" | "file" | "video", rawNode: unknown) => {
+    const node = object(rawNode);
+    const url = string(node.url).trim();
+    const aesKey = string(node.aeskey).trim();
+    if (url && aesKey) {
+      media.push({ kind, channel: "wecom", url, aesKey, fileName: string(node.filename || node.file_name) || undefined });
+      return true;
+    }
+    return false;
+  };
+
+  if (msgtype === "mixed") {
+    const msgItems = Array.isArray(object(body.mixed).msg_item) ? object(body.mixed).msg_item as unknown[] : [];
+    for (const rawItem of msgItems) {
+      const item = object(rawItem);
+      const itype = string(item.msgtype);
+      if (itype === "text") {
+        const t = string(object(item.text).content).trim();
+        if (t) parts.push(t);
+      } else if (itype === "image") {
+        collectMedia("image", item.image);
+      } else if (itype === "video") {
+        collectMedia("video", item.video);
+      } else if (itype === "file") {
+        collectMedia("file", item.file);
+      }
+    }
+  } else if (msgtype === "text") {
+    const t = string(object(body.text).content);
+    if (t) parts.push(t);
+  } else if (msgtype === "voice") {
+    const vt = string(object(body.voice).content).trim();
+    if (vt) parts.push(vt);
+  } else if (msgtype === "image") {
+    collectMedia("image", body.image);
+  } else if (msgtype === "file") {
+    collectMedia("file", body.file);
+  } else if (msgtype === "video") {
+    collectMedia("video", body.video);
+  }
+
+  let text = parts.join("\n").trim();
+  if (!text && !media.length) {
+    text = msgtype === "voice" ? "/voice-empty" : "/unsupported-media";
+  } else if (!text && media.length) {
+    text = media.map((m) => m.kind === "image" ? "[图片]" : m.kind === "video" ? "[视频]" : `[文件${m.fileName ? " " + m.fileName : ""}]`).join(" ");
+  }
+
+  return {
+    id,
+    channel: "wecom",
+    account: config.account,
+    sender,
+    chat,
+    group: body.chattype === "group" || body.chattype === 2,
+    text,
+    context: "",
+    ...(media.length ? { media } : {}),
+  };
 }
 export async function boundedJson(response: Response, limit = 1024 * 1024): Promise<Record<string, unknown>> {
   if (!response.ok) { await response.body?.cancel(); throw new Error("upstream_http_" + response.status); }
@@ -111,6 +230,7 @@ export async function weixinCall(path: string, config: ChannelConfig, body: unkn
   // updates shape. Successful sends can omit zero and return only message_id.
   const implicitSuccess = result.ret === undefined && result.errcode === undefined
     && ((path === "getupdates" && (Array.isArray(result.msgs) || typeof result.get_updates_buf === "string"))
+      || (path === "getuploadurl" && (typeof result.upload_full_url === "string" || typeof result.upload_param === "string"))
       || (path === "sendmessage" && Object.keys(result).every((key) => ["message_id", "errmsg"].includes(key))
         && (result.errmsg === undefined || result.errmsg === "")
         && (result.message_id === undefined || typeof result.message_id === "string" && /^\d+$/.test(result.message_id)

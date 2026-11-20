@@ -4,6 +4,7 @@ import { MuseRpc } from "../noise";
 import { ManagedStore, type Task, type Outbound } from "./store";
 import { NativeConversations } from "./native";
 import { OutboxRelay } from "./outbox";
+import { readSandboxFile, uploadWecomMedia, uploadWeixinMedia } from "./media";
 import { channelReply } from "./reply";
 import { assertPlatformSuccess, boundedJson, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
 
@@ -152,7 +153,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261120-outbox-v3",
+        runtime_version: "managed-20261120-media-alerts-v1",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -172,7 +173,7 @@ export class ManagedChannels extends DurableObject<Env> {
           .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id) })),
         native_sessions: this.ctx.storage.sql.exec("SELECT COUNT(*) count,SUM(awaiting) active FROM native_sessions").one(),
         outbox_offsets: { weixin: this.outbox.offset("weixin"), wecom: this.outbox.offset("wecom") },
-        scope: "text",
+        scope: "text+media",
       });
     }
     if (request.method === "POST" && (path === "/admin/managed/weixin" || path === "/admin/managed/wecom")) {
@@ -679,45 +680,174 @@ export class ManagedChannels extends DurableObject<Env> {
     return response.chat_events.map(object).filter((event) => Number.isSafeInteger(event.seq));
   }
 
+  private async sendTextBubble(route: Incoming, config: ChannelConfig, reqId: string, text: string) {
+    if (route.channel === "weixin") {
+      await weixinCall("sendmessage", config, {
+        msg: { from_user_id: "", to_user_id: route.chat, client_id: reqId,
+          message_type: 2, message_state: 2, context_token: route.context,
+          item_list: [{ type: 1, text_item: { text } }] },
+        base_info: { channel_version: "2.4.9", bot_agent: "Muse/1.0" },
+      });
+    } else {
+      assertPlatformSuccess(await this.frame({ cmd: "aibot_send_msg", headers: { req_id: reqId },
+        body: { chatid: route.chat, chat_type: route.group ? 2 : 1, msgtype: "markdown", markdown: { content: text } } }));
+    }
+  }
+
+  /** 当微信主动推送收到腾讯明确业务拒收（如 context_token 失效）时，安全回退到已启用的企微渠道。 */
+  private queueWecomFallback(row: Outbound, files: string[]): boolean {
+    const wecom = this.config("wecom");
+    if (!wecom?.enabled || !wecom.allowedSenders.length) return false;
+    const task = this.store.task(row.task_id);
+    if (!task.message_id.startsWith("push:") && !task.message_id.startsWith("outbox:")) return false;
+    const fallbackId = "fallback:" + task.message_id;
+    const target = wecom.allowedSenders[0];
+    const recent = this.native.latestRoute("wecom", wecom.account, target, false);
+    const fallbackRoute: Incoming = {
+      id: fallbackId,
+      channel: "wecom",
+      account: wecom.account,
+      chat: recent?.chat ?? target,
+      sender: recent?.sender ?? target,
+      group: false,
+      text: row.text || "[附件]",
+      context: "",
+    };
+    let created = false;
+    this.ctx.storage.transactionSync(() => {
+      const next = this.store.ingest(fallbackRoute);
+      if (next) {
+        this.store.complete(next, row.text);
+        if (files.length) this.store.set("outbound-files:" + next.id, files);
+        this.store.set("outbound-fallback:" + row.id, { at: Date.now(), fallback_task_id: next.id });
+        created = true;
+      }
+    });
+    return created;
+  }
+
   private async deliver() {
+    let fallbackCreated = false;
     const rows = this.ctx.storage.sql.exec<Outbound>("SELECT * FROM outbound WHERE state='pending' ORDER BY id LIMIT 10").toArray();
     for (const row of rows) {
       const route = JSON.parse(row.route) as Incoming;
       const config = this.config(route.channel);
       if (!config?.enabled || config.account !== route.account) continue;
+      const files = this.store.get<string[]>("outbound-files:" + row.task_id) ?? [];
       // Each chunk has its own persisted send boundary. Ambiguous chunks are never replayed.
       const parts = this.store.get<number>("outbound-part:" + row.id) ?? 0;
-      const chunks = row.text.match(/[\s\S]{1,900}/gu) ?? [""];
+      const chunks = row.text ? (row.text.match(/[\s\S]{1,900}/gu) ?? [""]) : (files.length ? [] : [""]);
+      const filePart = this.store.get<number>("outbound-file-part:" + row.id) ?? 0;
       const identity = this.store.get<string>("outbound-id:" + row.id) ?? crypto.randomUUID();
       this.store.set("outbound-id:" + row.id, identity);
+
+      let failed = false;
       for (let i = parts; i < chunks.length; i++) {
+        if (route.channel === "wecom") {
+          try { await this.ensureWecom(config); }
+          catch { this.healthResult("wecom", "gateway_connect_failed"); failed = true; break; }
+        }
+        this.ctx.storage.sql.exec("UPDATE outbound SET state='sending' WHERE id=?", row.id);
+        try {
+          await this.sendTextBubble(route, config, "cf-" + identity + "-" + i, chunks[i]);
+          const allDone = i + 1 === chunks.length && filePart >= files.length;
+          this.ctx.storage.transactionSync(() => {
+            this.store.set("outbound-part:" + row.id, i + 1);
+            this.ctx.storage.sql.exec("UPDATE outbound SET state=? WHERE id=?", allDone ? "delivered" : "pending", row.id);
+          });
+        } catch (error) {
+          const code = failureCode(error);
+          this.store.set("outbound-error:" + row.id, { code, at: Date.now() });
+          this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
+          // 仅在首片被腾讯明确业务拒收（确定未送达）时触发企微兜底，绝不对超时不确定的发送重放。
+          if (route.channel === "weixin" && i === 0 && code.startsWith("platform_rejected_")) {
+            if (this.queueWecomFallback(row, files)) fallbackCreated = true;
+          }
+          failed = true;
+          break;
+        }
+      }
+      if (failed) continue;
+
+      for (let f = filePart; f < files.length; f++) {
         if (route.channel === "wecom") {
           try { await this.ensureWecom(config); }
           catch { this.healthResult("wecom", "gateway_connect_failed"); break; }
         }
+        const sandboxPath = files[f];
+        let payload: { bytes: Uint8Array; fileName: string };
+        try {
+          payload = await readSandboxFile((op) => this.rpc(op), sandboxPath);
+        } catch (error) {
+          const reason = error instanceof Error && error.message === "media_too_large"
+            ? `附件 ${sandboxPath.split("/").pop()} 超过 CF 托管 6MB 单文件上限，已保留在沙箱：/home/hatch/${sandboxPath}`
+            : `附件 ${sandboxPath.split("/").pop()} 暂时无法读取（/home/hatch/${sandboxPath}）`;
+          this.ctx.storage.sql.exec("UPDATE outbound SET state='sending' WHERE id=?", row.id);
+          try {
+            await this.sendTextBubble(route, config, "cf-" + identity + "-fn-" + f, reason);
+            this.ctx.storage.transactionSync(() => {
+              this.store.set("outbound-file-part:" + row.id, f + 1);
+              this.ctx.storage.sql.exec("UPDATE outbound SET state=? WHERE id=?", f + 1 === files.length ? "delivered" : "pending", row.id);
+            });
+          } catch (sendErr) {
+            this.store.set("outbound-error:" + row.id, { code: failureCode(sendErr), at: Date.now() });
+            this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
+            break;
+          }
+          continue;
+        }
+
+        // 先完成加密上传（未向用户发气泡，失败可安全保留 pending 或记录错误），再落 sending 边界发送消息。
+        let wxItem: Record<string, unknown> | undefined;
+        let wcMedia: { mediaId: string; msgType: "image" | "video" | "file" } | undefined;
+        try {
+          if (route.channel === "weixin") {
+            wxItem = await uploadWeixinMedia(config, route.chat, payload.bytes, payload.fileName);
+          } else {
+            wcMedia = await uploadWecomMedia((frame) => this.frame(frame), payload.bytes, payload.fileName);
+          }
+        } catch (uploadErr) {
+          this.store.set("outbound-error:" + row.id, { code: failureCode(uploadErr), at: Date.now() });
+          this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
+          break;
+        }
+
         this.ctx.storage.sql.exec("UPDATE outbound SET state='sending' WHERE id=?", row.id);
         try {
           if (route.channel === "weixin") {
             await weixinCall("sendmessage", config, {
-              msg: { from_user_id: "", to_user_id: route.chat, client_id: "cf-" + identity + "-" + i,
+              msg: { from_user_id: "", to_user_id: route.chat, client_id: "cf-" + identity + "-f" + f,
                 message_type: 2, message_state: 2, context_token: route.context,
-                item_list: [{ type: 1, text_item: { text: chunks[i] } }] },
+                item_list: [wxItem!] },
               base_info: { channel_version: "2.4.9", bot_agent: "Muse/1.0" },
             });
           } else {
-            assertPlatformSuccess(await this.frame({ cmd: "aibot_send_msg", headers: { req_id: "cf-" + identity + "-" + i },
-              body: { chatid: route.chat, chat_type: route.group ? 2 : 1, msgtype: "markdown", markdown: { content: chunks[i] } } }));
+            assertPlatformSuccess(await this.frame({
+              cmd: "aibot_send_msg",
+              headers: { req_id: "cf-" + identity + "-f" + f },
+              body: {
+                chatid: route.chat,
+                chat_type: route.group ? 2 : 1,
+                msgtype: wcMedia!.msgType,
+                [wcMedia!.msgType]: { media_id: wcMedia!.mediaId },
+              },
+            }));
           }
           this.ctx.storage.transactionSync(() => {
-            this.store.set("outbound-part:" + row.id, i + 1);
-            this.ctx.storage.sql.exec("UPDATE outbound SET state=? WHERE id=?", i + 1 === chunks.length ? "delivered" : "pending", row.id);
+            this.store.set("outbound-file-part:" + row.id, f + 1);
+            this.ctx.storage.sql.exec("UPDATE outbound SET state=? WHERE id=?", f + 1 === files.length ? "delivered" : "pending", row.id);
           });
         } catch (error) {
-          this.store.set("outbound-error:" + row.id, { code: failureCode(error), at: Date.now() });
+          const code = failureCode(error);
+          this.store.set("outbound-error:" + row.id, { code, at: Date.now() });
           this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
+          if (route.channel === "weixin" && f === 0 && chunks.length === 0 && code.startsWith("platform_rejected_")) {
+            if (this.queueWecomFallback(row, files)) fallbackCreated = true;
+          }
           break;
         }
       }
     }
+    if (fallbackCreated) await this.deliver();
   }
 }

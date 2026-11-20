@@ -51,7 +51,8 @@ export class ManagedStore {
     const word = task.text.trim();
     if (word === "/ping") return "pong · CF 网关运行中";
     if (word === "/help") return "/ping 连通检查\n/status 连接状态\n/new 新会话\n/stop 向 Muse 请求停止\n/help 命令表\n消息直接交给 Muse 原生处理。";
-    if (word === "/unsupported-media") return "CF 托管首版暂支持文字，请发送文字消息。";
+    if (word === "/unsupported-media") return "这条媒体消息暂不支持解析（或缺少可下载附件），请改发文字、图片或常规文件。";
+    if (word === "/voice-empty") return "没听清这段语音，请再发一次语音或改发文字。";
     if (word === "/new") {
       this.sql.exec("UPDATE conversations SET generation=generation+1,session=NULL WHERE id=?", task.conversation);
       return "已开启新会话。";
