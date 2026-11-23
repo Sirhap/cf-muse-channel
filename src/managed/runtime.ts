@@ -212,7 +212,8 @@ export class ManagedChannels extends DurableObject<Env> {
           .map((task) => ({ ...task, error: this.store.get("task-error:" + task.id) })),
         deliveries: this.ctx.storage.sql.exec<{ id: number; task_id: number; state: string }>(
           "SELECT id,task_id,state FROM outbound ORDER BY id DESC LIMIT 10").toArray()
-          .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id) })),
+          .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id),
+            media_sent: this.store.get<number>("outbound-media-sent:" + row.id) ?? 0 })),
         native_sessions: this.ctx.storage.sql.exec(`SELECT COUNT(*) count,COALESCE(SUM(awaiting),0) active,
           COALESCE(SUM(muse_account IS NULL),0) owner_unresolved,COALESCE(SUM(history_more),0) history_backlog,
           (SELECT COUNT(*) FROM native_pending_assistant) pending_assistant FROM native_sessions`).one(),
@@ -1096,6 +1097,8 @@ export class ManagedChannels extends DurableObject<Env> {
           }
           this.ctx.storage.transactionSync(() => {
             this.store.set("outbound-file-part:" + row.id, f + 1);
+            const receiptKey = "outbound-media-sent:" + row.id;
+            this.store.set(receiptKey, (this.store.get<number>(receiptKey) ?? 0) + 1);
             this.ctx.storage.sql.exec("UPDATE outbound SET state=? WHERE id=?", f + 1 === files.length ? "delivered" : "pending", row.id);
           });
         } catch (error) {

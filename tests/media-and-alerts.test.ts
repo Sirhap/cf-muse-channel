@@ -216,6 +216,9 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
       expect(mediaItem.type).toBe(2);
       expect(((mediaItem.image_item as Record<string, unknown>).media as Record<string, unknown>).encrypt_query_param).toBe("dl-param-xyz");
       expect(state.storage.sql.exec<{ state: string }>("SELECT state FROM outbound").one().state).toBe("delivered");
+      const status = await runtime.fetch(new Request("https://internal/admin/managed/status"));
+      expect(await status.json()).toMatchObject({ deliveries: [{ state: "delivered", media_sent: 1 }] });
+      await state.storage.deleteAlarm();
     });
   });
 
