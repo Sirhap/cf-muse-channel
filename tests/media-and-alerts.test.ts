@@ -121,7 +121,7 @@ describe("微信/企微入站媒体与语音转文字解析 + 沙箱写入", () 
         return 1;
       });
       const client = { call, open } as unknown as MuseRpc;
-      const native = new NativeConversations(store, (op) => op(client), (op) => state.storage.transactionSync(op), vi.fn());
+      const native = new NativeConversations(store, (op) => op(client, { account: "primary-account", vm: "fixture-vm" }), (op) => state.storage.transactionSync(op), vi.fn(), async () => ["primary-account"]);
 
       // 返回预先用 Python AES-128-ECB 加密的 PNG 密文
       const ct = hexToBytes("6757603f6e91ba7c944b3c934782324a42addd79ad28530fe59398f198673697");
@@ -169,14 +169,16 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
         group: false, text: "已生图", context: "ctx-ok",
       })!;
       store.complete(task, "图表已生成");
-      store.set("outbound-files:" + task.id, ["workspace/charts/out.png"]);
+      const owner = { account: "secondary", vm: "media-owner" };
+      store.setOutboundFiles(task.id, ["workspace/charts/out.png"], owner);
 
       const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
       const internal = runtime as unknown as {
-        rpc: <T>(op: (c: MuseRpc) => Promise<T>) => Promise<T>;
+        rpc: <T>(op: (c: MuseRpc) => Promise<T>, target?: { account: string; vm: string }) => Promise<T>;
         deliver: () => Promise<void>;
       };
-      vi.spyOn(internal, "rpc").mockImplementation(async (op) => {
+      vi.spyOn(internal, "rpc").mockImplementation(async (op, target) => {
+        expect(target).toEqual(owner);
         const fakeRpc = {
           call: async (path: string) => {
             if (path === "/fs/stat") return { kind: "file", size: pngBytes.length };
@@ -220,7 +222,7 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
   it("OutboxRelay 在微信无 context_token 时自动企微兜底（且若企微自身已有相同正文不重复发）", async () => {
     await runInDurableObject(env.MOBILE.getByName("outbox-wx-fallback"), async (_instance, state) => {
       const store = new ManagedStore(state.storage.sql);
-      const native = new NativeConversations(store, async () => { throw new Error("unused"); }, (op) => state.storage.transactionSync(op), vi.fn());
+      const native = new NativeConversations(store, async () => { throw new Error("unused"); }, (op) => state.storage.transactionSync(op), vi.fn(), async () => ["primary-account"]);
       const files: Record<string, Uint8Array> = {
         "workspace/weixin-bot/state/outbox.jsonl": new TextEncoder().encode(""),
         "workspace/wecom-bot/state/outbox.jsonl": new TextEncoder().encode(""),
@@ -235,7 +237,7 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
           return { status: 206, body: files[key].slice(Number(m[1]), Number(m[2]) + 1) };
         },
       } as unknown as MuseRpc;
-      const relay = new OutboxRelay(store, (op) => op(fakeRpc), (op) => state.storage.transactionSync(op), (c, a, ch, g) => native.latestRoute(c, a, ch, g));
+      const relay = new OutboxRelay(store, (op) => op(fakeRpc, { account: "primary-account", vm: "fixture-vm" }), (op) => state.storage.transactionSync(op), (c, a, ch, g) => native.latestRoute(c, a, ch, g));
       const cfgs = {
         weixin: { enabled: true, account: "wx", secret: "s", allowedSenders: ["alice"] },
         wecom: { enabled: true, account: "wc", secret: "s", allowedSenders: ["alice"] },

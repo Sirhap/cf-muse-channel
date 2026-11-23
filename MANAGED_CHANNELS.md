@@ -12,8 +12,10 @@
 
 切换 CF 托管后原虚机 `weixin-bot` / `wecom-bot` 已停用，`ManagedChannels` 通过以下两种方式支持定时任务推送：
 
-1. **零改虚机自动追踪（默认开启）**：在每轮 alarm 中通过既有 Noise 连接调用轻量 `POST /fs/stats` 检查已启用渠道的 `workspace/<channel>-bot/state/outbox.jsonl` 字节大小。首次仅记录末尾高水位（不重放历史旧行）；仅当文件增长时才用 `HTTP Range: bytes=<offset>-` 拉取新增片段，过滤 `mode="send"` 且符合白名单的新行，与新偏移量在同一 SQLite 事务提交后推送。
+1. **零改虚机自动追踪（默认开启）**：固定从主账号 `primary-account` 的 Muse 虚机读取，不随新会话账号池切换。通过同一条 Noise 连接用 `POST /fs/stats` 检查 `workspace/<channel>-bot/state/outbox.jsonl` 大小，用 HTTP Range 读取新增完整行。合规的待发记录与新偏移在同一 SQLite 事务提交。全新来源首次从文件末尾接续。暂时断连或发现虚机变化时保留原进度。
 2. **直推接口（可选）**：定时任务或脚本也可直接调用 `POST /managed/push`（`Authorization: Bearer <DEMO_KEY>`，JSON `{"id":"可选幂等键","channel":"auto|weixin|wecom","chat":"可选白名单接收者","text":"正文"}`）秒级送达；`channel` 为 `auto` 时优先最新活跃渠道，微信无可用 `context_token` 时自动回退到已启用的企微，相同 `id` 严格幂等去重。
+
+升级已有分离部署时，先发布凭证 Worker，再发布渠道 Worker。旧发件箱偏移只有渠道归属，升级后在 `/admin/managed/status` 显示 `legacy_offset_unverified` 并等待核对。以主账号的实际发件箱与已有投递台账确定最后已处理的完整行，再从同源后台调用 `POST /admin/managed/outbox/adopt`。提交 `channel`、状态页的 `expected_offset`、核对后的字节 `offset` 及后台主账号的 `vm_id`。若还有已核实来自同一虚机的旧待发附件，可同时提供 `file_task_ids`。遇到 409 重新对账，保留原通知和投递记录。未核实归属前保持该渠道补扫暂停。
 
 ## 部署
 
@@ -42,6 +44,8 @@
 入站按原消息 ID 和会话唯一去重。连续输入立即交给同一个 Muse 会话，不在 CF 等待上一轮回答完成，也不在 CF 合并文本；输入顺序与原文保留。Muse 原生决定如何接续、合并或调度。SQLite 只保留尚未写入连接的传输回执和去重记录。正式回复先入 SQLite 发件表，再提交腾讯。每个分片有持久发送边界；确认回执前断线会标为 `unknown`，禁止自动重发该片。缺少回执不等于没有送达。管理员取得收件人的明确确认后，可用 `POST /admin/managed/confirm-delivery` 提交 `task_id`、原 `message_id` 和 `received:true`，只核销一个短消息气泡的未知投递，留下确认来源与时间；接口不会重新发送。
 
 提交前保存会话、历史序号和唯一设备标识。重启将中断的 `submitting` 转为 `unknown`；之后只读核对相同设备标识的用户消息，找到后核对原消息回执，绝不重提。无法确认时保留待核查记录，但不会阻止用户后续的新输入交给 Muse。替换账号或凭证前必须核对在途任务和未投递结果；仅关闭接收不受此限制。
+
+新会话由 Muse 账号池选择账号，创建后固定使用该账号和虚机处理消息、取消、订阅、历史及附件。`/new` 创建的新会话可重新选择账号。原账号停用或重连发现虚机不符时，等归属恢复后接续原会话。旧会话只有在启用账号中唯一确认归属后才接续。
 
 Muse 每产生一条完成的 assistant 消息，就按其消息 ID 去重并转回渠道；不等待整个会话进入 completed，也不要求一条输入对应一条回复。长任务的多段回答、连续输入后合并的一条回答，都由 Muse 原生决定。会话状态查询只用于调整补查频率，发生在回复投递之后。`/stop` 直接向 Muse 发送取消请求，后续新输入照常转交，不在 CF 等取消终态。
 

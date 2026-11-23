@@ -1,6 +1,6 @@
-import type { MuseRpc } from "../noise";
 import { bytesToBase64, downloadAndDecryptInbound, extractOutboundFiles, imageMimeForExtension, MAX_INLINE_IMAGE_BYTES, writeSandboxFile } from "./media";
-import { object, string, type Incoming } from "./protocol";
+import { MuseOwnerUnavailable, type OwnedRpc, type MuseOwner } from "./muse-owner";
+import { failureCode, object, string, type Incoming } from "./protocol";
 import { channelReply } from "./reply";
 import { ManagedStore, type Task } from "./store";
 
@@ -16,18 +16,24 @@ export interface NativeSession extends Record<string, SqlStorageValue> {
   cursor: number;
   awaiting: number;
   last_checked: number;
+  muse_account: string | null;
+  muse_vm: string | null;
 }
-type Rpc = <T>(operation: (client: MuseRpc) => Promise<T>) => Promise<T>;
 type Commit = (operation: () => void) => void;
 
 /** Native Muse owns turn scheduling. This relay persists transport receipts only. */
 export class NativeConversations {
-  constructor(private store: ManagedStore, private rpc: Rpc, private commit: Commit,
-    private watch: (session: string) => void) {
+  private resolving = new Map<string, Promise<MuseOwner>>();
+
+  constructor(private store: ManagedStore, private rpc: OwnedRpc, private commit: Commit,
+    private watch: (session: string, owner: MuseOwner) => void, private accountIds: () => Promise<string[]>) {
     store.sql.exec(`CREATE TABLE IF NOT EXISTS native_sessions(
       session TEXT PRIMARY KEY, conversation TEXT NOT NULL, generation INTEGER NOT NULL,
       route TEXT NOT NULL, cursor INTEGER NOT NULL, awaiting INTEGER NOT NULL DEFAULT 1,
-      last_checked INTEGER NOT NULL DEFAULT 0, UNIQUE(conversation,generation))`);
+      last_checked INTEGER NOT NULL DEFAULT 0, muse_account TEXT, muse_vm TEXT, UNIQUE(conversation,generation))`);
+    const columns = store.sql.exec<{ name: string }>("PRAGMA table_info(native_sessions)").toArray();
+    if (!columns.some(({ name }) => name === "muse_account")) store.sql.exec("ALTER TABLE native_sessions ADD COLUMN muse_account TEXT");
+    if (!columns.some(({ name }) => name === "muse_vm")) store.sql.exec("ALTER TABLE native_sessions ADD COLUMN muse_vm TEXT");
   }
 
   private events(response: unknown) {
@@ -37,17 +43,19 @@ export class NativeConversations {
       .sort((a, b) => Number(a.seq) - Number(b.seq));
   }
 
-  private history(session: string, limit = 40) {
-    return this.rpc((client) => client.call("/chat/history?session_id=" + encodeURIComponent(session) + "&limit=" + limit, 0));
+  private historyPath(session: string, limit: number) {
+    return "/chat/history?session_id=" + encodeURIComponent(session) + "&limit=" + limit;
   }
 
   /** 默认仅拉取最近 40 条事件；若检测到游标与最小序号间存在缺口，自动阶梯补拉避免漏消息。 */
-  private async historySince(session: string, cursor: number) {
-    let events = this.events(await this.history(session, 40));
+  private async historySince(session: string, cursor: number, owner: MuseOwner) {
+    const history = async (limit: number) => this.events(await this.rpc(
+      (client) => client.call(this.historyPath(session, limit), 0), owner));
+    let events = await history(40);
     if (cursor > 0 && events.length >= 40 && Number(events[0].seq) > cursor + 1) {
-      events = this.events(await this.history(session, 200));
+      events = await history(200);
       if (events.length >= 200 && Number(events[0].seq) > cursor + 1) {
-        events = this.events(await this.history(session, 500));
+        events = await history(500);
       }
     }
     return events;
@@ -60,6 +68,37 @@ export class NativeConversations {
 
   session(id: string): NativeSession | null {
     return this.store.sql.exec<NativeSession>("SELECT * FROM native_sessions WHERE session=?", id).toArray()[0] ?? null;
+  }
+
+  /** A positive history response plus definitive misses on the other enabled accounts establishes ownership. */
+  async resolveOwner(session: string): Promise<MuseOwner> {
+    const binding = this.session(session);
+    if (binding?.muse_account && binding.muse_vm) return { account: binding.muse_account, vm: binding.muse_vm };
+    const pending = this.resolving.get(session);
+    if (pending) return pending;
+    const check = this.discoverOwner(session).finally(() => this.resolving.delete(session));
+    this.resolving.set(session, check);
+    return check;
+  }
+
+  private async discoverOwner(session: string): Promise<MuseOwner> {
+    const proposals = await Promise.all((await this.accountIds()).map(async (account) => {
+      try {
+        return await this.rpc(async (client, owner) => {
+          this.events(await client.call(this.historyPath(session, 1), 0));
+          return owner;
+        }, { account });
+      } catch (error) {
+        if (error instanceof Error && ["rpc_http_404", "muse_account_unconfigured"].includes(error.message)) return null;
+        throw new MuseOwnerUnavailable("muse_owner_unresolved");
+      }
+    }));
+    const matches = proposals.filter((owner): owner is MuseOwner => owner !== null);
+    if (matches.length !== 1) throw new MuseOwnerUnavailable("muse_owner_unresolved");
+    const [owner] = matches;
+    this.store.sql.exec("UPDATE native_sessions SET muse_account=?,muse_vm=? WHERE session=? AND muse_account IS NULL",
+      owner.account, owner.vm, session);
+    return owner;
   }
 
   /** 查找指定渠道最近保存的合法路由（用于主动推送自动继承微信最新 context_token 与目标聊天）。 */
@@ -96,24 +135,36 @@ export class NativeConversations {
     if (existing) return existing;
     const conversation = this.store.sql.exec<{ generation: number; session: string | null }>("SELECT generation,session FROM conversations WHERE id=?", task.conversation).one();
     const key = "session:" + task.conversation + ":" + task.generation;
-    let session = task.session ?? this.store.get<string>(key) ?? (conversation.generation === task.generation ? conversation.session : null);
+    const session = task.session ?? this.store.get<string>(key) ?? (conversation.generation === task.generation ? conversation.session : null);
     if (!session) {
-      const started = object(await this.rpc((client) => client.call("/session/start", 0, "POST", {
-        method: "/api/session/start", params: { origin: "fresh", lifecycle: "persistent", title: "CF managed channel" },
-      })));
-      session = string(started.session_id);
-      if (!session) throw new Error("session_unavailable");
-      this.store.set(key, session);
-      this.store.sql.exec("UPDATE conversations SET session=? WHERE id=? AND generation=?", session, task.conversation, task.generation);
+      return this.rpc(async (client, owner) => {
+        const started = object(await client.call("/session/start", 0, "POST", {
+          method: "/api/session/start", params: { origin: "fresh", lifecycle: "persistent", title: "CF managed channel" },
+        }));
+        const created = string(started.session_id);
+        if (!created) throw new Error("session_unavailable");
+        this.commit(() => {
+          this.insertSession(task, created, owner, 0);
+          this.store.set(key, created);
+          this.store.sql.exec("UPDATE conversations SET session=? WHERE id=? AND generation=?", created, task.conversation, task.generation);
+        });
+        return this.session(created)!;
+      });
     }
     // Existing delivered replies form the initial boundary. Unsettled old turns
     // instead start at their original boundary so an upgrade cannot lose a reply.
     const unfinished = this.store.sql.exec<{ baseline: number }>(
       "SELECT baseline FROM tasks WHERE conversation=? AND generation=? AND session=? AND state IN ('running','unknown','submitting')", task.conversation, task.generation, session).toArray();
-    const events = this.events(await this.history(session, unfinished.length ? 100 : 20));
-    const cursor = unfinished.length ? Math.min(...unfinished.map((row) => row.baseline)) : Math.max(0, ...events.map((event) => Number(event.seq)));
-    this.store.sql.exec("INSERT INTO native_sessions(session,conversation,generation,route,cursor) VALUES (?,?,?,?,?)", session, task.conversation, task.generation, task.route, cursor);
-    return this.store.sql.exec<NativeSession>("SELECT * FROM native_sessions WHERE session=?", session).one();
+    const owner = await this.resolveOwner(session);
+    const cursor = unfinished.length ? Math.min(...unfinished.map((row) => row.baseline)) : Math.max(0, ...this.events(
+      await this.rpc((client) => client.call(this.historyPath(session, 20), 0), owner)).map((event) => Number(event.seq)));
+    this.insertSession(task, session, owner, cursor);
+    return this.session(session)!;
+  }
+
+  private insertSession(task: Task, session: string, owner: MuseOwner, cursor: number) {
+    this.store.sql.exec("INSERT INTO native_sessions(session,conversation,generation,route,cursor,muse_account,muse_vm) VALUES (?,?,?,?,?,?,?)",
+      session, task.conversation, task.generation, task.route, cursor, owner.account, owner.vm);
   }
 
   /** A successfully sent input never waits for an earlier assistant reply. */
@@ -121,31 +172,43 @@ export class NativeConversations {
     if (task.text.trim() === "/stop") {
       const row = this.store.sql.exec<{ session: string | null }>("SELECT session FROM conversations WHERE id=? AND generation=?", task.conversation, task.generation).toArray()[0];
       if (row?.session) {
-        this.store.sql.exec("UPDATE tasks SET state='submitting',session=? WHERE id=?", row.session, task.id);
-        try { await this.rpc((client) => client.call("/chat/cancel", 0, "POST", { session_id: row.session })); }
-        catch { this.store.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", task.id); return row.session; }
+        const owner = await this.resolveOwner(row.session);
+        try {
+          await this.rpc((client) => {
+            this.store.sql.exec("UPDATE tasks SET state='submitting',session=? WHERE id=?", row.session, task.id);
+            return client.call("/chat/cancel", 0, "POST", { session_id: row.session });
+          }, owner);
+        } catch (error) {
+          if (this.store.task(task.id).state !== "submitting") throw error;
+          this.store.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", task.id);
+          return row.session;
+        }
       }
       this.commit(() => this.store.complete(task, row?.session ? "已向 Muse 发送停止请求。" : "当前没有已连接的 Muse 会话。"));
       return row?.session ?? null;
     }
     const binding = await this.bind(task);
+    const owner = await this.resolveOwner(binding.session);
     const route = JSON.parse(task.route) as Incoming;
-    const streamItems = await this.stageInboundMedia(task, route);
+    const streamItems = await this.stageInboundMedia(task, route, owner);
     const device = "cf-managed-" + crypto.randomUUID();
-    this.commit(() => {
-      this.store.set("device:" + task.id, device);
-      this.store.set("native-input:" + task.id, { sending_at: Date.now() });
-      this.store.sql.exec("UPDATE native_sessions SET route=?,awaiting=1 WHERE session=?", task.route, binding.session);
-      this.store.sql.exec("UPDATE tasks SET state='submitting',session=?,baseline=? WHERE id=? AND state='queued'", binding.session, binding.cursor, task.id);
-    });
-    this.watch(binding.session);
     try {
-      await this.rpc((client) => client.open("/chat/stream", 0, "POST", {
-        session_id: binding.session, node_id: device, capabilities: {}, items: streamItems,
-      }));
+      await this.rpc((client) => {
+        this.commit(() => {
+          this.store.set("device:" + task.id, device);
+          this.store.set("native-input:" + task.id, { sending_at: Date.now() });
+          this.store.sql.exec("UPDATE native_sessions SET route=?,awaiting=1 WHERE session=?", task.route, binding.session);
+          this.store.sql.exec("UPDATE tasks SET state='submitting',session=?,baseline=? WHERE id=? AND state='queued'", binding.session, binding.cursor, task.id);
+        });
+        this.watch(binding.session, owner);
+        return client.open("/chat/stream", 0, "POST", {
+          session_id: binding.session, node_id: device, capabilities: {}, items: streamItems,
+        });
+      }, owner);
       this.store.sql.exec("UPDATE tasks SET state='submitted' WHERE id=?", task.id);
       this.store.set("native-input:" + task.id, { ...this.store.get<object>("native-input:" + task.id), submitted_at: Date.now() });
-    } catch {
+    } catch (error) {
+      if (this.store.task(task.id).state !== "submitting") throw error;
       // Recovery only inspects this device receipt; it never resends this input.
       this.store.sql.exec("UPDATE tasks SET state='unknown' WHERE id=?", task.id);
     }
@@ -153,7 +216,7 @@ export class NativeConversations {
   }
 
   /** 将微信/企微入站媒体下载解密后写入 Muse 沙箱；对 1.5MB 以内的图片同时附上 Muse 原生 image item 以便多模态直接识别。 */
-  private async stageInboundMedia(task: Task, route: Incoming): Promise<StreamItem[]> {
+  private async stageInboundMedia(task: Task, route: Incoming, owner: MuseOwner): Promise<StreamItem[]> {
     if (!route.media?.length) return [{ type: "text", text: task.text }];
     const notes: string[] = [];
     const imageItems: StreamItem[] = [];
@@ -165,7 +228,7 @@ export class NativeConversations {
         const { bytes, ext } = await downloadAndDecryptInbound(item);
         const filename = `${safeId}_${index}.${ext}`;
         const relPath = `workspace/cf-inbound-media/${filename}`;
-        await writeSandboxFile(this.rpc, relPath, bytes);
+        await writeSandboxFile((op) => this.rpc(op, owner), relPath, bytes);
         const mime = item.kind === "image" ? imageMimeForExtension(ext) : null;
         if (mime && bytes.length <= MAX_INLINE_IMAGE_BYTES) {
           imageItems.push({
@@ -180,6 +243,7 @@ export class NativeConversations {
           notes.push(`[已附${label}，已保存到沙箱路径：/home/hatch/${relPath}（${bytes.length} 字节）${oversizeHint}]`);
         }
       } catch (error) {
+        if (error instanceof MuseOwnerUnavailable) throw error;
         const code = error instanceof Error ? error.message : "unknown_error";
         const reason = code === "media_too_large"
           ? "超过 CF 托管 6MB 单文件上限"
@@ -196,10 +260,18 @@ export class NativeConversations {
 
   /** Adopt any old in-flight transport receipt without resubmitting the message. */
   async recoverLegacy() {
-    const rows = this.store.sql.exec<Task>("SELECT * FROM tasks WHERE state IN ('running','unknown') AND session IS NOT NULL ORDER BY id").toArray();
+    const rows = this.store.sql.exec<Task>(`SELECT t.* FROM tasks t LEFT JOIN native_sessions n ON n.session=t.session
+      WHERE t.session IS NOT NULL AND (t.state='running' OR (t.state='unknown' AND n.session IS NULL)) ORDER BY t.id`).toArray();
     for (const task of rows) {
-      await this.bind(task);
-      if (task.state === "running") this.store.sql.exec("UPDATE tasks SET state='submitted' WHERE id=?", task.id);
+      try {
+        await this.bind(task);
+        if (task.state === "running") {
+          await this.resolveOwner(task.session!);
+          this.store.sql.exec("UPDATE tasks SET state='submitted' WHERE id=?", task.id);
+        }
+      } catch (error) {
+        this.store.set("task-error:" + task.id, { code: failureCode(error), at: Date.now() });
+      }
     }
   }
 
@@ -207,8 +279,9 @@ export class NativeConversations {
    * The session itself may still be running; it is never a gate on delivery.
    */
   async collect(binding: NativeSession): Promise<boolean> {
-    if (binding.awaiting) this.watch(binding.session);
-    const events = await this.historySince(binding.session, binding.cursor);
+    const owner = await this.resolveOwner(binding.session);
+    if (binding.awaiting) this.watch(binding.session, owner);
+    const events = await this.historySince(binding.session, binding.cursor, owner);
     const latest = new Map<string, Record<string, unknown>>();
     const hasUserEvents = events.some((event) => event.event_name === "message.user");
     const devices = new Map<string, Task>();
@@ -271,7 +344,7 @@ export class NativeConversations {
           const extracted = extractOutboundFiles(output.text);
           const replyText = extracted.text ? channelReply(extracted.text) : (extracted.files.length ? "" : channelReply(output.text));
           this.store.complete(rows[0], replyText);
-          if (extracted.files.length) this.store.set("outbound-files:" + rows[0].id, extracted.files);
+          if (extracted.files.length) this.store.setOutboundFiles(rows[0].id, extracted.files, owner);
           this.store.set("native-output:" + rows[0].id, { message_id: output.identity, muse_completed_at: output.completedAt, captured_at: Date.now() });
           produced = true;
         }
@@ -283,7 +356,8 @@ export class NativeConversations {
 
   /** This only adjusts the history fallback cadence, after replies are delivered. */
   async refreshActivity(binding: NativeSession) {
-    const status = object(await this.rpc((client) => client.call("/api/session/list/" + encodeURIComponent(binding.session), 0)));
+    const owner = await this.resolveOwner(binding.session);
+    const status = object(await this.rpc((client) => client.call("/api/session/list/" + encodeURIComponent(binding.session), 0), owner));
     if (["completed", "failed", "error", "cancelled", "canceled"].includes(string(status.status))) {
       this.store.sql.exec("UPDATE native_sessions SET awaiting=0 WHERE session=?", binding.session);
     }

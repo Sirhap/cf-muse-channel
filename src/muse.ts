@@ -1,6 +1,7 @@
 import { json } from "./http";
 import { MuseRpc } from "./noise";
 import { applySetCookies, initialCookies, cookieHeader, type CookieJar } from "./cookies";
+import { MANAGED_MUSE_SOCKET, MUSE_VM_HEADER } from "./managed/muse-owner";
 
 const MUSE_ORIGIN = "https://muse.ai";
 const GATEWAY_ORIGIN = "https://hatch.metaaivm.com";
@@ -411,7 +412,8 @@ export class CookieController {
         return json({ ok: true, stage: "cookie_and_websocket", noise_rpc_verified: false,
           note: "Cookie exchange and WebSocket upgrade passed; run the Python client to verify Noise RPC." });
       }
-      return new Response(null, { status: 101, webSocket: upstream.webSocket });
+      const headers = pathname === MANAGED_MUSE_SOCKET ? { [MUSE_VM_HEADER]: step.vmId } : undefined;
+      return new Response(null, { status: 101, webSocket: upstream.webSocket, headers });
     } catch (error) {
       const failure = this.failure(error);
       await this.recordExternalFailure(step.seed, failure);

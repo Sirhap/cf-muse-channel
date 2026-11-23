@@ -291,7 +291,6 @@ describe("NativeConversations 增量拉取与缺口补拉", () => {
         if (path.startsWith("/chat/history")) {
           const limit = Number(new URL("https://x" + path).searchParams.get("limit"));
           limits.push(limit);
-          if (limit === 20) return { chat_events: [{ seq: 10, event_name: "message.user", payload: {} }] };
           if (limit === 40) {
             // 返回 40 条且最小 seq=30 > cursor(10)+1，触发补拉 limit=200
             return {
@@ -311,10 +310,11 @@ describe("NativeConversations 增量拉取与缺口补拉", () => {
         return { status: "completed" };
       });
       const client = { call, open: vi.fn(async () => 1) } as unknown as MuseRpc;
-      const native = new NativeConversations(store, (op) => op(client), (op) => state.storage.transactionSync(op), vi.fn());
+      const native = new NativeConversations(store, (op) => op(client, { account: "primary-account", vm: "fixture-vm" }), (op) => state.storage.transactionSync(op), vi.fn(), async () => ["primary-account"]);
       await native.forward(store.ingest(incoming("hi"))!);
+      state.storage.sql.exec("UPDATE native_sessions SET cursor=10");
       await native.collect(native.sessions()[0]);
-      expect(limits).toEqual([20, 40, 200]);
+      expect(limits).toEqual([40, 200]);
       const texts = state.storage.sql.exec<{ text: string }>("SELECT text FROM outbound ORDER BY id").toArray().map((r) => r.text);
       expect(texts).toEqual(["早先消息", "最新消息"]);
     });
@@ -429,11 +429,11 @@ describe("ManagedChannels 主动推送 (/managed/push) 与事件唤醒优化", (
       const subscribe = vi.fn(async () => {});
       const close = vi.fn();
       const internal = runtime as unknown as {
-        socket: () => Promise<MuseRpc>;
-        watch: (session: string) => Promise<void>;
+        socket: () => Promise<{ client: MuseRpc; owner: { account: string; vm: string }; approvalEvents: boolean }>;
+        watch: (session: string, owner: { account: string; vm: string }) => Promise<void>;
       };
-      vi.spyOn(internal, "socket").mockResolvedValue({ subscribe, close } as unknown as MuseRpc);
-      await internal.watch("idle-sess");
+      vi.spyOn(internal, "socket").mockResolvedValue({ client: { subscribe, close } as unknown as MuseRpc, owner: { account: "primary-account", vm: "fixture-vm" }, approvalEvents: false });
+      await internal.watch("idle-sess", { account: "primary-account", vm: "fixture-vm" });
       expect(subscribe).not.toHaveBeenCalled();
       expect(close).toHaveBeenCalledTimes(1);
     });
@@ -457,18 +457,19 @@ describe("ManagedChannels 主动推送 (/managed/push) 与事件唤醒优化", (
     await runInDurableObject(env.MOBILE.getByName("managed-dead-rpc-evict"), async (_instance, state) => {
       const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
       const internal = runtime as unknown as {
-        muse?: MuseRpc;
-        socket: () => Promise<MuseRpc>;
-        rpc: <T>(op: (client: MuseRpc) => Promise<T>) => Promise<T>;
+        muse: Map<string, { client: MuseRpc; owner: { account: string; vm: string }; approvalEvents: boolean }>;
+        socket: () => Promise<{ client: MuseRpc; owner: { account: string; vm: string }; approvalEvents: boolean }>;
+        rpc: <T>(op: (client: MuseRpc) => Promise<T>, target: { account: string }) => Promise<T>;
       };
       const deadClose = vi.fn();
       const deadCall = vi.fn(async () => { throw new Error("should_not_use_dead_socket"); });
-      internal.muse = { alive: false, close: deadClose, call: deadCall } as unknown as MuseRpc;
+      const owner = { account: "primary-account", vm: "fixture-vm" };
+      internal.muse.set(owner.account, { client: { alive: false, close: deadClose, call: deadCall } as unknown as MuseRpc, owner, approvalEvents: false });
 
       const freshCall = vi.fn(async () => ({ ok: true }));
-      const freshSocket = vi.spyOn(internal, "socket").mockResolvedValue({ alive: true, close: vi.fn(), call: freshCall } as unknown as MuseRpc);
+      const freshSocket = vi.spyOn(internal, "socket").mockResolvedValue({ client: { alive: true, close: vi.fn(), call: freshCall } as unknown as MuseRpc, owner, approvalEvents: false });
 
-      const res = await internal.rpc((client) => client.call("/api/session/list", 0));
+      const res = await internal.rpc((client) => client.call("/api/session/list", 0), owner);
       expect(res).toEqual({ ok: true });
       expect(deadClose).toHaveBeenCalledTimes(1);
       expect(deadCall).not.toHaveBeenCalled();
@@ -482,7 +483,7 @@ describe("OutboxRelay 纯 CF 侧 Range 增量同步 VM 定时任务发件箱", (
   it("首次仅记高水位不重放历史，后续仅 Range 拉增量、防半行截断、严格白名单与幂等去重", async () => {
     await runInDurableObject(env.MOBILE.getByName("outbox-range-sync"), async (_instance, state) => {
       const store = new ManagedStore(state.storage.sql);
-      const native = new NativeConversations(store, async () => { throw new Error("unused"); }, (op) => state.storage.transactionSync(op), vi.fn());
+      const native = new NativeConversations(store, async () => { throw new Error("unused"); }, (op) => state.storage.transactionSync(op), vi.fn(), async () => ["primary-account"]);
       // 先留一条微信入站记录，提供最新 context_token
       store.ingest({
         id: "wx-in-1", channel: "weixin", account: "wx-bot", chat: "alice", sender: "alice",
@@ -512,7 +513,7 @@ describe("OutboxRelay 纯 CF 侧 Range 增量同步 VM 定时任务发件箱", (
       const client = { call, raw } as unknown as MuseRpc;
       const relay = new OutboxRelay(
         store,
-        (op) => op(client),
+        (op) => op(client, { account: "primary-account", vm: "fixture-vm" }),
         (op) => state.storage.transactionSync(op),
         (ch, acc, chat, grp) => native.latestRoute(ch, acc, chat, grp),
       );

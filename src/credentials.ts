@@ -4,9 +4,9 @@ import { ADMIN_SESSION_SECONDS } from "./admin-session";
 import { APPROVAL_EVENTS_HEADER, parsePolicy, pollApprovals, type HeldApproval } from "./approval-policy";
 import { inspectChannels, publishedChannelStates, unknownChannels, type ChannelHealthReport } from "./channel-health";
 import { json } from "./http";
+import { MANAGED_MUSE_SOCKET, MUSE_ACCOUNT_HEADER, PRIMARY_ACCOUNT_ID } from "./managed/muse-owner";
 import { CookieController, type CredentialState, type CredentialStore } from "./muse";
 
-const PRIMARY_ACCOUNT_ID = "primary-account";
 const MAX_ACCOUNTS = 20;
 const COOLDOWN_MS = 60_000;
 const PRIMARY_APPROVAL_RECONCILE_MS = 300_000;
@@ -154,7 +154,11 @@ export class MuseCredentials extends DurableObject<Env> {
     if (path === "/admin/cookie") {
       if (request.method === "GET") return this.dashboard(await this.controller.adminStatus());
       if (request.method !== "POST") return json({ error: "not_found" }, 404);
-      try { return await this.dashboard(await this.controller.replaceCookies(await readCookieInput(request))); }
+      try {
+        const result = await this.controller.replaceCookies(await readCookieInput(request));
+        if (result.ok) await this.notifyManagedReconnect();
+        return await this.dashboard(result);
+      }
       catch (error) {
         if (error instanceof AdminInputError) return json({ error: error.code }, error.status);
         throw error;
@@ -224,20 +228,12 @@ export class MuseCredentials extends DurableObject<Env> {
     if (enabledRows.length === 0) {
       return json({ ok: false, error: "no_enabled_accounts_in_pool" }, 503);
     }
-    const wantsApprovalEvents = path === "/ws" && new URL(request.url).hostname === "internal"
-      && request.headers.get(APPROVAL_EVENTS_HEADER) === "1" && this.approvalEventsEnabled();
-    const connected = (id: string, response: Response) => {
-      if (wantsApprovalEvents && id === PRIMARY_ACCOUNT_ID && response.status === 101) {
-        response.headers.set(APPROVAL_EVENTS_HEADER, "1");
-      }
-      return response;
-    };
     if (enabledRows.length === 1) {
       const only = enabledRows[0];
       const res = await this.dispatchAccount(only.id, request, path);
       const ok = res.status === 101 || res.ok;
       this.markPoolOutcome(only.id, ok);
-      return connected(only.id, res);
+      return this.markManagedSocket(request, path, only.id, res);
     }
 
     const now = Date.now();
@@ -281,7 +277,7 @@ export class MuseCredentials extends DurableObject<Env> {
         const res = await this.dispatchAccount(candidate.row.id, attemptReq, path);
         const ok = res.status === 101 || res.ok;
         this.markPoolOutcome(candidate.row.id, ok);
-        if (ok) return connected(candidate.row.id, res);
+        if (ok) return this.markManagedSocket(request, path, candidate.row.id, res);
         lastResponse = res;
       } catch {
         this.markPoolOutcome(candidate.row.id, false);
@@ -290,8 +286,31 @@ export class MuseCredentials extends DurableObject<Env> {
     return lastResponse ?? json({ ok: false, error: "pool_dispatch_failed" }, 502);
   }
 
+  private markManagedSocket(request: Request, path: string, id: string, response: Response) {
+    if (response.status !== 101 || !response.webSocket || new URL(request.url).hostname !== "internal") return response;
+    const managed = path === MANAGED_MUSE_SOCKET;
+    const events = (path === "/ws" || managed) && id === PRIMARY_ACCOUNT_ID
+      && request.headers.get(APPROVAL_EVENTS_HEADER) === "1" && this.approvalEventsEnabled();
+    if (!managed && !events) return response;
+    const headers = new Headers(response.headers);
+    if (managed) headers.set(MUSE_ACCOUNT_HEADER, id);
+    if (events) headers.set(APPROVAL_EVENTS_HEADER, "1");
+    return new Response(null, { status: 101, webSocket: response.webSocket, headers });
+  }
+
+  /** Account candidates for read-only discovery of managed sessions created before ownership was stored. */
+  managedAccountIds(): string[] {
+    this.ensurePrimaryAccountRow();
+    return this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM muse_accounts WHERE enabled=1 ORDER BY created_at,id")
+      .toArray().map((row) => row.id);
+  }
+
   async fetch(request: Request): Promise<Response> {
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path === MANAGED_MUSE_SOCKET && (url.hostname !== "internal" || request.method !== "GET")) {
+      return json({ error: "not_found" }, 404);
+    }
     const isInternalIsolated = request.headers.get("X-Muse-Internal-Isolated") === "1";
     if (isInternalIsolated) {
       this.markIsolated();
@@ -327,6 +346,13 @@ export class MuseCredentials extends DurableObject<Env> {
     }
 
     const requestedAccount = request.headers.get("X-Muse-Account")?.trim() || "";
+    if (path === MANAGED_MUSE_SOCKET) {
+      if (!requestedAccount) return this.dispatchPooledRequest(request, path);
+      this.ensurePrimaryAccountRow();
+      const row = this.ctx.storage.sql.exec<{ enabled: number }>("SELECT enabled FROM muse_accounts WHERE id=?", requestedAccount).toArray()[0];
+      if (!row?.enabled) return json({ error: "managed_account_unavailable" }, 409);
+      return this.markManagedSocket(request, path, requestedAccount, await this.dispatchAccount(requestedAccount, request, path));
+    }
     const isAccountAdminPath = ["/admin/cookie", "/admin/current-cookie", "/admin/renew", "/admin/probe-rpc"].includes(path);
     const isPoolExecutionPath = ["/ws", "/probe/worker-rpc", "/probe/cookie", "/credentials/refresh"].includes(path);
     const isAccountStatusPath = ["/credentials/status", "/cookie-health"].includes(path);
@@ -636,6 +662,7 @@ export class MuseCredentials extends DurableObject<Env> {
       if (this.defaultAccountId() === id) return json({ error: "cannot_delete_active_default_account" }, 409);
       await this.forwardToAccount(id, new Request("https://internal/admin/internal-wipe", { method: "POST" })).catch(() => {});
       this.ctx.storage.sql.exec("DELETE FROM muse_accounts WHERE id=?", id);
+      await this.notifyManagedReconnect();
       return this.listAccounts();
     }
 

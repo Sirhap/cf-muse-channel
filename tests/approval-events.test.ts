@@ -2,6 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
 import { APPROVAL_EVENTS_HEADER } from "../src/approval-policy";
 import { MuseCredentials } from "../src/credentials";
+import { MANAGED_MUSE_SOCKET, MUSE_ACCOUNT_HEADER, MUSE_VM_HEADER, PRIMARY_ACCOUNT_ID } from "../src/managed/muse-owner";
 import { ManagedChannels } from "../src/managed/runtime";
 import { MuseRpc } from "../src/noise";
 
@@ -18,9 +19,15 @@ function upstreamNoiseResponse() {
 
 it("advertises approval streaming only for the selected primary account on the managed connection", async () => {
   await runInDurableObject(env.CREDENTIALS.getByName("approval-event-account"), async (_instance, state) => {
-    const fetchSecondary = vi.fn(async (request: Request) => new URL(request.url).pathname === "/ws"
-      ? upstreamNoiseResponse()
-      : Response.json({ configured: true, needs_login: false, ok: true }));
+    const fetchSecondary = vi.fn(async (request: Request) => {
+      const path = new URL(request.url).pathname;
+      if (path !== "/ws" && path !== MANAGED_MUSE_SOCKET) {
+        return Response.json({ configured: true, needs_login: false, ok: true });
+      }
+      const response = upstreamNoiseResponse();
+      if (path === MANAGED_MUSE_SOCKET) response.headers.set(MUSE_VM_HEADER, "secondary-vm");
+      return response;
+    });
     const credentials = new MuseCredentials(state, {
       ...env,
       AUTO_APPROVAL_ENABLED: "true",
@@ -53,6 +60,25 @@ it("advertises approval streaming only for the selected primary account on the m
     );
     expect(await upgrade("internal")).toBeNull();
     expect(fetchSecondary.mock.calls.some(([request]) => new URL(request.url).pathname === "/ws")).toBe(true);
+
+    const managedUpgrade = (host: string, account?: string) => credentials.fetch(new Request("https://" + host + MANAGED_MUSE_SOCKET, {
+      headers: { Upgrade: "websocket", ...(account ? { [MUSE_ACCOUNT_HEADER]: account } : {}) },
+    }));
+    const pooled = await managedUpgrade("internal");
+    expect(pooled.status).toBe(101);
+    expect(pooled.headers.get(MUSE_ACCOUNT_HEADER)).toBe("secondary");
+    expect(pooled.headers.get(MUSE_VM_HEADER)).toBe("secondary-vm");
+    pooled.webSocket!.accept();
+    pooled.webSocket!.close();
+    const pinned = await managedUpgrade("internal", PRIMARY_ACCOUNT_ID);
+    expect(pinned.status).toBe(101);
+    expect(pinned.headers.get(MUSE_ACCOUNT_HEADER)).toBe(PRIMARY_ACCOUNT_ID);
+    expect(pinned.headers.get(MUSE_VM_HEADER)).toBeTruthy();
+    pinned.webSocket!.accept();
+    pinned.webSocket!.close();
+    expect((await managedUpgrade("public.example")).status).toBe(404);
+    state.storage.sql.exec("UPDATE muse_accounts SET enabled=0 WHERE id='secondary'");
+    expect((await managedUpgrade("internal", "secondary")).status).toBe(409);
   });
 });
 
@@ -69,6 +95,8 @@ it("watches approvals on the warm socket, deduplicates snapshots and loses readi
       expect(request.headers.get(APPROVAL_EVENTS_HEADER)).toBe("1");
       const response = upstreamNoiseResponse();
       response.headers.set(APPROVAL_EVENTS_HEADER, "1");
+      response.headers.set(MUSE_ACCOUNT_HEADER, PRIMARY_ACCOUNT_ID);
+      response.headers.set(MUSE_VM_HEADER, "fixture-vm");
       return response;
     });
     const connect = vi.spyOn(MuseRpc, "connect").mockResolvedValue({ subscribe, alive: true } as unknown as MuseRpc);

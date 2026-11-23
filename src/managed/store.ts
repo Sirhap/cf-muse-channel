@@ -1,4 +1,5 @@
 import type { Incoming } from "./protocol";
+import type { MuseOwner } from "./muse-owner";
 export type TaskState = "queued" | "submitting" | "submitted" | "running" | "unknown" | "succeeded" | "failed" | "cancelled";
 export interface Task extends Record<string, SqlStorageValue> {
   id: number; message_id: string; route: string; conversation: string; text: string; state: TaskState;
@@ -26,6 +27,10 @@ export class ManagedStore {
   set(key: string, data: unknown) {
     this.sql.exec("INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, JSON.stringify(data));
   }
+  setOutboundFiles(taskId: number, files: string[], owner: MuseOwner) {
+    this.set("outbound-files:" + taskId, files);
+    this.set("outbound-owner:" + taskId, owner);
+  }
   ingest(message: Incoming): Task | null {
     const conversation = JSON.stringify([message.channel, message.account, message.group, message.chat]);
     this.sql.exec("INSERT OR IGNORE INTO conversations(id) VALUES (?)", conversation);
@@ -45,7 +50,10 @@ export class ManagedStore {
   }
   task(id: number) { return this.sql.exec<Task>("SELECT * FROM tasks WHERE id=?", id).one(); }
   candidate(): Task | null {
-    return this.sql.exec<Task>("SELECT * FROM tasks WHERE state='queued' ORDER BY id LIMIT 1").toArray()[0] ?? null;
+    return this.sql.exec<Task>(`SELECT t.* FROM tasks t WHERE t.state='queued' AND NOT EXISTS (
+      SELECT 1 FROM tasks blocked JOIN metadata m ON m.key='task-error:' || blocked.id
+      WHERE blocked.conversation=t.conversation AND blocked.generation=t.generation AND blocked.state='queued' AND blocked.id<=t.id
+        AND json_extract(m.value,'$.retry_after')>?) ORDER BY t.id LIMIT 1`, Date.now()).toArray()[0] ?? null;
   }
   command(task: Task): string | null {
     const word = task.text.trim();

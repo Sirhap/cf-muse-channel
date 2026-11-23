@@ -5,6 +5,8 @@ import { MuseRpc } from "../noise";
 import { ManagedStore, type Task, type Outbound } from "./store";
 import { NativeConversations } from "./native";
 import { OutboxRelay } from "./outbox";
+import { MANAGED_MUSE_SOCKET, MUSE_ACCOUNT_HEADER, MUSE_VM_HEADER, MuseOwnerUnavailable, PRIMARY_ACCOUNT_ID,
+  type MuseOwner, type MuseTarget } from "./muse-owner";
 import { readSandboxFile, uploadWecomMedia, uploadWeixinMedia } from "./media";
 import { channelReply } from "./reply";
 import { assertPlatformSuccess, boundedJson, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
@@ -23,20 +25,23 @@ interface Diagnostic {
   submitted_at: number | null;
   completed_at: number | null;
   event_received: boolean;
+  owner?: MuseOwner;
 }
+interface MuseConnection { client: MuseRpc; owner: MuseOwner; approvalEvents: boolean; }
 export class ManagedChannels extends DurableObject<Env> {
   private store: ManagedStore;
   private native: NativeConversations;
   private outbox: OutboxRelay;
-  private muse?: MuseRpc;
-  private museConnecting?: Promise<MuseRpc>;
+  private muse = new Map<string, MuseConnection>();
+  private museConnecting = new Map<string, Promise<MuseConnection>>();
+  private museEpoch = 0;
   private approvalSubscription?: ApprovalSubscription;
   private wecom?: WebSocket;
   private wecomStarting?: Promise<void>;
   private wecomReady = false;
   private responses = new Map<string, { resolve: (response: Record<string, unknown>) => void; reject: () => void }>();
   private subscriptions = new Map<string, MuseRpc>();
-  private watching = new Set<string>();
+  private watching = new Map<string, symbol>();
   private dirtySessions = new Set<string>();
   private pendingFullScan = false;
   private lastWecomPing = 0;
@@ -53,10 +58,11 @@ export class ManagedChannels extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.store = new ManagedStore(ctx.storage.sql);
-    this.native = new NativeConversations(this.store, (operation) => this.rpc(operation),
+    this.native = new NativeConversations(this.store, (operation, target) => this.rpc(operation, target),
       (operation) => ctx.storage.transactionSync(operation),
-      (session) => ctx.waitUntil(this.watch(session).catch(() => {})));
-    this.outbox = new OutboxRelay(this.store, (operation) => this.rpc(operation),
+      (session, owner) => ctx.waitUntil(this.watch(session, owner).catch(() => {})),
+      () => this.env.CREDENTIALS.getByName(PRIMARY_ACCOUNT_ID).managedAccountIds());
+    this.outbox = new OutboxRelay(this.store, (operation, target) => this.rpc(operation, target),
       (operation) => ctx.storage.transactionSync(operation),
       (channel, account, chat, group) => this.native.latestRoute(channel, account, chat, group));
     // A worker may have died after sending. Such tasks always require reconciliation.
@@ -112,6 +118,24 @@ export class ManagedChannels extends DurableObject<Env> {
         return json({ ok: true, task_id: task.id, source: "recipient_confirmation" });
       } catch { return json({ error: "invalid_delivery_receipt" }, 400); }
     }
+    if (path === "/admin/managed/outbox/adopt" && request.method === "POST") {
+      let body: Record<string, unknown>;
+      try { body = await boundedJson(new Response(request.body), 8192); }
+      catch { return json({ error: "invalid_outbox_boundary" }, 400); }
+      const { channel, expected_offset: expected, offset, vm_id: vm, file_task_ids: fileTasks = [] } = body;
+      const validOffset = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+      if ((channel !== "weixin" && channel !== "wecom") || (expected !== null && !validOffset(expected))
+          || !validOffset(offset) || typeof vm !== "string" || !vm || vm.length > 256
+          || !Array.isArray(fileTasks) || fileTasks.length > 100 || fileTasks.some((id) => !validOffset(id) || id === 0)) {
+        return json({ error: "invalid_outbox_boundary" }, 400);
+      }
+      try {
+        const adopted = await this.outbox.adopt(channel, expected, offset, vm, fileTasks);
+        return adopted ? json({ ok: true, channel, offset }) : json({ error: "outbox_boundary_conflict" }, 409);
+      } catch (error) {
+        return json({ error: failureCode(error) }, 503);
+      }
+    }
     if (path === "/admin/managed/connectivity" && request.method === "POST") {
       const weixin = this.config("weixin");
       const [wx, wc] = await Promise.all([
@@ -150,10 +174,10 @@ export class ManagedChannels extends DurableObject<Env> {
       return json(states);
     }
     if (path === "/admin/managed/probe") {
-      if (request.method === "GET") return json(this.store.get("diagnostic") ?? { state: "not_started" });
+      const diagnostic = this.store.get<Diagnostic>("diagnostic");
+      if (request.method === "GET") return json(diagnostic ? { ...diagnostic, owner: undefined } : { state: "not_started" });
       if (request.method === "POST") {
-        const existing = this.store.get<Diagnostic>("diagnostic");
-        if (existing) return json(existing);
+        if (diagnostic) return json({ ...diagnostic, owner: undefined });
         this.store.set("diagnostic", { state: "preparing", session: null, baseline: 0, submitted_at: null, completed_at: null, event_received: false } satisfies Diagnostic);
         await this.ctx.storage.setAlarm(Date.now() + 100);
         return json({ state: "preparing" }, 202);
@@ -161,7 +185,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261120-multi-account-v4",
+        runtime_version: "managed-20261123-account-ownership",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -185,18 +209,15 @@ export class ManagedChannels extends DurableObject<Env> {
         deliveries: this.ctx.storage.sql.exec<{ id: number; task_id: number; state: string }>(
           "SELECT id,task_id,state FROM outbound ORDER BY id DESC LIMIT 10").toArray()
           .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id) })),
-        native_sessions: this.ctx.storage.sql.exec("SELECT COUNT(*) count,SUM(awaiting) active FROM native_sessions").one(),
+        native_sessions: this.ctx.storage.sql.exec("SELECT COUNT(*) count,SUM(awaiting) active,SUM(muse_account IS NULL) owner_unresolved FROM native_sessions").one(),
         outbox_offsets: { weixin: this.outbox.offset("weixin"), wecom: this.outbox.offset("wecom") },
+        outbox_sync: { weixin: this.outbox.status("weixin"), wecom: this.outbox.status("wecom") },
         primary_approval_subscription_ready: this.primaryApprovalSubscriptionReady(),
         scope: "text+media",
       });
     }
     if (request.method === "POST" && path === "/admin/managed/reconnect-muse") {
-      this.muse?.close();
-      this.muse = undefined;
-      for (const sub of this.subscriptions.values()) sub.close();
-      this.subscriptions.clear();
-      this.watching.clear();
+      this.closeMuse();
       return json({ ok: true });
     }
     if (request.method === "POST" && path === "/admin/managed/wake") {
@@ -434,22 +455,48 @@ export class ManagedChannels extends DurableObject<Env> {
     return lastError;
   }
 
-  private async socket(warm = false): Promise<MuseRpc> {
+  private async socket(warm: boolean, target?: MuseTarget): Promise<MuseConnection> {
     const headers = new Headers({ Upgrade: "websocket" });
     if (warm) headers.set(APPROVAL_EVENTS_HEADER, "1");
-    const response = await this.env.CREDENTIALS.getByName("primary-account").fetch(new Request("https://internal/ws", {
+    if (target) headers.set(MUSE_ACCOUNT_HEADER, target.account);
+    const response = await this.env.CREDENTIALS.getByName(PRIMARY_ACCOUNT_ID).fetch(new Request("https://internal" + MANAGED_MUSE_SOCKET, {
       headers,
     }));
-    if (response.status !== 101 || !response.webSocket) throw new Error("muse_connect_failed");
-    const client = await MuseRpc.connect(response.webSocket);
-    if (warm && response.headers.get(APPROVAL_EVENTS_HEADER) === "1") this.followApprovals(client);
-    return client;
+    if (response.status !== 101 || !response.webSocket) {
+      if (response.status === 409) throw new MuseOwnerUnavailable("muse_account_unavailable");
+      if (response.status === 503) {
+        const detail = await boundedJson(response, 2048).catch(() => ({}));
+        if (object(detail).error === "cookie_not_configured") throw new MuseOwnerUnavailable("muse_account_unconfigured");
+      }
+      throw new MuseOwnerUnavailable("muse_connect_failed");
+    }
+    const account = response.headers.get(MUSE_ACCOUNT_HEADER);
+    const vm = response.headers.get(MUSE_VM_HEADER);
+    if (!account || !vm || (target && (target.account !== account || ("vm" in target && target.vm !== vm)))) {
+      response.webSocket.accept();
+      response.webSocket.close(1000, "Muse owner mismatch");
+      throw new MuseOwnerUnavailable("muse_owner_mismatch");
+    }
+    let client: MuseRpc;
+    try { client = await MuseRpc.connect(response.webSocket); }
+    catch { throw new MuseOwnerUnavailable("muse_connect_failed"); }
+    return { client, owner: { account, vm }, approvalEvents: response.headers.get(APPROVAL_EVENTS_HEADER) === "1" };
+  }
+
+  private closeMuse() {
+    this.museEpoch++;
+    for (const { client } of this.muse.values()) client.close();
+    this.muse.clear();
+    this.museConnecting.clear();
+    for (const sub of this.subscriptions.values()) sub.close();
+    this.subscriptions.clear();
+    this.watching.clear();
   }
 
   /** Used by the credentials DO to decide whether to keep fast polling the primary account. */
   primaryApprovalSubscriptionReady(): boolean {
     const subscription = this.approvalSubscription;
-    return Boolean(subscription?.ready && subscription.socket === this.muse && subscription.socket.alive);
+    return Boolean(subscription?.ready && subscription.socket === this.muse.get(PRIMARY_ACCOUNT_ID)?.client && subscription.socket.alive);
   }
 
   private followApprovals(client: MuseRpc) {
@@ -484,24 +531,52 @@ export class ManagedChannels extends DurableObject<Env> {
     }));
   }
 
-  /** 复用支持流级多路复用的热 MuseRpc 连接；发送前主动剔除空闲期间已断的死连接，避免误把未发出的消息标成 unknown。 */
-  private async rpc<T>(operation: (client: MuseRpc) => Promise<T>): Promise<T> {
-    if (this.muse && this.muse.alive === false) {
-      this.muse.close();
-      this.muse = undefined;
+  private async connectMuse(target?: MuseTarget): Promise<MuseConnection> {
+    const epoch = this.museEpoch;
+    const conn = await this.socket(true, target);
+    if (epoch !== this.museEpoch) {
+      conn.client.close();
+      throw new MuseOwnerUnavailable("muse_connection_replaced");
     }
-    let client = this.muse;
-    if (!client) {
-      this.museConnecting ??= this.socket(true).then((connected) => {
-        this.muse = connected;
-        return connected;
-      }).finally(() => { this.museConnecting = undefined; });
-      client = await this.museConnecting;
+    const previous = this.muse.get(conn.owner.account);
+    if (previous?.client.alive && previous.owner.vm === conn.owner.vm) {
+      conn.client.close();
+      return previous;
     }
-    try { return await operation(client); }
+    previous?.client.close();
+    this.muse.set(conn.owner.account, conn);
+    if (conn.approvalEvents) this.followApprovals(conn.client);
+    return conn;
+  }
+
+  /** Only session creation uses the pool. Other operations reuse an exact account connection. */
+  private async rpc<T>(operation: (client: MuseRpc, owner: MuseOwner) => Promise<T>, target?: MuseTarget): Promise<T> {
+    let conn = target ? this.muse.get(target.account) : undefined;
+    if (conn?.client.alive === false) {
+      conn.client.close();
+      this.muse.delete(conn.owner.account);
+      conn = undefined;
+    }
+    if (!conn && target) {
+      let pending = this.museConnecting.get(target.account);
+      if (!pending) {
+        pending = this.connectMuse({ account: target.account }).finally(() => {
+          if (this.museConnecting.get(target.account) === pending) this.museConnecting.delete(target.account);
+        });
+        this.museConnecting.set(target.account, pending);
+      }
+      conn = await pending;
+    }
+    conn ??= await this.connectMuse();
+    const { client, owner } = conn;
+    if (target && "vm" in target && target.vm !== owner.vm) throw new MuseOwnerUnavailable("muse_owner_mismatch");
+    if (this.muse.get(owner.account) !== conn) throw new MuseOwnerUnavailable("muse_connection_replaced");
+    try { return await operation(client, owner); }
     catch (error) {
-      if (this.muse === client) this.muse = undefined;
-      client.close();
+      if (!client.alive) {
+        if (this.muse.get(owner.account) === conn) this.muse.delete(owner.account);
+        client.close();
+      }
       throw error;
     }
   }
@@ -526,8 +601,7 @@ export class ManagedChannels extends DurableObject<Env> {
     const wecom = this.config("wecom"), weixin = this.config("weixin");
     if (!wecom?.enabled && !weixin?.enabled && !this.active()) {
       await this.ctx.storage.deleteAlarm();
-      this.muse?.close(); this.muse = undefined;
-      for (const subscription of this.subscriptions.values()) subscription.close();
+      this.closeMuse();
       this.closeWecom();
       return;
     }
@@ -686,12 +760,17 @@ export class ManagedChannels extends DurableObject<Env> {
     if (reply !== null) this.store.complete(task, reply);
   }
 
-  private async watch(session: string) {
+  private async watch(session: string, owner: MuseOwner) {
     if (this.watching.has(session)) return;
-    this.watching.add(session);
+    const attempt = Symbol(session);
+    this.watching.set(session, attempt);
     let client: MuseRpc;
-    try { client = await this.socket(); }
-    catch (error) { this.watching.delete(session); throw error; }
+    try { ({ client } = await this.socket(false, owner)); }
+    catch (error) {
+      if (this.watching.get(session) === attempt) this.watching.delete(session);
+      throw error;
+    }
+    if (this.watching.get(session) !== attempt) { client.close(); return; }
     const diagnostic = this.store.get<Diagnostic>("diagnostic");
     const awaiting = this.ctx.storage.sql.exec<{ count: number }>(
       "SELECT COUNT(*) count FROM native_sessions WHERE session=? AND awaiting=1", session).one().count > 0;
@@ -716,7 +795,7 @@ export class ManagedChannels extends DurableObject<Env> {
       }
     }).catch(() => {}).finally(() => {
       if (this.subscriptions.get(session) === client) this.subscriptions.delete(session);
-      this.watching.delete(session);
+      if (this.watching.get(session) === attempt) this.watching.delete(session);
       client.close();
     }));
   }
@@ -744,19 +823,22 @@ export class ManagedChannels extends DurableObject<Env> {
       const dirty = new Set(this.dirtySessions);
       this.dirtySessions.clear();
       await this.deliver();
-      await this.diagnostic();
+      await this.diagnostic().catch((error) => {
+        this.store.set("diagnostic-error", { code: failureCode(error), at: Date.now() });
+      });
       await this.native.recoverLegacy();
-      let prepared = true;
       // These are unsent transport receipts. Forward the burst immediately;
       // an earlier Muse turn never gates the next input.
       for (let sent = 0; sent < 20; sent++) {
         const task = this.store.candidate();
         if (!task) break;
-        try { await this.native.forward(task); }
-        catch {
-          prepared = false;
-          this.store.set("task-error:" + task.id, { code: "submission_preflight_failed", at: Date.now() });
-          break;
+        try {
+          await this.native.forward(task);
+          this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key=?", "task-error:" + task.id);
+        }
+        catch (error) {
+          const at = Date.now();
+          this.store.set("task-error:" + task.id, { code: failureCode(error), at, retry_after: at + 15000 });
         }
       }
       const uncertainSessions = new Set(
@@ -781,7 +863,7 @@ export class ManagedChannels extends DurableObject<Env> {
             // 会话状态刷新仅影响后续补查节拍，放后台异步执行避免阻塞紧随其后的新消息与本地指令。
             this.ctx.waitUntil(this.native.refreshActivity(binding).catch(() => {}));
           }
-        } catch { this.store.set("native-error:" + binding.session, { code: "native_history_check_failed", at: Date.now() }); }
+        } catch (error) { this.store.set("native-error:" + binding.session, { code: failureCode(error), at: Date.now() }); }
       }
       if (fullScan && Date.now() - this.lastOutboxSync >= 10_000) {
         this.lastOutboxSync = Date.now();
@@ -791,7 +873,6 @@ export class ManagedChannels extends DurableObject<Env> {
         } catch { /* VM outbox 增量同步独立于实时对话，单次失败不阻塞主流程 */ }
       }
       await this.deliver();
-      if (!prepared) break;
       loops++;
     } while (loops < 10 && (revision !== this.eventRevision || this.dirtySessions.size > 0 || this.pendingFullScan || this.store.candidate()));
     if (this.active()) await this.ctx.storage.setAlarm(Date.now() + 15000);
@@ -801,24 +882,27 @@ export class ManagedChannels extends DurableObject<Env> {
     const diagnostic = this.store.get<Diagnostic>("diagnostic");
     if (!diagnostic || diagnostic.state === "succeeded" || diagnostic.state === "failed") return;
     if (diagnostic.state === "preparing") {
-      const started = object(await this.rpc((rpc) => rpc.call("/session/start", 0, "POST", {
-        method: "/api/session/start", params: { origin: "fresh", lifecycle: "persistent", title: "CF managed isolated verification" },
-      })));
-      const session = string(started.session_id);
-      if (!session) throw new Error("session_unavailable");
-      const next: Diagnostic = { ...diagnostic, session, state: "submission_unknown", submitted_at: Date.now() };
-      this.store.set("diagnostic", next);
-      this.ctx.waitUntil(this.watch(session).catch(() => {}));
-      await this.rpc((rpc) => rpc.open("/chat/stream", 0, "POST", {
-        session_id: session, node_id: "cf-managed-diagnostic", capabilities: {},
-        items: [{ type: "text", text: "只回复：CF 托管独立验证成功。不要执行其他操作。" }],
-      }));
+      await this.rpc(async (rpc, owner) => {
+        const started = object(await rpc.call("/session/start", 0, "POST", {
+          method: "/api/session/start", params: { origin: "fresh", lifecycle: "persistent", title: "CF managed isolated verification" },
+        }));
+        const session = string(started.session_id);
+        if (!session) throw new Error("session_unavailable");
+        this.store.set("diagnostic", { ...diagnostic, owner, session, state: "submission_unknown", submitted_at: Date.now() });
+        this.ctx.waitUntil(this.watch(session, owner).catch(() => {}));
+        await rpc.open("/chat/stream", 0, "POST", {
+          session_id: session, node_id: "cf-managed-diagnostic", capabilities: {},
+          items: [{ type: "text", text: "只回复：CF 托管独立验证成功。不要执行其他操作。" }],
+        });
+      });
       return;
     }
     if (!diagnostic.session) return;
     const session = diagnostic.session;
-    this.ctx.waitUntil(this.watch(session).catch(() => {}));
-    const history = object(await this.rpc((rpc) => rpc.call("/chat/history?session_id=" + encodeURIComponent(session) + "&limit=40", 0)));
+    const owner = diagnostic.owner ?? await this.native.resolveOwner(session);
+    if (!diagnostic.owner) this.store.set("diagnostic", { ...diagnostic, owner });
+    this.ctx.waitUntil(this.watch(session, owner).catch(() => {}));
+    const history = object(await this.rpc((rpc) => rpc.call("/chat/history?session_id=" + encodeURIComponent(session) + "&limit=40", 0), owner));
     if (this.history(history).some((event) => event.event_name === "message.assistant"
       && object(event.payload).status === "completed" && string(object(event.payload).display_text))) {
       this.store.set("diagnostic", { ...this.store.get<Diagnostic>("diagnostic")!, state: "succeeded", completed_at: Date.now() });
@@ -868,7 +952,11 @@ export class ManagedChannels extends DurableObject<Env> {
       const next = this.store.ingest(fallbackRoute);
       if (next) {
         this.store.complete(next, row.text);
-        if (files.length) this.store.set("outbound-files:" + next.id, files);
+        if (files.length) {
+          const owner = this.store.get<MuseOwner>("outbound-owner:" + row.task_id);
+          if (owner) this.store.setOutboundFiles(next.id, files, owner);
+          else this.store.set("outbound-files:" + next.id, files);
+        }
         this.store.set("outbound-fallback:" + row.id, { at: Date.now(), fallback_task_id: next.id });
         created = true;
       }
@@ -878,7 +966,8 @@ export class ManagedChannels extends DurableObject<Env> {
 
   private async deliver() {
     let fallbackCreated = false;
-    const rows = this.ctx.storage.sql.exec<Outbound>("SELECT * FROM outbound WHERE state='pending' ORDER BY id LIMIT 10").toArray();
+    const rows = this.ctx.storage.sql.exec<Outbound>(`SELECT o.* FROM outbound o LEFT JOIN metadata m ON m.key='outbound-error:' || o.id
+      WHERE o.state='pending' AND COALESCE(json_extract(m.value,'$.retry_after'),0)<=? ORDER BY o.id LIMIT 10`, Date.now()).toArray();
     for (const row of rows) {
       const route = JSON.parse(row.route) as Incoming;
       const config = this.config(route.channel);
@@ -927,8 +1016,20 @@ export class ManagedChannels extends DurableObject<Env> {
         const sandboxPath = files[f];
         let payload: { bytes: Uint8Array; fileName: string };
         try {
-          payload = await readSandboxFile((op) => this.rpc(op), sandboxPath);
+          let owner = this.store.get<MuseOwner>("outbound-owner:" + row.task_id);
+          if (!owner) {
+            const session = this.store.task(row.task_id).session;
+            if (!session) throw new MuseOwnerUnavailable("muse_owner_unresolved");
+            owner = await this.native.resolveOwner(session);
+            this.store.set("outbound-owner:" + row.task_id, owner);
+          }
+          payload = await this.rpc((client) => readSandboxFile((op) => op(client), sandboxPath), owner);
         } catch (error) {
+          if (!(error instanceof Error) || !/^(media_too_large|outbound_file_(not_allowed|not_found|empty)|rpc_http_404)$/.test(error.message)) {
+            const at = Date.now();
+            this.store.set("outbound-error:" + row.id, { code: failureCode(error), at, retry_after: at + 15000 });
+            break;
+          }
           const reason = error instanceof Error && error.message === "media_too_large"
             ? `附件 ${sandboxPath.split("/").pop()} 超过 CF 托管 6MB 单文件上限，已保留在沙箱：/home/hatch/${sandboxPath}`
             : `附件 ${sandboxPath.split("/").pop()} 暂时无法读取（/home/hatch/${sandboxPath}）`;
