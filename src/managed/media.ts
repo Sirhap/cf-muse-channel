@@ -124,17 +124,18 @@ export function extractOutboundFiles(text: string): { text: string; files: strin
   return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(), files };
 }
 
-/** Muse may publish an image as a separate history event with no assistant text. */
-export function presentationImages(payload: Record<string, unknown>): string[] {
-  if (payload.kind !== "image" || (payload.role && payload.role !== "assistant")) return [];
-  const images = object(payload.data).images;
-  if (!Array.isArray(images)) return [];
+/** Muse can publish images and videos independently of the assistant text. */
+export function presentationMedia(payload: Record<string, unknown>): string[] {
+  const kind = payload.kind;
+  if ((kind !== "image" && kind !== "video") || (payload.role && payload.role !== "assistant")) return [];
+  const resources = object(payload.data)[kind === "image" ? "images" : "videos"];
+  if (!Array.isArray(resources)) return [];
   const paths = new Set<string>();
-  for (const image of images) {
-    const resource = object(image);
+  for (const entry of resources) {
+    const resource = object(entry);
     if (resource.missing === true) continue;
     const path = normalizeAllowedSandboxPath(string(resource.path));
-    if (path && mediaCategoryForPath(path) === "image") paths.add(path);
+    if (path && mediaCategoryForPath(path) === kind) paths.add(path);
     if (paths.size === 6) break;
   }
   return [...paths];
@@ -296,8 +297,8 @@ export async function uploadWecomMedia(
   sendFrame: (frame: Record<string, unknown>) => Promise<Record<string, unknown>>,
   bytes: Uint8Array,
   fileName: string,
+  msgType = mediaCategoryForPath(fileName),
 ): Promise<{ mediaId: string; msgType: "image" | "video" | "file" }> {
-  const msgType = mediaCategoryForPath(fileName);
   const totalChunks = Math.max(1, Math.ceil(bytes.length / WECOM_UPLOAD_CHUNK));
   const initResp = await sendFrame({
     cmd: "aibot_upload_media_init",

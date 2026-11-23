@@ -1,4 +1,4 @@
-import { bytesToBase64, downloadAndDecryptInbound, extractOutboundFiles, imageMimeForExtension, MAX_INLINE_IMAGE_BYTES, presentationImages, writeSandboxFile } from "./media";
+import { bytesToBase64, downloadAndDecryptInbound, extractOutboundFiles, imageMimeForExtension, MAX_INLINE_IMAGE_BYTES, presentationMedia, writeSandboxFile } from "./media";
 import { MuseOwnerUnavailable, type OwnedRpc, type MuseOwner } from "./muse-owner";
 import { failureCode, object, string, type Incoming } from "./protocol";
 import { channelReply } from "./reply";
@@ -336,7 +336,7 @@ export class NativeConversations {
         for (const [identity, event] of outputs) {
           if (event.event_name === "delta.presentation") {
             const payload = object(event.payload);
-            const files = presentationImages(payload);
+            const files = presentationMedia(payload);
             if (files.length && this.queueOutput(binding, owner, identity, event, "", files)) produced = true;
           } else if (this.acceptAssistant(binding, owner, identity, event)) produced = true;
         }

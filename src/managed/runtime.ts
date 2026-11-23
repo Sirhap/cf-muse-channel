@@ -189,7 +189,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261123-native-images",
+        runtime_version: "managed-20261124-native-media",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -213,7 +213,8 @@ export class ManagedChannels extends DurableObject<Env> {
         deliveries: this.ctx.storage.sql.exec<{ id: number; task_id: number; state: string }>(
           "SELECT id,task_id,state FROM outbound ORDER BY id DESC LIMIT 10").toArray()
           .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id),
-            media_sent: this.store.get<number>("outbound-media-sent:" + row.id) ?? 0 })),
+            media_sent: this.store.get<number>("outbound-media-sent:" + row.id) ?? 0,
+            media_sent_as_file: this.store.get<number>("outbound-media-fallback:" + row.id) ?? 0 })),
         native_sessions: this.ctx.storage.sql.exec(`SELECT COUNT(*) count,COALESCE(SUM(awaiting),0) active,
           COALESCE(SUM(muse_account IS NULL),0) owner_unresolved,COALESCE(SUM(history_more),0) history_backlog,
           (SELECT COUNT(*) FROM native_pending_assistant) pending_assistant FROM native_sessions`).one(),
@@ -794,7 +795,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }, (event) => {
       const record = object(event), payload = object(record.payload);
       if (payload.session_id !== session) return;
-      // 唤醒已完成的回复及独立返回的图片。
+      // 唤醒已完成的回复及独立返回的媒体。
       if (["delta.message_done", "delta.presentation", "sessions.updated", "message.assistant"].includes(string(record.event))) {
         const diagnostic = this.store.get<Diagnostic>("diagnostic");
         if (diagnostic?.session === session) this.store.set("diagnostic", { ...diagnostic, event_received: true });
@@ -975,6 +976,15 @@ export class ManagedChannels extends DurableObject<Env> {
     return created;
   }
 
+  private async sendWecomMedia(route: Incoming, reqId: string, media: { msgType: string; mediaId: string }) {
+    assertPlatformSuccess(await this.frame({
+      cmd: "aibot_send_msg",
+      headers: { req_id: reqId },
+      body: { chatid: route.chat, chat_type: route.group ? 2 : 1,
+        msgtype: media.msgType, [media.msgType]: { media_id: media.mediaId } },
+    }));
+  }
+
   private async deliver() {
     let fallbackCreated = false;
     const rows = this.ctx.storage.sql.exec<Outbound>(`SELECT o.* FROM outbound o LEFT JOIN metadata m ON m.key='outbound-error:' || o.id
@@ -1075,6 +1085,7 @@ export class ManagedChannels extends DurableObject<Env> {
         }
 
         this.ctx.storage.sql.exec("UPDATE outbound SET state='sending' WHERE id=?", row.id);
+        let sentAsFile = false;
         try {
           if (route.channel === "weixin") {
             await weixinCall("sendmessage", config, {
@@ -1084,21 +1095,25 @@ export class ManagedChannels extends DurableObject<Env> {
               base_info: { channel_version: "2.4.9", bot_agent: "Muse/1.0" },
             });
           } else {
-            assertPlatformSuccess(await this.frame({
-              cmd: "aibot_send_msg",
-              headers: { req_id: "cf-" + identity + "-f" + f },
-              body: {
-                chatid: route.chat,
-                chat_type: route.group ? 2 : 1,
-                msgtype: wcMedia!.msgType,
-                [wcMedia!.msgType]: { media_id: wcMedia!.mediaId },
-              },
-            }));
+            const reqId = "cf-" + identity + "-f" + f;
+            try {
+              await this.sendWecomMedia(route, reqId, wcMedia!);
+            } catch (error) {
+              // An explicit negative receipt permits one file fallback. An uncertain send must never be replayed.
+              if (wcMedia!.msgType === "file" || failureCode(error) !== "platform_rejected_846697") throw error;
+              const file = await uploadWecomMedia((frame) => this.frame(frame), payload.bytes, payload.fileName, "file");
+              await this.sendWecomMedia(route, reqId + "-file", file);
+              sentAsFile = true;
+            }
           }
           this.ctx.storage.transactionSync(() => {
             this.store.set("outbound-file-part:" + row.id, f + 1);
             const receiptKey = "outbound-media-sent:" + row.id;
             this.store.set(receiptKey, (this.store.get<number>(receiptKey) ?? 0) + 1);
+            if (sentAsFile) {
+              const fallbackKey = "outbound-media-fallback:" + row.id;
+              this.store.set(fallbackKey, (this.store.get<number>(fallbackKey) ?? 0) + 1);
+            }
             this.ctx.storage.sql.exec("UPDATE outbound SET state=? WHERE id=?", f + 1 === files.length ? "delivered" : "pending", row.id);
           });
         } catch (error) {

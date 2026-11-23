@@ -124,6 +124,27 @@ it("keeps the last committed page across a transport failure and accepts gaps an
   });
 });
 
+it("queues the separate Muse MP4 presentation for the original WeCom conversation", async () => {
+  await runInDurableObject(env.MOBILE.getByName("history-pages-wecom-video"), async (_, state) => {
+    const f = fixture(state);
+    const native = f.newNative();
+    await native.forward(f.input());
+    const binding = native.sessions()[0];
+    const file = "workspace/imagine_media/gold-price.mp4";
+    f.history([assistant(9), {
+      seq: 10, event_name: "delta.presentation", message_id: "native-video-event",
+      payload: { id: "video-card", kind: "video", role: "assistant",
+        data: { videos: [{ path: "sandbox://" + file, mime: "video/mp4", byte_len: 2903019 }] } },
+    }]);
+    await native.collect(binding);
+    await f.newNative().collect(binding);
+    const rows = f.store.sql.exec<{ task_id: number; text: string; route: string }>("SELECT task_id,text,route FROM outbound ORDER BY id").toArray();
+    expect(rows.map(row => row.text)).toEqual(["output 9", ""]);
+    expect(f.store.get("outbound-files:" + rows[1].task_id)).toEqual([file]);
+    expect(JSON.parse(rows[1].route)).toMatchObject({ channel: "wecom", chat: "alice" });
+  });
+});
+
 it("finds final replies updated in place or emitted at a newer sequence after the cursor passed them", async () => {
   await runInDurableObject(env.MOBILE.getByName("history-pages-immature"), async (_, state) => {
     const f = fixture(state);

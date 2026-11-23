@@ -157,6 +157,60 @@ describe("微信/企微入站媒体与语音转文字解析 + 沙箱写入", () 
 });
 
 describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜底", () => {
+  it.each([true, false])("reuploads a WeCom image as a file only after explicit rejection (rejected=%s)", async (rejected) => {
+    await runInDurableObject(env.MOBILE.getByName("outbound-wecom-media-" + rejected), async (_instance, state) => {
+      const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
+      const store = new ManagedStore(state.storage.sql);
+      state.storage.sql.exec("INSERT INTO config VALUES ('wecom',?)", JSON.stringify({
+        enabled: true, account: "wc-bot", secret: "wc-sec", allowedSenders: ["alice"],
+      }));
+      const task = store.ingest({ id: "native:s1:presentation:card", channel: "wecom", account: "wc-bot",
+        chat: "alice", sender: "alice", group: false, text: "", context: "" })!;
+      store.complete(task, "");
+      store.setOutboundFiles(task.id, ["workspace/gold.webp"], { account: "primary-account", vm: "fixture-vm" });
+      const bytes = new TextEncoder().encode("RIFF1234WEBP");
+      const internal = runtime as unknown as {
+        rpc: <T>(op: (c: MuseRpc) => Promise<T>) => Promise<T>;
+        ensureWecom: () => Promise<void>;
+        deliver: () => Promise<void>;
+        frame: (value: Record<string, unknown>) => Promise<Record<string, unknown>>;
+      };
+      const calls: string[] = [];
+      let uploaded = "";
+      vi.spyOn(internal, "ensureWecom").mockResolvedValue();
+      vi.spyOn(internal, "rpc").mockImplementation(async (op) => op({
+        call: async () => ({ kind: "file", size: bytes.length }),
+        raw: async () => ({ status: 206, body: bytes }),
+      } as unknown as MuseRpc));
+      vi.spyOn(internal, "frame").mockImplementation(async (frame) => {
+        const body = frame.body as Record<string, unknown>;
+        if (frame.cmd === "aibot_upload_media_init") {
+          uploaded = String(body.type);
+          calls.push("upload:" + uploaded);
+          return { errcode: 0, body: { upload_id: "upload-" + uploaded } };
+        }
+        if (frame.cmd === "aibot_upload_media_finish") return { errcode: 0, body: { media_id: "media-" + uploaded } };
+        if (frame.cmd === "aibot_upload_media_chunk") return { errcode: 0 };
+        const kind = String(body.msgtype);
+        calls.push("send:" + kind);
+        expect(body).toMatchObject({ chatid: "alice", [kind]: { media_id: "media-" + kind } });
+        if (kind === "image") {
+          if (rejected) return { errcode: 846697 };
+          throw new Error("platform_response_unknown");
+        }
+        return { errcode: 0 };
+      });
+
+      await internal.deliver();
+      expect(calls).toEqual(rejected ? ["upload:image", "send:image", "upload:file", "send:file"] : ["upload:image", "send:image"]);
+      const response = await runtime.fetch(new Request("https://internal/admin/managed/status"));
+      expect(await response.json()).toMatchObject({
+        deliveries: [{ state: rejected ? "delivered" : "unknown", media_sent: rejected ? 1 : 0, media_sent_as_file: rejected ? 1 : 0 }],
+      });
+      await state.storage.deleteAlarm();
+    });
+  });
+
   it("支持 Muse 回复 [[FILE:...]] 拉取沙箱图片并经微信 getuploadurl + CDN 加密上传送达", async () => {
     await runInDurableObject(env.MOBILE.getByName("outbound-weixin-media"), async (_instance, state) => {
       const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });

@@ -4,7 +4,7 @@
 
 转发前清理独占一行的 `[[hatch_widget:…]]` 交互组件标记，保留正文、普通方括号和行内示例。只有组件、没有正文时给出渠道不支持显示的说明。
 
-本版支持文字收发、图片/常规文件/6MB 内小视频双向传输（微信 AES-128-ECB / 企微 AES-256-CBC 与分片上传，入站写入 Muse 沙箱 `workspace/cf-inbound-media/`，出站识别 Muse 独立返回的图片、`[[FILE:...]]` 与 `outbox.jsonl` 的 `send_file`）、微信与企微语音转文字、发送者白名单、私聊会话隔离、企微群聊隔离、非白名单审批与 Cookie 401 失效去重告警、微信主动推送缺失/拒收自动企微兜底、定时任务主动推送接口（`POST /managed/push` / `POST /admin/managed/push`）和 `/ping`、`/help`、`/status`、`/queue`、`/new`、`/stop`。微信群消息不接收；超大附件（>6MB）保留在沙箱并给出路径提示。
+本版支持文字收发、图片/常规文件/6MB 内小视频双向传输（微信 AES-128-ECB / 企微 AES-256-CBC 与分片上传，入站写入 Muse 沙箱 `workspace/cf-inbound-media/`，出站识别 Muse 独立返回的图片或视频、`[[FILE:...]]` 与 `outbox.jsonl` 的 `send_file`）、微信与企微语音转文字、发送者白名单、私聊会话隔离、企微群聊隔离、非白名单审批与 Cookie 401 失效去重告警、微信主动推送缺失/拒收自动企微兜底、定时任务主动推送接口（`POST /managed/push` / `POST /admin/managed/push`）和 `/ping`、`/help`、`/status`、`/queue`、`/new`、`/stop`。微信群消息不接收；超大附件（>6MB）保留在沙箱并给出路径提示。 企微明确以 `846697` 拒收原生图片或视频消息时，会把原件作为普通附件另发一次。
 
 ## 定时任务主动推送
 
