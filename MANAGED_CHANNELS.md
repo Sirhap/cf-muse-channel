@@ -8,6 +8,8 @@
 
 ## 定时任务主动推送
 
+这里的发件箱是 Muse 虚机里的本地 `outbox.jsonl` 文件。脚本把待发给微信或企微的消息追加到文件，渠道 Worker 从上次保存的位置读取新增内容。使用这条链路无需开启邮箱或配置邮件连接器。
+
 切换 CF 托管后原虚机 `weixin-bot` / `wecom-bot` 已停用，`ManagedChannels` 通过以下两种方式支持定时任务推送：
 
 1. **零改虚机自动追踪（默认开启）**：在每轮 alarm 中通过既有 Noise 连接调用轻量 `POST /fs/stats` 检查已启用渠道的 `workspace/<channel>-bot/state/outbox.jsonl` 字节大小。首次仅记录末尾高水位（不重放历史旧行）；仅当文件增长时才用 `HTTP Range: bytes=<offset>-` 拉取新增片段，过滤 `mode="send"` 且符合白名单的新行，与新偏移量在同一 SQLite 事务提交后推送。

@@ -219,14 +219,22 @@ export function assertPlatformSuccess(result: Record<string, unknown>) {
   }
 }
 export const WEIXIN_ORIGIN = "https://ilinkai.weixin.qq.com";
-export async function weixinCall(path: string, config: ChannelConfig, body: unknown, timeout = 15000) {
+export async function weixinCall(path: string, config: ChannelConfig, body: unknown, timeout = 15000, signal?: AbortSignal) {
   const uin = crypto.getRandomValues(new Uint32Array(1))[0].toString();
-  const result = await boundedJson(await fetch(WEIXIN_ORIGIN + "/ilink/bot/" + path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: "Bearer " + config.secret,
-      AuthorizationType: "ilink_bot_token", "X-WECHAT-UIN": btoa(uin), "iLink-App-Id": "bot", "iLink-App-ClientVersion": "132105" },
-    body: JSON.stringify(body), redirect: "manual", signal: AbortSignal.timeout(timeout),
-  }));
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new DOMException("iLink request timed out", "TimeoutError")), timeout);
+  let result: Record<string, unknown>;
+  try {
+    result = await boundedJson(await fetch(WEIXIN_ORIGIN + "/ilink/bot/" + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + config.secret,
+        AuthorizationType: "ilink_bot_token", "X-WECHAT-UIN": btoa(uin), "iLink-App-Id": "bot", "iLink-App-ClientVersion": "132105" },
+      body: JSON.stringify(body), redirect: "manual",
+      signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal,
+    }));
+  } finally {
+    clearTimeout(timer);
+  }
   // iLink empty long-poll replies may omit ret/errcode. They still need a valid
   // updates shape. Successful sends can omit zero and return only message_id.
   const implicitSuccess = result.ret === undefined && result.errcode === undefined

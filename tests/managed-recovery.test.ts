@@ -65,6 +65,71 @@ it("constructs Tencent requests in the actual Workers runtime and never follows 
   } finally { vi.unstubAllGlobals(); }
 });
 
+it("clears the iLink deadline after reading the response and retains the deadline for a stalled call", async () => {
+  const { weixinCall } = await import("../src/managed/protocol");
+  const config = { enabled: false, account: "test", secret: "synthetic", allowedSenders: ["alice"] };
+  const signals: AbortSignal[] = [];
+  let stall = false;
+  vi.useFakeTimers();
+  vi.stubGlobal("fetch", vi.fn((_input: RequestInfo, init: RequestInit) => {
+    const signal = init.signal!;
+    signals.push(signal);
+    return stall ? new Promise<Response>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }) : Promise.resolve(Response.json({ msgs: [] }));
+  }));
+  try {
+    await expect(weixinCall("getupdates", config, {}, 50)).resolves.toEqual({ msgs: [] });
+    stall = true;
+    const pending = expect(weixinCall("getupdates", config, {}, 50)).rejects.toMatchObject({ name: "TimeoutError" });
+    await vi.advanceTimersByTimeAsync(50);
+    await pending;
+    expect(signals.map((signal) => signal.aborted)).toEqual([false, true]);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  }
+});
+
+it("starts WeChat reception while the WeCom connection is pending and aborts its poll when paused", async () => {
+  await runInDurableObject(env.MOBILE.getByName("managed-weixin-poll-pause"), async (_instance, state) => {
+    const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
+    const config = JSON.stringify({ enabled: true, account: "test-account", secret: "synthetic", allowedSenders: ["alice"] });
+    state.storage.sql.exec("INSERT INTO config VALUES ('weixin',?), ('wecom',?)", config, config);
+    const started = Promise.withResolvers<AbortSignal>();
+    const wecom = Promise.withResolvers<void>();
+    const harness = runtime as unknown as { pump(): Promise<void>; ensureWecom(): Promise<void> };
+    vi.spyOn(harness, "pump").mockResolvedValue(undefined);
+    const connect = vi.spyOn(harness, "ensureWecom").mockReturnValue(wecom.promise);
+    vi.stubGlobal("fetch", vi.fn((_input: RequestInfo, init: RequestInit) => {
+      const signal = init.signal!;
+      started.resolve(signal);
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }));
+    const alarm = runtime.alarm();
+    try {
+      const signal = await started.promise;
+      expect(connect).toHaveBeenCalledOnce();
+      expect(signal.aborted).toBe(false);
+      const paused = await runtime.fetch(new Request("https://internal/admin/managed/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: "weixin", enabled: false }),
+      }));
+      expect(paused.status).toBe(200);
+      expect(signal.aborted).toBe(true);
+    } finally {
+      wecom.reject(new Error("synthetic WeCom outage"));
+      await alarm;
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+});
+
 it("preflights WeCom with a real Workers Request without subscribing to or taking over the existing bot", async () => {
   await runInDurableObject(env.MOBILE.getByName("managed-preflight"), async (instance, state) => {
     let server: WebSocket | undefined;

@@ -44,6 +44,7 @@ export class ManagedChannels extends DurableObject<Env> {
   private eventRevision = 0;
   private pumping?: Promise<void>;
   private polling?: Promise<void>;
+  private weixinPollAbort?: AbortController;
   private health: Record<Channel, Health> = {
     weixin: { connected: false, last_ok: null, error: null },
     wecom: { connected: false, last_ok: null, error: null },
@@ -219,6 +220,7 @@ export class ManagedChannels extends DurableObject<Env> {
         const updated: ChannelConfig = { ...existing, enabled: body.enabled };
         this.ctx.storage.sql.exec("INSERT INTO config VALUES (?,?) ON CONFLICT(channel) DO UPDATE SET value=excluded.value", channel, JSON.stringify(updated));
         if (channel === "wecom" && !body.enabled) this.closeWecom();
+        if (channel === "weixin" && !body.enabled) this.weixinPollAbort?.abort();
         await this.ctx.storage.setAlarm(Date.now() + 100);
         if (body.enabled) this.ctx.waitUntil(this.pump());
         return json({ ok: true, channel, enabled: body.enabled });
@@ -283,6 +285,7 @@ export class ManagedChannels extends DurableObject<Env> {
         delete data.initialCursor;
         this.ctx.storage.sql.exec("INSERT INTO config VALUES (?,?) ON CONFLICT(channel) DO UPDATE SET value=excluded.value", channel, JSON.stringify(data));
         if (channel === "wecom") this.closeWecom();
+        if (channel === "weixin" && (replacing || !data.enabled)) this.weixinPollAbort?.abort();
         await this.ctx.storage.setAlarm(Date.now() + 100);
         return json({ ok: true, enabled: data.enabled });
       } catch { return json({ error: "invalid_channel_configuration" }, 400); }
@@ -530,6 +533,18 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     // Schedule before I/O so an interrupted invocation has a durable recovery trigger.
     await this.ctx.storage.setAlarm(Date.now() + 30000);
+    // Start the WeChat long poll before any WeCom handshake or heartbeat can block it.
+    if (weixin?.enabled) {
+      if (!this.polling) {
+        const controller = new AbortController();
+        this.weixinPollAbort = controller;
+        this.polling = this.pollWeixin(weixin, controller.signal).finally(() => {
+          this.polling = undefined;
+          this.weixinPollAbort = undefined;
+        });
+      }
+      this.ctx.waitUntil(this.polling);
+    }
     if (wecom?.enabled && (!this.wecomReady || this.wecom?.readyState !== WebSocket.OPEN || Date.now() - this.lastWecomPing >= 25_000)) {
       try {
         await this.ensureWecom(wecom);
@@ -537,10 +552,6 @@ export class ManagedChannels extends DurableObject<Env> {
         this.lastWecomPing = Date.now();
         this.healthResult("wecom");
       } catch (error) { this.healthResult("wecom", failureCode(error)); this.closeWecom(); }
-    }
-    if (weixin?.enabled) {
-      this.polling ??= this.pollWeixin(weixin).finally(() => { this.polling = undefined; });
-      this.ctx.waitUntil(this.polling);
     }
     await this.pump(true);
     if (this.active()) await this.ctx.storage.setAlarm(Date.now() + 15000);
@@ -553,18 +564,18 @@ export class ManagedChannels extends DurableObject<Env> {
       || this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) count FROM native_sessions WHERE awaiting=1").one().count > 0;
   }
 
-  private async pollWeixin(config: ChannelConfig) {
+  private async pollWeixin(config: ChannelConfig, signal: AbortSignal) {
     const deadline = Date.now() + 120000;
     let failed = false;
-    while (Date.now() < deadline && this.config("weixin")?.enabled) {
+    while (!signal.aborted && Date.now() < deadline && this.config("weixin")?.enabled) {
       try {
         const started = Date.now();
         const data = await weixinCall("getupdates", config, {
           get_updates_buf: this.store.get<string>("weixin_cursor") ?? "", base_info: { channel_version: "2.4.9", bot_agent: "Muse/1.0" },
-        }, 45000);
+        }, 45000, signal);
         const messages = weixinMessages(data, config);
         const current = this.config("weixin");
-        if (!current?.enabled || current.account !== config.account || current.secret !== config.secret) return;
+        if (signal.aborted || !current?.enabled || current.account !== config.account || current.secret !== config.secret) return;
         // No await between ingest and cursor commit. Both share one synchronous SQLite transaction.
         this.ctx.storage.transactionSync(() => {
           for (const message of messages) this.ingest(message);
@@ -575,6 +586,7 @@ export class ManagedChannels extends DurableObject<Env> {
         // An unexpectedly immediate empty response must not create a busy poll loop.
         if (!messages.length && Date.now() - started < 500) await new Promise((resolve) => setTimeout(resolve, 500));
       } catch (error) {
+        if (signal.aborted) return;
         if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) continue;
         this.healthResult("weixin", failureCode(error));
         failed = true;
@@ -583,7 +595,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     // 消除 120 秒长轮询退出到下一次 30 秒 alarm 之间的微信收消息空窗期。
     const still = this.config("weixin");
-    if (still?.enabled && still.account === config.account && still.secret === config.secret) {
+    if (!signal.aborted && still?.enabled && still.account === config.account && still.secret === config.secret) {
       const target = Date.now() + (failed ? 3000 : 50);
       const scheduled = await this.ctx.storage.getAlarm();
       if (scheduled === null || scheduled > target) await this.ctx.storage.setAlarm(target);
