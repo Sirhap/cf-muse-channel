@@ -1,4 +1,4 @@
-import { bytesToBase64, downloadAndDecryptInbound, extractOutboundFiles, imageMimeForExtension, MAX_INLINE_IMAGE_BYTES, writeSandboxFile } from "./media";
+import { bytesToBase64, downloadAndDecryptInbound, extractOutboundFiles, imageMimeForExtension, MAX_INLINE_IMAGE_BYTES, presentationImages, writeSandboxFile } from "./media";
 import { MuseOwnerUnavailable, type OwnedRpc, type MuseOwner } from "./muse-owner";
 import { failureCode, object, string, type Incoming } from "./protocol";
 import { channelReply } from "./reply";
@@ -318,18 +318,27 @@ export class NativeConversations {
     for (let index = 0; index < MAX_HISTORY_PAGES; index++) {
       const { events, more } = await this.historyPage(binding.session, owner, after);
       const through = events.at(-1)?.seq ?? after;
-      const assistant = new Map<string, HistoryEvent>();
+      const outputs = new Map<string, HistoryEvent>();
       for (const event of events) {
-        if (event.event_name !== "message.assistant") continue;
-        const identity = this.assistantIdentity(event);
-        if (!identity) throw new Error("assistant_identity_unavailable");
-        assistant.set(identity, event);
+        if (event.event_name === "message.assistant") {
+          const identity = this.assistantIdentity(event);
+          if (!identity) throw new Error("assistant_identity_unavailable");
+          outputs.set(identity, event);
+        } else if (event.event_name === "delta.presentation") {
+          const presentation = object(event.payload);
+          const identity = string(presentation.id) || this.assistantIdentity(event) || String(event.seq);
+          outputs.set("presentation:" + identity, event);
+        }
       }
 
       this.commit(() => {
         if (through > after) this.confirmInputs(events, this.receiptInputs(binding.session), after, through);
-        for (const [identity, event] of assistant) {
-          if (this.acceptAssistant(binding, owner, identity, event)) produced = true;
+        for (const [identity, event] of outputs) {
+          if (event.event_name === "delta.presentation") {
+            const payload = object(event.payload);
+            const files = presentationImages(payload);
+            if (files.length && this.queueOutput(binding, owner, identity, event, "", files)) produced = true;
+          } else if (this.acceptAssistant(binding, owner, identity, event)) produced = true;
         }
         this.store.sql.exec("UPDATE native_sessions SET cursor=?,history_more=?,last_checked=? WHERE session=?",
           through, Number(more), Date.now(), binding.session);
@@ -360,12 +369,18 @@ export class NativeConversations {
     this.store.sql.exec("DELETE FROM native_pending_assistant WHERE session=? AND message=?", binding.session, identity);
     const text = string(payload.display_text) || string(payload.content);
     if (!text) return false;
+    const { text: reply, files } = extractOutboundFiles(text);
+    return this.queueOutput(binding, owner, identity, event, reply ? channelReply(reply) : (files.length ? "" : channelReply(text)), files);
+  }
+
+  private queueOutput(binding: NativeSession, owner: MuseOwner, identity: string, event: HistoryEvent, reply: string, files: string[]) {
+    const payload = object(event.payload);
     const rows = this.store.sql.exec<Task>(`INSERT OR IGNORE INTO tasks(message_id,route,conversation,generation,text,state,session,baseline,created_at)
-      VALUES (?,?,?,?,?,'queued',?,?,?) RETURNING *`, id, binding.route, binding.conversation, binding.generation, text, binding.session, event.seq, Date.now()).toArray();
+      VALUES (?,?,?,?,?,'queued',?,?,?) RETURNING *`, "native:" + binding.session + ":" + identity, binding.route, binding.conversation,
+      binding.generation, string(payload.display_text) || string(payload.content), binding.session, event.seq, Date.now()).toArray();
     const [task] = rows;
     if (!task) return false;
-    const { text: reply, files } = extractOutboundFiles(text);
-    this.store.complete(task, reply ? channelReply(reply) : (files.length ? "" : channelReply(text)));
+    this.store.complete(task, reply);
     if (files.length) this.store.setOutboundFiles(task.id, files, owner);
     this.store.set("native-output:" + task.id, { message_id: identity,
       muse_completed_at: typeof payload.display_text_updated_at_ms === "number" ? payload.display_text_updated_at_ms : null,

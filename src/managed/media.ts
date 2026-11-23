@@ -1,6 +1,6 @@
 import type { MuseRpc } from "../noise";
 import { aes128EcbDecrypt, aes128EcbEncrypt, aes256CbcDecrypt, base64ToBytes, bytesToBase64, bytesToHex, hexToBytes, md5Hex } from "./crypto";
-import { string, weixinCall, type ChannelConfig } from "./protocol";
+import { object, string, weixinCall, type ChannelConfig } from "./protocol";
 
 export { aes128EcbDecrypt, aes128EcbEncrypt, aes256CbcDecrypt, base64ToBytes, bytesToBase64, bytesToHex, hexToBytes, md5Hex };
 
@@ -122,6 +122,22 @@ export function extractOutboundFiles(text: string): { text: string; files: strin
     kept.push(line);
   }
   return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(), files };
+}
+
+/** Muse may publish an image as a separate history event with no assistant text. */
+export function presentationImages(payload: Record<string, unknown>): string[] {
+  if (payload.kind !== "image" || (payload.role && payload.role !== "assistant")) return [];
+  const images = object(payload.data).images;
+  if (!Array.isArray(images)) return [];
+  const paths = new Set<string>();
+  for (const image of images) {
+    const resource = object(image);
+    if (resource.missing === true) continue;
+    const path = normalizeAllowedSandboxPath(string(resource.path));
+    if (path && mediaCategoryForPath(path) === "image") paths.add(path);
+    if (paths.size === 6) break;
+  }
+  return [...paths];
 }
 
 /** 有界下载腾讯媒体密文（绝不跟随跨站重定向，超限立即中断）。 */

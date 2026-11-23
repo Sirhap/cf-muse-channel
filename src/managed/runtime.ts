@@ -189,7 +189,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261123-history-pagination",
+        runtime_version: "managed-20261123-native-images",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -793,8 +793,8 @@ export class ManagedChannels extends DurableObject<Env> {
     }, (event) => {
       const record = object(event), payload = object(record.payload);
       if (payload.session_id !== session) return;
-      // 忽略 delta.message_start（此时回复尚未完成），仅在可能产生完成文本的事件时唤醒精准会话。
-      if (["delta.message_done", "sessions.updated", "message.assistant"].includes(string(record.event))) {
+      // 唤醒已完成的回复及独立返回的图片。
+      if (["delta.message_done", "delta.presentation", "sessions.updated", "message.assistant"].includes(string(record.event))) {
         const diagnostic = this.store.get<Diagnostic>("diagnostic");
         if (diagnostic?.session === session) this.store.set("diagnostic", { ...diagnostic, event_received: true });
         this.dirtySessions.add(session);

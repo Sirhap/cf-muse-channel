@@ -29,8 +29,8 @@ function fixture(state: DurableObjectState) {
     op => state.storage.transactionSync(op), vi.fn(), async () => ["primary-account"]);
   const row = () => store.sql.exec<{ count: number; earliest: number }>(
     "SELECT COUNT(*) count, MIN(baseline) earliest FROM tasks WHERE message_id LIKE 'native:%'").one();
-  const input = () => store.ingest({
-    id: "input", text: "input", channel: "wecom", account: "bot", chat: "alice", sender: "alice", group: false, context: "",
+  const input = (channel: "weixin" | "wecom" = "wecom") => store.ingest({
+    id: "input", text: "input", channel, account: "bot", chat: "alice", sender: "alice", group: false, context: "fresh-context",
   })!;
   return { store, newNative, row, readPage, open: client.open, input, history: (events: Record<string, unknown>[]) => { history = events; } };
 }
@@ -54,6 +54,46 @@ it("recovers 501 replies over two turns and commits each reply once", async () =
     expect(restarted.session(first.session)).toMatchObject({ cursor: 511, history_more: 0 });
     await restarted.collect(restarted.sessions()[0]);
     expect(f.row().count).toBe(501);
+  });
+});
+
+it("queues a late Muse image for WeChat once and allows a later request to resend the same image", async () => {
+  await runInDurableObject(env.MOBILE.getByName("history-pages-weixin-presentation"), async (_, state) => {
+    const f = fixture(state);
+    const native = f.newNative();
+    await native.forward(f.input("weixin"));
+    const binding = native.sessions()[0];
+    const file = "workspace/imagine_media/gold-price.webp";
+    const presentation = (seq: number, id: string, role = "assistant") => ({
+      seq, event_name: "delta.presentation", message_id: "m" + seq,
+      payload: {
+        id, kind: "image", role,
+        data: { images: [
+          { path: "sandbox://" + file, mime: "image/webp", byte_len: 226614 },
+          { path: file },
+          { path: "sandbox://workspace/../credentials.env" },
+          { path: "sandbox://workspace/gone.webp", missing: true },
+          { path: "https://untrusted.example/media/raw/image.webp" },
+        ] },
+      },
+    });
+    f.history([assistant(10)]);
+    await native.collect(binding);
+    const restarted = f.newNative();
+    f.history([assistant(10), presentation(11, "a"), presentation(12, "a"), presentation(13, "b", "user"), assistant(14)]);
+    await restarted.collect(binding);
+    await restarted.collect(binding);
+    f.history([assistant(10), presentation(11, "a"), presentation(20, "intentional-resend")]);
+    await restarted.collect(binding);
+
+    const deliveries = f.store.sql.exec<{ task_id: number; text: string; route: string }>(
+      "SELECT task_id,text,route FROM outbound ORDER BY id").toArray();
+    expect(deliveries.map(row => row.text)).toEqual(["output 10", "", "output 14", ""]);
+    for (const row of deliveries.filter(row => !row.text)) {
+      expect(f.store.get("outbound-files:" + row.task_id)).toEqual([file]);
+      expect(f.store.get("outbound-owner:" + row.task_id)).toEqual({ account: "primary-account", vm: "vm-a" });
+      expect(JSON.parse(row.route)).toMatchObject({ channel: "weixin", context: "fresh-context" });
+    }
   });
 });
 
