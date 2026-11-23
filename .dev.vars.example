@@ -9,6 +9,7 @@ MUSE_COOKIE_PART_2=""
 MUSE_VM_ID=""
 
 AUTO_APPROVAL_ENABLED="false"
+AUTO_APPROVAL_EVENTS_ENABLED="false"
 AUTO_APPROVAL_POLICY_JSON=""
 
 # Optional: a separate management password (12–512 characters) to enable /admin.

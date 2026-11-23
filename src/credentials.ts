@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AdminInputError, readCookieInput } from "./admin-input";
 import { ADMIN_SESSION_SECONDS } from "./admin-session";
-import { parsePolicy, pollApprovals, type HeldApproval } from "./approval-policy";
+import { APPROVAL_EVENTS_HEADER, parsePolicy, pollApprovals, type HeldApproval } from "./approval-policy";
 import { inspectChannels, publishedChannelStates, unknownChannels, type ChannelHealthReport } from "./channel-health";
 import { json } from "./http";
 import { CookieController, type CredentialState, type CredentialStore } from "./muse";
@@ -9,6 +9,7 @@ import { CookieController, type CredentialState, type CredentialStore } from "./
 const PRIMARY_ACCOUNT_ID = "primary-account";
 const MAX_ACCOUNTS = 20;
 const COOLDOWN_MS = 60_000;
+const PRIMARY_APPROVAL_RECONCILE_MS = 300_000;
 
 export type PoolStrategy = "failover" | "round_robin" | "lru";
 
@@ -223,12 +224,20 @@ export class MuseCredentials extends DurableObject<Env> {
     if (enabledRows.length === 0) {
       return json({ ok: false, error: "no_enabled_accounts_in_pool" }, 503);
     }
+    const wantsApprovalEvents = path === "/ws" && new URL(request.url).hostname === "internal"
+      && request.headers.get(APPROVAL_EVENTS_HEADER) === "1" && this.approvalEventsEnabled();
+    const connected = (id: string, response: Response) => {
+      if (wantsApprovalEvents && id === PRIMARY_ACCOUNT_ID && response.status === 101) {
+        response.headers.set(APPROVAL_EVENTS_HEADER, "1");
+      }
+      return response;
+    };
     if (enabledRows.length === 1) {
       const only = enabledRows[0];
       const res = await this.dispatchAccount(only.id, request, path);
       const ok = res.status === 101 || res.ok;
       this.markPoolOutcome(only.id, ok);
-      return res;
+      return connected(only.id, res);
     }
 
     const now = Date.now();
@@ -272,7 +281,7 @@ export class MuseCredentials extends DurableObject<Env> {
         const res = await this.dispatchAccount(candidate.row.id, attemptReq, path);
         const ok = res.status === 101 || res.ok;
         this.markPoolOutcome(candidate.row.id, ok);
-        if (ok) return res;
+        if (ok) return connected(candidate.row.id, res);
         lastResponse = res;
       } catch {
         this.markPoolOutcome(candidate.row.id, false);
@@ -699,6 +708,7 @@ export class MuseCredentials extends DurableObject<Env> {
       enabled: this.env.AUTO_APPROVAL_ENABLED === "true",
       next_alarm_at: await this.ctx.storage.getAlarm(),
       last_event: latest,
+      primary_event: this.event<Record<string, unknown>>("primary_approval_event"),
       decisions: summary,
     };
   }
@@ -837,6 +847,34 @@ export class MuseCredentials extends DurableObject<Env> {
     return row?.count ?? 0;
   }
 
+  private approvalEventsEnabled(): boolean {
+    return this.env.AUTO_APPROVAL_ENABLED === "true" && this.env.AUTO_APPROVAL_EVENTS_ENABLED === "true"
+      && this.env.MANAGED_CHANNELS_ENABLED === "true";
+  }
+
+  private async primaryApprovalsUseEvents(): Promise<boolean> {
+    if (!this.approvalEventsEnabled() || !this.env.MOBILE) return false;
+    const checked = this.event<number>("primary_approval_checked");
+    if (checked === null || Date.now() - checked >= PRIMARY_APPROVAL_RECONCILE_MS) return false;
+    try {
+      return await this.env.MOBILE.getByName("channels").primaryApprovalSubscriptionReady();
+    } catch {
+      return false;
+    }
+  }
+
+  /** The subscription is a wake-up hint. The Sentinel list and policy remain authoritative. */
+  async checkApprovalEvent(): Promise<void> {
+    if (!this.approvalEventsEnabled() || this.isIsolated()) return;
+    this.ensurePrimaryAccountRow();
+    const primary = this.ctx.storage.sql.exec<{ label: string }>(
+      "SELECT label FROM muse_accounts WHERE id=? AND enabled=1", PRIMARY_ACCOUNT_ID,
+    ).toArray()[0];
+    if (!primary) return;
+    const result = await this.pollLocal("approval_event", primary.label);
+    if (!result.ok) throw new Error("approval_event_poll_failed");
+  }
+
   private async pollLocal(source = "manual", accountLabel?: string) {
     if (this.env.AUTO_APPROVAL_ENABLED !== "true") {
       return { ok: true, enabled: false, source, pending: 0, approved: 0, held: 0, unknown: 0, accepted_total: this.localAcceptedCount() };
@@ -844,6 +882,7 @@ export class MuseCredentials extends DurableObject<Env> {
     const started = Date.now();
     const heldItems: HeldApproval[] = [];
     const isolated = this.isIsolated();
+    const statusKey = source === "approval_event" ? "primary_approval_event" : "approval_poll";
     try {
       const rules = parsePolicy(this.env.AUTO_APPROVAL_POLICY_JSON);
       if (!rules.length) throw new Error("empty_approval_policy");
@@ -888,7 +927,10 @@ export class MuseCredentials extends DurableObject<Env> {
         ...result,
         accepted_total: this.localAcceptedCount(),
       };
-      this.record("approval_poll", status);
+      this.record(statusKey, status);
+      if (!isolated && this.approvalEventsEnabled()) {
+        this.record("primary_approval_checked", status.completed_at);
+      }
       return status;
     } catch {
       await this.checkCookieExpiryAlert(accountLabel);
@@ -901,7 +943,7 @@ export class MuseCredentials extends DurableObject<Env> {
         error: "approval_poll_failed",
         accepted_total: this.localAcceptedCount(),
       };
-      this.record("approval_poll", status);
+      this.record(statusKey, status);
       return status;
     }
   }
@@ -914,9 +956,15 @@ export class MuseCredentials extends DurableObject<Env> {
     const enabledAccounts = this.ctx.storage.sql.exec<AccountRow>(
       "SELECT id, label FROM muse_accounts WHERE enabled = 1 ORDER BY created_at ASC, id ASC",
     ).toArray();
+    const primaryViaEvents = source === "durable_object_alarm"
+      && enabledAccounts.some((row) => row.id === PRIMARY_ACCOUNT_ID)
+      && await this.primaryApprovalsUseEvents();
+    const accountsToPoll = primaryViaEvents
+      ? enabledAccounts.filter((row) => row.id !== PRIMARY_ACCOUNT_ID)
+      : enabledAccounts;
 
     // 仅存在主账号且已开启时，保持原有单账号返回结构与零额外 DO 请求
-    if (enabledAccounts.length === 1 && enabledAccounts[0].id === PRIMARY_ACCOUNT_ID) {
+    if (accountsToPoll.length === 1 && accountsToPoll[0].id === PRIMARY_ACCOUNT_ID) {
       const local = await this.pollLocal(source);
       const status = { ...local, accounts_polled: 1, accounts_ok: local.ok ? 1 : 0 };
       this.record("approval_poll", status);
@@ -924,7 +972,7 @@ export class MuseCredentials extends DurableObject<Env> {
     }
 
     const perAccount = await Promise.all(
-      enabledAccounts.map(async (row) => {
+      accountsToPoll.map(async (row) => {
         try {
           let payload: Record<string, unknown>;
           if (row.id === PRIMARY_ACCOUNT_ID) {
@@ -977,7 +1025,8 @@ export class MuseCredentials extends DurableObject<Env> {
       unknown: perAccount.reduce((sum, a) => sum + a.unknown, 0),
       accounts_polled: perAccount.length,
       accounts_ok: accountsOk,
-      total_accepted: perAccount.reduce((sum, a) => sum + a.accepted_total, 0),
+      total_accepted: perAccount.reduce((sum, a) => sum + a.accepted_total, primaryViaEvents ? this.localAcceptedCount() : 0),
+      ...(primaryViaEvents ? { primary_via_events: true } : {}),
       per_account: perAccount,
     };
     this.record("approval_poll", summary);

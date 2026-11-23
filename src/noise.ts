@@ -213,10 +213,12 @@ export class MuseRpc {
     if (ready) return Promise.resolve(ready);
     if (this.closedError) return Promise.reject(this.closedError);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { target.waiter = undefined; reject(new Error('noise_read_timeout')); }, timeout);
+      const timer = timeout > 0
+        ? setTimeout(() => { target.waiter = undefined; reject(new Error('noise_read_timeout')); }, timeout)
+        : undefined;
       target.waiter = {
-        resolve: (frame) => { clearTimeout(timer); resolve(frame); },
-        reject: (error) => { clearTimeout(timer); reject(error); },
+        resolve: (frame) => { if (timer !== undefined) clearTimeout(timer); resolve(frame); },
+        reject: (error) => { if (timer !== undefined) clearTimeout(timer); reject(error); },
       };
     });
   }
@@ -295,8 +297,8 @@ export class MuseRpc {
     return this.sendRequest(stream, path, service, method, body);
   }
 
-  /** 订阅服务端事件流；读取前先注册 stream 缓冲避免极速回包竞态。 */
-  async subscribe(path: string, body: unknown, onEvent: (event: unknown) => void) {
+  /** Register before sending. A zero idle timeout ties the stream to the socket lifetime. */
+  async subscribe(path: string, body: unknown, onEvent: (event: unknown) => void, idleTimeout = 120_000) {
     if (this.closedError) throw this.closedError;
     const stream = this.stream++;
     this.streams.set(stream, { queue: [] });
@@ -305,7 +307,7 @@ export class MuseRpc {
       let buffer = '';
       const decoder = new TextDecoder();
       for (;;) {
-        const frame = await this.readStream(stream, 120000);
+        const frame = await this.readStream(stream, idleTimeout);
         if (frame.has(5)) throw new Error('rpc_stream_reset');
         const response = frame.has(3) ? fields(getBytes(frame, 3)) : fields(getBytes(frame, 4));
         if (frame.has(3)) {

@@ -1,3 +1,5 @@
+export const APPROVAL_EVENTS_HEADER = "X-Muse-Approval-Events";
+
 export interface ApprovalRule { host: string; port: 443; methods: string[]; thread_ids?: string[] }
 export function parsePolicy(value: string | undefined): ApprovalRule[] {
   if (!value) return [];

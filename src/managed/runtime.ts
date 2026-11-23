@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { json } from "../http";
+import { APPROVAL_EVENTS_HEADER, unwrapRecord } from "../approval-policy";
 import { MuseRpc } from "../noise";
 import { ManagedStore, type Task, type Outbound } from "./store";
 import { NativeConversations } from "./native";
@@ -10,6 +11,11 @@ import { assertPlatformSuccess, boundedJson, failureCode, object, string, validC
 
 const IDLE_HISTORY_SCAN_MS = 60_000;
 interface Health { connected: boolean; last_ok: number | null; error: string | null; }
+interface ApprovalSubscription {
+  socket: MuseRpc;
+  ready: boolean;
+  pendingIds?: string;
+}
 interface Diagnostic {
   state: string;
   session: string | null;
@@ -24,6 +30,7 @@ export class ManagedChannels extends DurableObject<Env> {
   private outbox: OutboxRelay;
   private muse?: MuseRpc;
   private museConnecting?: Promise<MuseRpc>;
+  private approvalSubscription?: ApprovalSubscription;
   private wecom?: WebSocket;
   private wecomStarting?: Promise<void>;
   private wecomReady = false;
@@ -179,6 +186,7 @@ export class ManagedChannels extends DurableObject<Env> {
           .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id) })),
         native_sessions: this.ctx.storage.sql.exec("SELECT COUNT(*) count,SUM(awaiting) active FROM native_sessions").one(),
         outbox_offsets: { weixin: this.outbox.offset("weixin"), wecom: this.outbox.offset("wecom") },
+        primary_approval_subscription_ready: this.primaryApprovalSubscriptionReady(),
         scope: "text+media",
       });
     }
@@ -423,12 +431,54 @@ export class ManagedChannels extends DurableObject<Env> {
     return lastError;
   }
 
-  private async socket(): Promise<MuseRpc> {
+  private async socket(warm = false): Promise<MuseRpc> {
+    const headers = new Headers({ Upgrade: "websocket" });
+    if (warm) headers.set(APPROVAL_EVENTS_HEADER, "1");
     const response = await this.env.CREDENTIALS.getByName("primary-account").fetch(new Request("https://internal/ws", {
-      headers: { Upgrade: "websocket" },
+      headers,
     }));
     if (response.status !== 101 || !response.webSocket) throw new Error("muse_connect_failed");
-    return MuseRpc.connect(response.webSocket);
+    const client = await MuseRpc.connect(response.webSocket);
+    if (warm && response.headers.get(APPROVAL_EVENTS_HEADER) === "1") this.followApprovals(client);
+    return client;
+  }
+
+  /** Used by the credentials DO to decide whether to keep fast polling the primary account. */
+  primaryApprovalSubscriptionReady(): boolean {
+    const subscription = this.approvalSubscription;
+    return Boolean(subscription?.ready && subscription.socket === this.muse && subscription.socket.alive);
+  }
+
+  private followApprovals(client: MuseRpc) {
+    const subscription: ApprovalSubscription = { socket: client, ready: false };
+    this.approvalSubscription = subscription;
+    // This stream shares the warm socket. A quiet account may emit no events for hours.
+    this.ctx.waitUntil(client.subscribe("/chat/subscribe", {}, (event) => {
+      if (this.approvalSubscription !== subscription) return;
+      const record = object(event);
+      if (record.event !== "approvals.snapshot") return;
+      const pending = object(record.payload).pending_approvals;
+      const ids = Array.isArray(pending) ? pending.map((entry) => string(unwrapRecord(entry).approval_id)) : null;
+      if (!ids || ids.some((id) => !id)) {
+        subscription.ready = false;
+        subscription.pendingIds = undefined;
+        return;
+      }
+      subscription.ready = true;
+      const pendingIds = JSON.stringify([...new Set(ids)].sort());
+      if (subscription.pendingIds === pendingIds) return;
+      subscription.pendingIds = pendingIds;
+      if (!ids.length) return;
+      this.ctx.waitUntil(this.env.CREDENTIALS.getByName("primary-account").checkApprovalEvent().catch(() => {
+        // Resume fast polling if the event could not be reconciled.
+        if (this.approvalSubscription === subscription && subscription.pendingIds === pendingIds) {
+          subscription.ready = false;
+          subscription.pendingIds = undefined;
+        }
+      }));
+    }, 0).catch(() => {}).finally(() => {
+      if (this.approvalSubscription === subscription) this.approvalSubscription = undefined;
+    }));
   }
 
   /** 复用支持流级多路复用的热 MuseRpc 连接；发送前主动剔除空闲期间已断的死连接，避免误把未发出的消息标成 unknown。 */
@@ -439,7 +489,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     let client = this.muse;
     if (!client) {
-      this.museConnecting ??= this.socket().then((connected) => {
+      this.museConnecting ??= this.socket(true).then((connected) => {
         this.muse = connected;
         return connected;
       }).finally(() => { this.museConnecting = undefined; });

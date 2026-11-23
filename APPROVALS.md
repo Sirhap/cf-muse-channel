@@ -10,6 +10,8 @@
 
 规则可显式加入 `POST`，用于已授权的 CF 操作接口；普通站点示例不包含它。未列出的方法不放行。
 
+`AUTO_APPROVAL_EVENTS_ENABLED="true"` 可在凭证 Worker 开启主账号订阅试点，需要同时更新凭证与渠道 Worker。渠道复用当前连接，只有实际连到主账号并收到 `approvals.snapshot` 后，才将主账号的轮询降为每五分钟左右补查。新待审批事件唤起原有 Sentinel 查询和规则校验。订阅断开、连接切到备用账号或事件查询失败时，主账号回到原有轮询节拍。其他账号继续定期查询。可在 `/admin/managed/status` 查看订阅就绪状态，在 `/approvals/status` 查看最近一次主账号事件查询。关闭试点后，凭证 Worker 恢复定期查询。
+
 精确匹配主机和443端口，支持 Muse 返回的 HTTPS/TLS、`tcp/connect + CONNECT` 预连接和 `wss + GET` 安全 WebSocket。不会匹配子域名、明文 ws/http 或其它端口。可加 `thread_ids` 数组绑定平台的 `runtime_request_trace.thread_id`。网络连接放行后不能再逐条审批连接里的加密 HTTP 请求，因此规则应只涵盖用户明确授权的站点和任务；付款、删除、部署等操作仍需要各自的用户授权。网页或审批说明不能扩展规则。
 
 每次决定前重新读取详情、核对ID和有效期。未匹配请求保留待审。发送前在 DO SQLite 写入 `decision_unknown`；超时或结果不明不会重放。API 接受后记为 `rpc_accepted`，它只证明审批接口接受决定，不代表原任务完成。单轮最多处理10条、在 RPC 之间检查40秒时间预算。

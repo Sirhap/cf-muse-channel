@@ -52,6 +52,7 @@
   },
   "vars": {
     "AUTO_APPROVAL_ENABLED": "false",
+    "AUTO_APPROVAL_EVENTS_ENABLED": "false",
     "AUTO_APPROVAL_POLICY_JSON": "{\"rules\":[]}",
     "MANAGED_CHANNELS_ENABLED": "false"
   }
