@@ -12,6 +12,9 @@ import { channelReply } from "./reply";
 import { assertPlatformSuccess, boundedJson, failureCode, object, string, validConfig, wecomMessage, weixinCall, weixinMessages, type Channel, type ChannelConfig, type Incoming } from "./protocol";
 
 const IDLE_HISTORY_SCAN_MS = 60_000;
+const WECOM_UPLOAD_TRANSPORT_ERRORS = new Set([
+  "wecom_not_connected", "platform_connection_lost", "platform_response_unknown", "platform_send_unknown",
+]);
 interface Health { connected: boolean; last_ok: number | null; error: string | null; }
 interface ApprovalSubscription {
   socket: MuseRpc;
@@ -190,7 +193,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261124-recovery",
+        runtime_version: "managed-20261124-wecom-upload-retry",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -1094,7 +1097,8 @@ export class ManagedChannels extends DurableObject<Env> {
           } catch (error) {
             const at = Date.now();
             const code = failureCode(error);
-            if (sendAsFile) {
+            // Upload frames cannot create a chat message, even when their response is lost.
+            if (sendAsFile || (route.channel === "wecom" && WECOM_UPLOAD_TRANSPORT_ERRORS.has(code))) {
               this.store.set("outbound-error:" + row.id, { code, at, retry_after: at + 15000 });
             } else {
               this.store.set("outbound-error:" + row.id, { code, at });

@@ -157,7 +157,7 @@ describe("微信/企微入站媒体与语音转文字解析 + 沙箱写入", () 
 });
 
 describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜底", () => {
-  it.each(["reject", "timeout", "retry-upload", "file-send-timeout"] as const)("recovers WeCom media without replaying an uncertain send (%s)", async (scenario) => {
+  it.each(["reject", "timeout", "retry-native-upload", "retry-fallback-upload", "file-send-timeout"] as const)("recovers WeCom media without replaying an uncertain send (%s)", async (scenario) => {
     await runInDurableObject(env.MOBILE.getByName("outbound-wecom-media-" + scenario), async (_instance, state) => {
       const createRuntime = () => new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
       let runtime = createRuntime();
@@ -179,7 +179,8 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
       const calls: string[] = [];
       const fileUploadStates: string[] = [];
       let uploaded = "";
-      let failUpload = scenario === "retry-upload";
+      const failedUpload = scenario === "retry-native-upload" ? "image" : scenario === "retry-fallback-upload" ? "file" : null;
+      let failUpload = failedUpload !== null;
       const setup = (instance: ManagedChannels) => {
         const internal = instance as unknown as InternalRuntime;
         vi.spyOn(internal, "ensureWecom").mockResolvedValue();
@@ -195,7 +196,7 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
             if (uploaded === "file") {
               fileUploadStates.push(store.sql.exec<{ state: string }>("SELECT state FROM outbound").one().state);
             }
-            if (uploaded === "file" && failUpload) {
+            if (uploaded === failedUpload && failUpload) {
               failUpload = false;
               throw new Error("platform_connection_lost");
             }
@@ -208,6 +209,7 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
           expect(body).toMatchObject({ chatid: "alice", [kind]: { media_id: "media-" + kind } });
           if (kind === "image") {
             if (scenario === "timeout") throw new Error("platform_response_unknown");
+            if (scenario === "retry-native-upload") return { errcode: 0 };
             return { errcode: 846697 };
           }
           if (scenario === "file-send-timeout") throw new Error("platform_response_unknown");
@@ -217,16 +219,19 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
       };
 
       await setup(runtime).deliver();
-      if (scenario === "retry-upload") {
+      if (failedUpload) {
+        const firstCalls = failedUpload === "image"
+          ? ["upload:image"] : ["upload:image", "send:image", "upload:file"];
         expect(store.sql.exec("SELECT state FROM outbound").one()).toEqual({ state: "pending" });
-        expect(calls).toEqual(["upload:image", "send:image", "upload:file"]);
+        expect(calls).toEqual(firstCalls);
+        expect(store.get("outbound-error:1")).toMatchObject({ code: "platform_connection_lost", retry_after: expect.any(Number) });
         runtime = createRuntime();
         const afterRestart = setup(runtime);
         await afterRestart.deliver();
-        expect(calls).toHaveLength(3);
+        expect(calls).toEqual(firstCalls);
         vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
-        await afterRestart.deliver();
-        expect(calls).toEqual(["upload:image", "send:image", "upload:file", "upload:file", "send:file"]);
+        await Promise.all([afterRestart.deliver(), afterRestart.deliver()]);
+        expect(calls).toEqual([...firstCalls, "upload:" + failedUpload, "send:" + failedUpload]);
       } else {
         expect(calls).toEqual(scenario === "timeout" ? ["upload:image", "send:image"] : ["upload:image", "send:image", "upload:file", "send:file"]);
         runtime = createRuntime();
@@ -234,11 +239,13 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
         await setup(runtime).deliver();
         expect(calls).toHaveLength(callCount);
       }
-      expect(fileUploadStates).toEqual(scenario === "timeout" ? [] : scenario === "retry-upload" ? ["pending", "pending"] : ["pending"]);
-      const delivered = scenario === "reject" || scenario === "retry-upload";
+      const asFile = scenario === "reject" || scenario === "retry-fallback-upload";
+      const delivered = asFile || scenario === "retry-native-upload";
+      expect(fileUploadStates).toHaveLength(scenario === "retry-fallback-upload" ? 2 : asFile || scenario === "file-send-timeout" ? 1 : 0);
+      expect(fileUploadStates.every((value) => value === "pending")).toBe(true);
       const response = await runtime.fetch(new Request("https://internal/admin/managed/status"));
       expect(await response.json()).toMatchObject({
-        deliveries: [{ state: delivered ? "delivered" : "unknown", media_sent: delivered ? 1 : 0, media_sent_as_file: delivered ? 1 : 0 }],
+        deliveries: [{ state: delivered ? "delivered" : "unknown", media_sent: delivered ? 1 : 0, media_sent_as_file: asFile ? 1 : 0 }],
       });
       await state.storage.deleteAlarm();
     });
