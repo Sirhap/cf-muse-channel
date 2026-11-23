@@ -15,7 +15,7 @@
 1. **零改虚机自动追踪（默认开启）**：固定从主账号 `primary-account` 的 Muse 虚机读取，不随新会话账号池切换。通过同一条 Noise 连接用 `POST /fs/stats` 检查 `workspace/<channel>-bot/state/outbox.jsonl` 大小，用 HTTP Range 读取新增完整行。合规的待发记录与新偏移在同一 SQLite 事务提交。全新来源首次从文件末尾接续。暂时断连或发现虚机变化时保留原进度。
 2. **直推接口（可选）**：定时任务或脚本也可直接调用 `POST /managed/push`（`Authorization: Bearer <DEMO_KEY>`，JSON `{"id":"可选幂等键","channel":"auto|weixin|wecom","chat":"可选白名单接收者","text":"正文"}`）秒级送达；`channel` 为 `auto` 时优先最新活跃渠道，微信无可用 `context_token` 时自动回退到已启用的企微，相同 `id` 严格幂等去重。
 
-升级已有分离部署时，先发布凭证 Worker，再发布渠道 Worker。旧发件箱偏移只有渠道归属，升级后在 `/admin/managed/status` 显示 `legacy_offset_unverified` 并等待核对。以主账号的实际发件箱与已有投递台账确定最后已处理的完整行，再从同源后台调用 `POST /admin/managed/outbox/adopt`。提交 `channel`、状态页的 `expected_offset`、核对后的字节 `offset` 及后台主账号的 `vm_id`。若还有已核实来自同一虚机的旧待发附件，可同时提供 `file_task_ids`。遇到 409 重新对账，保留原通知和投递记录。未核实归属前保持该渠道补扫暂停。
+升级已有分离部署时，先发布凭证 Worker，再发布渠道 Worker。旧发件箱偏移只有渠道归属，升级后在 `/admin/managed/status` 显示 `legacy_offset_unverified` 并等待核对。以主账号的实际发件箱与已有投递台账确定最后已处理的完整行，再用管理员权限读取 `GET /admin/managed/outbox/adopt`，取得当前主虚机 `vm_id` 和每个渠道的 `expected_offset`、文件大小。向同一路径 POST 提交 `channel`、`expected_offset`、核对后的字节 `offset` 和 `vm_id`。若还有已核实来自同一虚机的旧待发附件，可同时提供 `file_task_ids`。遇到 409 重新对账，保留原通知和投递记录。未核实归属前保持该渠道补扫暂停。
 
 ## 部署
 

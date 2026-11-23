@@ -58,6 +58,9 @@ it("pauses an unaudited legacy offset and adopts only a complete boundary on the
     const relay = new OutboxRelay(store, rpc, op => state.storage.transactionSync(op), () => null);
     const cfg = { wecom: { enabled: true, account: "bot", allowedSenders: ["alice"], secret: "test" } };
     store.set("outbox_offset:wecom", old.length);
+    const inspection = await relay.inspect();
+    expect(inspection.vm_id).toBe(owner.vm);
+    expect(inspection.channels.wecom).toMatchObject({ expected_offset: old.length, size: file.length, state: "legacy_offset_unverified" });
     expect(await relay.sync(cfg)).toBe(0);
     expect(relay.status("wecom")).toBe("legacy_offset_unverified");
     await expect(relay.adopt("wecom", old.length, old.length, "wrong-vm", [])).rejects.toThrow("muse_owner_mismatch");

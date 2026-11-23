@@ -16,6 +16,14 @@ function login(password: string, source = origin) {
 }
 
 describe("administrator login sessions", () => {
+  it("limits outbox adoption inspection to administrators", async () => {
+    const dispatch = vi.fn(async () => Response.json({ ok: true }));
+    const path = origin + "/admin/managed/outbox/adopt";
+    expect((await handleRequest(new Request(path), bindings, dispatch)).status).toBe(401);
+    expect((await handleRequest(new Request(path, { headers: { Authorization: "Bearer " + key } }), bindings, dispatch)).status).toBe(200);
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
   it("uses a separate login page and rejects wrong keys, cross-site submissions, and oversized bodies", async () => {
     const sessions = { startAdminSession: vi.fn(), hasAdminSession: vi.fn(), endAdminSession: vi.fn() };
     const dispatch = vi.fn();

@@ -118,6 +118,10 @@ export class ManagedChannels extends DurableObject<Env> {
         return json({ ok: true, task_id: task.id, source: "recipient_confirmation" });
       } catch { return json({ error: "invalid_delivery_receipt" }, 400); }
     }
+    if (path === "/admin/managed/outbox/adopt" && request.method === "GET") {
+      try { return json(await this.outbox.inspect()); }
+      catch (error) { return json({ error: failureCode(error) }, 503); }
+    }
     if (path === "/admin/managed/outbox/adopt" && request.method === "POST") {
       let body: Record<string, unknown>;
       try { body = await boundedJson(new Response(request.body), 8192); }

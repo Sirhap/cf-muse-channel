@@ -57,7 +57,7 @@ export async function handleAdminRoute(request: Request, env: Env, dispatch: (re
     || (request.method === "POST" && ["/admin/managed/probe", "/admin/managed/probe-native"].includes(path))
     || (request.method === "POST" && path === "/admin/managed/connectivity")
     || (request.method === "POST" && path === "/admin/managed/confirm-delivery")
-    || (request.method === "POST" && path === "/admin/managed/outbox/adopt")
+    || (["GET", "POST"].includes(request.method) && path === "/admin/managed/outbox/adopt")
     || (request.method === "POST" && path === "/admin/managed/push")
     || (request.method === "POST" && ["/admin/managed/toggle", "/admin/managed/wake", "/admin/managed/reveal"].includes(path))
     || (request.method === "POST" && ["/admin/managed/weixin", "/admin/managed/wecom"].includes(path))

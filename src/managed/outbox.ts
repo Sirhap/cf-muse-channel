@@ -6,6 +6,7 @@ import { channelReply } from "./reply";
 import type { ManagedStore } from "./store";
 
 const MAX_OUTBOX_CHUNK = 256 * 1024;
+const CHANNELS = ["weixin", "wecom"] as const;
 type Commit = (operation: () => void) => void;
 type RouteLookup = (channel: Channel, account: string, chat?: string, group?: boolean) => Incoming | null;
 
@@ -80,6 +81,21 @@ export class OutboxRelay {
     return entry?.kind === "file" && byteOffset(entry.size) ? entry.size : null;
   }
 
+  /** Resolve the actual primary VM and the migration inputs without changing either cursor. */
+  inspect() {
+    return this.rpc(async (client, owner) => {
+      const stats = await client.call("/fs/stats", 0, "POST", { paths: CHANNELS.map(outboxPath) }, 10_000);
+      return {
+        vm_id: owner.vm,
+        channels: Object.fromEntries(CHANNELS.map((channel) => [channel, {
+          expected_offset: this.offset(channel),
+          size: this.fileSize(stats, channel),
+          state: this.status(channel),
+        }])),
+      };
+    }, { account: PRIMARY_ACCOUNT_ID });
+  }
+
   /** Attach an audited boundary to the current primary VM using the old offset as a compare-and-set guard. */
   async adopt(channel: Channel, expected: number | null, offset: number, vm: string, fileTasks: number[]) {
     const owner = { account: PRIMARY_ACCOUNT_ID, vm };
@@ -118,7 +134,7 @@ export class OutboxRelay {
   }
 
   async sync(configs: Partial<Record<Channel, ChannelConfig | null>>): Promise<number> {
-    const active = (["weixin", "wecom"] as const).filter((channel) => Boolean(configs[channel]?.enabled));
+    const active = CHANNELS.filter((channel) => Boolean(configs[channel]?.enabled));
     if (!active.length) return 0;
 
     try {
