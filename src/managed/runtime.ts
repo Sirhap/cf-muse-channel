@@ -48,6 +48,7 @@ export class ManagedChannels extends DurableObject<Env> {
   private lastOutboxSync = 0;
   private eventRevision = 0;
   private pumping?: Promise<void>;
+  private delivering?: Promise<void>;
   private polling?: Promise<void>;
   private weixinPollAbort?: AbortController;
   private health: Record<Channel, Health> = {
@@ -189,7 +190,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261124-native-media",
+        runtime_version: "managed-20261124-recovery",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -986,6 +987,15 @@ export class ManagedChannels extends DurableObject<Env> {
   }
 
   private async deliver() {
+    // A push request can arrive while an alarm is uploading a pending attachment.
+    const run = () => this.deliverPending();
+    const pass = this.delivering ? this.delivering.then(run, run) : run();
+    this.delivering = pass;
+    try { await pass; }
+    finally { if (this.delivering === pass) this.delivering = undefined; }
+  }
+
+  private async deliverPending() {
     let fallbackCreated = false;
     const rows = this.ctx.storage.sql.exec<Outbound>(`SELECT o.* FROM outbound o LEFT JOIN metadata m ON m.key='outbound-error:' || o.id
       WHERE o.state='pending' AND COALESCE(json_extract(m.value,'$.retry_after'),0)<=? ORDER BY o.id LIMIT 10`, Date.now()).toArray();
@@ -1029,7 +1039,7 @@ export class ManagedChannels extends DurableObject<Env> {
       }
       if (failed) continue;
 
-      for (let f = filePart; f < files.length; f++) {
+      attachments: for (let f = filePart; f < files.length; f++) {
         if (route.channel === "wecom") {
           try { await this.ensureWecom(config); }
           catch { this.healthResult("wecom", "gateway_connect_failed"); break; }
@@ -1069,64 +1079,77 @@ export class ManagedChannels extends DurableObject<Env> {
           continue;
         }
 
-        // 先完成加密上传（未向用户发气泡，失败可安全保留 pending 或记录错误），再落 sending 边界发送消息。
-        let wxItem: Record<string, unknown> | undefined;
-        let wcMedia: { mediaId: string; msgType: "image" | "video" | "file" } | undefined;
-        try {
-          if (route.channel === "weixin") {
-            wxItem = await uploadWeixinMedia(config, route.chat, payload.bytes, payload.fileName);
-          } else {
-            wcMedia = await uploadWecomMedia((frame) => this.frame(frame), payload.bytes, payload.fileName);
-          }
-        } catch (uploadErr) {
-          this.store.set("outbound-error:" + row.id, { code: failureCode(uploadErr), at: Date.now() });
-          this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
-          break;
-        }
-
-        this.ctx.storage.sql.exec("UPDATE outbound SET state='sending' WHERE id=?", row.id);
-        let sentAsFile = false;
-        try {
-          if (route.channel === "weixin") {
-            await weixinCall("sendmessage", config, {
-              msg: { from_user_id: "", to_user_id: route.chat, client_id: "cf-" + identity + "-f" + f,
-                message_type: 2, message_state: 2, context_token: route.context,
-                item_list: [wxItem!] },
-              base_info: { channel_version: "2.4.9", bot_agent: "Muse/1.0" },
-            });
-          } else {
-            const reqId = "cf-" + identity + "-f" + f;
-            try {
-              await this.sendWecomMedia(route, reqId, wcMedia!);
-            } catch (error) {
-              // An explicit negative receipt permits one file fallback. An uncertain send must never be replayed.
-              if (wcMedia!.msgType === "file" || failureCode(error) !== "platform_rejected_846697") throw error;
-              const file = await uploadWecomMedia((frame) => this.frame(frame), payload.bytes, payload.fileName, "file");
-              await this.sendWecomMedia(route, reqId + "-file", file);
-              sentAsFile = true;
+        const reqId = "cf-" + identity + "-f" + f;
+        const fileFallbackKey = "outbound-file-fallback:" + row.id + ":" + f;
+        let sendAsFile = this.store.get<boolean>(fileFallbackKey) === true;
+        for (;;) {
+          let wxItem: Record<string, unknown> | undefined;
+          let wcMedia: Awaited<ReturnType<typeof uploadWecomMedia>> | undefined;
+          try {
+            if (route.channel === "weixin") {
+              wxItem = await uploadWeixinMedia(config, route.chat, payload.bytes, payload.fileName);
+            } else {
+              wcMedia = await uploadWecomMedia((frame) => this.frame(frame), payload.bytes, payload.fileName, sendAsFile ? "file" : undefined);
             }
+          } catch (error) {
+            const at = Date.now();
+            const code = failureCode(error);
+            if (sendAsFile) {
+              this.store.set("outbound-error:" + row.id, { code, at, retry_after: at + 15000 });
+            } else {
+              this.store.set("outbound-error:" + row.id, { code, at });
+              this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
+            }
+            break attachments;
           }
+
+          this.ctx.storage.sql.exec("UPDATE outbound SET state='sending' WHERE id=?", row.id);
+          try {
+            if (route.channel === "weixin") {
+              await weixinCall("sendmessage", config, {
+                msg: { from_user_id: "", to_user_id: route.chat, client_id: reqId,
+                  message_type: 2, message_state: 2, context_token: route.context,
+                  item_list: [wxItem!] },
+                base_info: { channel_version: "2.4.9", bot_agent: "Muse/1.0" },
+              });
+            } else {
+              await this.sendWecomMedia(route, sendAsFile ? reqId + "-file" : reqId, wcMedia!);
+            }
+          } catch (error) {
+            const code = failureCode(error);
+            if (wcMedia && wcMedia.msgType !== "file" && code === "platform_rejected_846697") {
+              // The native send was rejected. Persist fallback intent before any new upload.
+              this.ctx.storage.transactionSync(() => {
+                this.store.set(fileFallbackKey, true);
+                this.ctx.storage.sql.exec("UPDATE outbound SET state='pending' WHERE id=?", row.id);
+              });
+              sendAsFile = true;
+              continue;
+            }
+            this.store.set("outbound-error:" + row.id, { code, at: Date.now() });
+            this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
+            if (route.channel === "weixin" && f === 0 && chunks.length === 0 && code.startsWith("platform_rejected_")) {
+              if (this.queueWecomFallback(row, files)) fallbackCreated = true;
+            }
+            break attachments;
+          }
+
           this.ctx.storage.transactionSync(() => {
             this.store.set("outbound-file-part:" + row.id, f + 1);
             const receiptKey = "outbound-media-sent:" + row.id;
             this.store.set(receiptKey, (this.store.get<number>(receiptKey) ?? 0) + 1);
-            if (sentAsFile) {
+            if (sendAsFile) {
               const fallbackKey = "outbound-media-fallback:" + row.id;
               this.store.set(fallbackKey, (this.store.get<number>(fallbackKey) ?? 0) + 1);
+              this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key=?", fileFallbackKey);
             }
+            this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key=?", "outbound-error:" + row.id);
             this.ctx.storage.sql.exec("UPDATE outbound SET state=? WHERE id=?", f + 1 === files.length ? "delivered" : "pending", row.id);
           });
-        } catch (error) {
-          const code = failureCode(error);
-          this.store.set("outbound-error:" + row.id, { code, at: Date.now() });
-          this.ctx.storage.sql.exec("UPDATE outbound SET state='unknown' WHERE id=?", row.id);
-          if (route.channel === "weixin" && f === 0 && chunks.length === 0 && code.startsWith("platform_rejected_")) {
-            if (this.queueWecomFallback(row, files)) fallbackCreated = true;
-          }
           break;
         }
       }
     }
-    if (fallbackCreated) await this.deliver();
+    if (fallbackCreated) await this.deliverPending();
   }
 }

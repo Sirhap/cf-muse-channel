@@ -96,37 +96,50 @@ export class OutboxRelay {
     }, { account: PRIMARY_ACCOUNT_ID });
   }
 
-  /** Attach an audited boundary to the current primary VM using the old offset as a compare-and-set guard. */
+  /** Attach an audited boundary or claim more pending attachments at the existing verified cursor. */
   async adopt(channel: Channel, expected: number | null, offset: number, vm: string, fileTasks: number[]) {
     const owner = { account: PRIMARY_ACCOUNT_ID, vm };
     return this.rpc(async (client) => {
-      const size = this.fileSize(await client.call("/fs/stats", 0, "POST", { paths: [outboxPath(channel)] }, 10_000), channel);
-      if (size === null || offset > size) return false;
-      if (offset > 0) {
-        const tail = await client.raw("/media/raw/" + outboxPath(channel), 0, "GET",
-          { range: `bytes=${offset - 1}-${offset - 1}` }, 15_000, 4096);
-        if (tail.status !== 206 || tail.body.length !== 1 || tail.body[0] !== 0x0a) return false;
+      const sourceKey = "outbox-source:" + channel;
+      const current = this.store.get<MuseOwner>(sourceKey);
+      if (current?.account !== owner.account || current.vm !== vm) {
+        const size = this.fileSize(await client.call("/fs/stats", 0, "POST", { paths: [outboxPath(channel)] }, 10_000), channel);
+        if (size === null || offset > size) return false;
+        if (offset > 0) {
+          const tail = await client.raw("/media/raw/" + outboxPath(channel), 0, "GET",
+            { range: `bytes=${offset - 1}-${offset - 1}` }, 15_000, 4096);
+          if (tail.status !== 206 || tail.body.length !== 1 || tail.body[0] !== 0x0a) return false;
+        }
       }
       let adopted = false;
       this.commit(() => {
         if (this.offset(channel) !== expected) return;
-        const existing = this.store.get<MuseOwner>("outbox-source:" + channel);
-        // A live source can only be replaced by a different VM, never rewound.
-        if (existing?.vm === vm) return;
+        const existing = this.store.get<MuseOwner>(sourceKey);
+        const sameSource = existing?.account === owner.account && existing.vm === vm;
+        // An already verified source accepts more attachments without moving its cursor.
+        if (sameSource && (!fileTasks.length || expected !== offset)) return;
         const old = this.position(channel, owner);
         if (old && old.offset !== offset) return;
         for (const id of fileTasks) {
           const task = this.store.sql.exec<{ message_id: string }>(
             "SELECT t.message_id FROM tasks t JOIN outbound o ON o.task_id=t.id WHERE t.id=? AND o.state='pending'", id).toArray()[0];
           const origin = task?.message_id.replace(/^fallback:/, "") ?? "";
-          if (!this.store.get<string[]>("outbound-files:" + id)?.length || this.store.get<MuseOwner>("outbound-owner:" + id)
+          const bound = this.store.get<MuseOwner>("outbound-owner:" + id);
+          if (!this.store.get<string[]>("outbound-files:" + id)?.length || (bound && (bound.account !== owner.account || bound.vm !== owner.vm))
               || !(origin.startsWith(`outbox:${channel}:`) || channel === "weixin" && origin.startsWith("outbox:wx-fallback:"))) return;
         }
-        const namespace = old?.namespace ?? (!existing && this.legacyOffset(channel) !== null ? "" : crypto.randomUUID() + ":");
-        this.store.set(this.positionKey(channel, owner), { offset, namespace });
-        this.store.set("outbox-source:" + channel, owner);
-        this.recordState(channel, "ready");
-        for (const id of fileTasks) this.store.set("outbound-owner:" + id, owner);
+        if (!sameSource) {
+          const namespace = old?.namespace ?? (!existing && this.legacyOffset(channel) !== null ? "" : crypto.randomUUID() + ":");
+          this.store.set(this.positionKey(channel, owner), { offset, namespace });
+          this.store.set(sourceKey, owner);
+          this.recordState(channel, "ready");
+        }
+        for (const id of fileTasks) {
+          this.store.set("outbound-owner:" + id, owner);
+          this.store.sql.exec(`DELETE FROM metadata WHERE key=(
+            SELECT 'outbound-error:' || id FROM outbound WHERE task_id=?
+          ) AND json_extract(value,'$.code')='muse_owner_unresolved'`, id);
+        }
         adopted = true;
       });
       return adopted;

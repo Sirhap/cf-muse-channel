@@ -57,6 +57,26 @@ it("recovers 501 replies over two turns and commits each reply once", async () =
   });
 });
 
+it("shrinks an oversized history response without skipping entries or wasting the page budget", async () => {
+  await runInDurableObject(env.MOBILE.getByName("history-pages-body-limit"), async (_, state) => {
+    const f = fixture(state);
+    const native = f.newNative();
+    await native.forward(f.input());
+    const binding = native.sessions()[0];
+    const history = Array.from({ length: 102 }, (_, i) => assistant(i + 1));
+    f.readPage.mockImplementation((after, limit) => {
+      const events = history.filter((event) => event.seq > after);
+      if (limit > 50) throw new Error("rpc_body_limit");
+      return { chat_events: events.slice(0, limit), has_more: events.length > limit };
+    });
+
+    await native.collect(binding);
+    expect(f.readPage.mock.calls).toEqual([[0, 100], [0, 50], [50, 50], [100, 50]]);
+    expect(native.sessions()[0]).toMatchObject({ cursor: 102, history_more: 0 });
+    expect(f.row()).toMatchObject({ count: 102, earliest: 1 });
+  });
+});
+
 it("queues a late Muse image for WeChat once and allows a later request to resend the same image", async () => {
   await runInDurableObject(env.MOBILE.getByName("history-pages-weixin-presentation"), async (_, state) => {
     const f = fixture(state);

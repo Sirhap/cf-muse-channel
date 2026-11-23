@@ -157,9 +157,10 @@ describe("微信/企微入站媒体与语音转文字解析 + 沙箱写入", () 
 });
 
 describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜底", () => {
-  it.each([true, false])("reuploads a WeCom image as a file only after explicit rejection (rejected=%s)", async (rejected) => {
-    await runInDurableObject(env.MOBILE.getByName("outbound-wecom-media-" + rejected), async (_instance, state) => {
-      const runtime = new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
+  it.each(["reject", "timeout", "retry-upload", "file-send-timeout"] as const)("recovers WeCom media without replaying an uncertain send (%s)", async (scenario) => {
+    await runInDurableObject(env.MOBILE.getByName("outbound-wecom-media-" + scenario), async (_instance, state) => {
+      const createRuntime = () => new ManagedChannels(state, { ...env, MANAGED_CHANNELS_ENABLED: "true" });
+      let runtime = createRuntime();
       const store = new ManagedStore(state.storage.sql);
       state.storage.sql.exec("INSERT INTO config VALUES ('wecom',?)", JSON.stringify({
         enabled: true, account: "wc-bot", secret: "wc-sec", allowedSenders: ["alice"],
@@ -169,43 +170,75 @@ describe("出站媒体发送与微信 context_token 失效/缺失自动企微兜
       store.complete(task, "");
       store.setOutboundFiles(task.id, ["workspace/gold.webp"], { account: "primary-account", vm: "fixture-vm" });
       const bytes = new TextEncoder().encode("RIFF1234WEBP");
-      const internal = runtime as unknown as {
+      type InternalRuntime = {
         rpc: <T>(op: (c: MuseRpc) => Promise<T>) => Promise<T>;
         ensureWecom: () => Promise<void>;
         deliver: () => Promise<void>;
         frame: (value: Record<string, unknown>) => Promise<Record<string, unknown>>;
       };
       const calls: string[] = [];
+      const fileUploadStates: string[] = [];
       let uploaded = "";
-      vi.spyOn(internal, "ensureWecom").mockResolvedValue();
-      vi.spyOn(internal, "rpc").mockImplementation(async (op) => op({
-        call: async () => ({ kind: "file", size: bytes.length }),
-        raw: async () => ({ status: 206, body: bytes }),
-      } as unknown as MuseRpc));
-      vi.spyOn(internal, "frame").mockImplementation(async (frame) => {
-        const body = frame.body as Record<string, unknown>;
-        if (frame.cmd === "aibot_upload_media_init") {
-          uploaded = String(body.type);
-          calls.push("upload:" + uploaded);
-          return { errcode: 0, body: { upload_id: "upload-" + uploaded } };
-        }
-        if (frame.cmd === "aibot_upload_media_finish") return { errcode: 0, body: { media_id: "media-" + uploaded } };
-        if (frame.cmd === "aibot_upload_media_chunk") return { errcode: 0 };
-        const kind = String(body.msgtype);
-        calls.push("send:" + kind);
-        expect(body).toMatchObject({ chatid: "alice", [kind]: { media_id: "media-" + kind } });
-        if (kind === "image") {
-          if (rejected) return { errcode: 846697 };
-          throw new Error("platform_response_unknown");
-        }
-        return { errcode: 0 };
-      });
+      let failUpload = scenario === "retry-upload";
+      const setup = (instance: ManagedChannels) => {
+        const internal = instance as unknown as InternalRuntime;
+        vi.spyOn(internal, "ensureWecom").mockResolvedValue();
+        vi.spyOn(internal, "rpc").mockImplementation(async (op) => op({
+          call: async () => ({ kind: "file", size: bytes.length }),
+          raw: async () => ({ status: 206, body: bytes }),
+        } as unknown as MuseRpc));
+        vi.spyOn(internal, "frame").mockImplementation(async (frame) => {
+          const body = frame.body as Record<string, unknown>;
+          if (frame.cmd === "aibot_upload_media_init") {
+            uploaded = String(body.type);
+            calls.push("upload:" + uploaded);
+            if (uploaded === "file") {
+              fileUploadStates.push(store.sql.exec<{ state: string }>("SELECT state FROM outbound").one().state);
+            }
+            if (uploaded === "file" && failUpload) {
+              failUpload = false;
+              throw new Error("platform_connection_lost");
+            }
+            return { errcode: 0, body: { upload_id: "upload-" + uploaded } };
+          }
+          if (frame.cmd === "aibot_upload_media_finish") return { errcode: 0, body: { media_id: "media-" + uploaded } };
+          if (frame.cmd === "aibot_upload_media_chunk") return { errcode: 0 };
+          const kind = String(body.msgtype);
+          calls.push("send:" + kind);
+          expect(body).toMatchObject({ chatid: "alice", [kind]: { media_id: "media-" + kind } });
+          if (kind === "image") {
+            if (scenario === "timeout") throw new Error("platform_response_unknown");
+            return { errcode: 846697 };
+          }
+          if (scenario === "file-send-timeout") throw new Error("platform_response_unknown");
+          return { errcode: 0 };
+        });
+        return internal;
+      };
 
-      await internal.deliver();
-      expect(calls).toEqual(rejected ? ["upload:image", "send:image", "upload:file", "send:file"] : ["upload:image", "send:image"]);
+      await setup(runtime).deliver();
+      if (scenario === "retry-upload") {
+        expect(store.sql.exec("SELECT state FROM outbound").one()).toEqual({ state: "pending" });
+        expect(calls).toEqual(["upload:image", "send:image", "upload:file"]);
+        runtime = createRuntime();
+        const afterRestart = setup(runtime);
+        await afterRestart.deliver();
+        expect(calls).toHaveLength(3);
+        vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+        await afterRestart.deliver();
+        expect(calls).toEqual(["upload:image", "send:image", "upload:file", "upload:file", "send:file"]);
+      } else {
+        expect(calls).toEqual(scenario === "timeout" ? ["upload:image", "send:image"] : ["upload:image", "send:image", "upload:file", "send:file"]);
+        runtime = createRuntime();
+        const callCount = calls.length;
+        await setup(runtime).deliver();
+        expect(calls).toHaveLength(callCount);
+      }
+      expect(fileUploadStates).toEqual(scenario === "timeout" ? [] : scenario === "retry-upload" ? ["pending", "pending"] : ["pending"]);
+      const delivered = scenario === "reject" || scenario === "retry-upload";
       const response = await runtime.fetch(new Request("https://internal/admin/managed/status"));
       expect(await response.json()).toMatchObject({
-        deliveries: [{ state: rejected ? "delivered" : "unknown", media_sent: rejected ? 1 : 0, media_sent_as_file: rejected ? 1 : 0 }],
+        deliveries: [{ state: delivered ? "delivered" : "unknown", media_sent: delivered ? 1 : 0, media_sent_as_file: delivered ? 1 : 0 }],
       });
       await state.storage.deleteAlarm();
     });

@@ -64,8 +64,17 @@ export class NativeConversations {
   }
 
   private async historyPage(session: string, owner: MuseOwner, after: number, limit = HISTORY_PAGE_SIZE) {
-    const data = object(await this.rpc((client) =>
-      client.call(this.historyPath(session, limit) + "&after_seq=" + after, 0), owner));
+    let response: unknown;
+    for (;;) {
+      try {
+        response = await this.rpc((client) => client.call(this.historyPath(session, limit) + "&after_seq=" + after, 0), owner);
+        break;
+      } catch (error) {
+        if (limit === 1 || !(error instanceof Error) || error.message !== "rpc_body_limit") throw error;
+        limit = Math.floor(limit / 2);
+      }
+    }
+    const data = object(response);
     if (typeof data.has_more !== "boolean" || !Array.isArray(data.chat_events) || data.chat_events.length > limit) {
       throw new Error("history_page_invalid");
     }
@@ -80,7 +89,7 @@ export class NativeConversations {
     }
     events.sort((a, b) => a.seq - b.seq);
     if (!events.length && (data.has_more || rows.length)) throw new Error("history_page_no_progress");
-    return { events, more: data.has_more };
+    return { events, more: data.has_more, limit };
   }
 
   sessions() {
@@ -314,9 +323,11 @@ export class NativeConversations {
       binding.session, PENDING_ASSISTANT_CHECKS).toArray();
 
     let after = binding.cursor;
+    let pageSize = HISTORY_PAGE_SIZE;
     let produced = false;
     for (let index = 0; index < MAX_HISTORY_PAGES; index++) {
-      const { events, more } = await this.historyPage(binding.session, owner, after);
+      const { events, more, limit } = await this.historyPage(binding.session, owner, after, pageSize);
+      pageSize = limit;
       const through = events.at(-1)?.seq ?? after;
       const outputs = new Map<string, HistoryEvent>();
       for (const event of events) {

@@ -73,6 +73,25 @@ it("pauses an unaudited legacy offset and adopts only a complete boundary on the
     expect(outbound.text).toBe("new");
     expect(store.get("outbound-owner:" + outbound.task_id)).toEqual(owner);
     expect(relay.offset("wecom")).toBe(file.length);
+
+    const queueLegacy = (id: string) => {
+      const task = store.ingest({ id, channel: "wecom", account: "bot", chat: "alice", sender: "alice",
+        group: false, text: "", context: "" })!;
+      store.complete(task, "");
+      store.set("outbound-files:" + task.id, ["workspace/legacy.txt"]);
+      return task.id;
+    };
+    const legacyTasks = Array.from({ length: 101 }, (_, i) => queueLegacy("outbox:wecom:legacy-" + i));
+    const unrelated = queueLegacy("outbox:wx-fallback:legacy");
+    expect(await relay.adopt("wecom", file.length, old.length, owner.vm, legacyTasks.slice(0, 1))).toBe(false);
+    expect(await relay.adopt("wecom", file.length, file.length, owner.vm, [legacyTasks[0], unrelated])).toBe(false);
+    expect(store.get("outbound-owner:" + legacyTasks[0])).toBeNull();
+    expect(await relay.adopt("wecom", file.length, file.length, owner.vm, legacyTasks.slice(0, 100))).toBe(true);
+    expect(await relay.adopt("wecom", file.length, file.length, owner.vm, legacyTasks.slice(100))).toBe(true);
+    expect(await relay.adopt("wecom", file.length, file.length, owner.vm, legacyTasks.slice(100))).toBe(true);
+    expect(legacyTasks.every((id) => store.get<{ vm: string }>("outbound-owner:" + id)?.vm === owner.vm)).toBe(true);
+    expect(store.get("outbound-owner:" + unrelated)).toBeNull();
+    expect(relay.offset("wecom")).toBe(file.length);
   });
 });
 
