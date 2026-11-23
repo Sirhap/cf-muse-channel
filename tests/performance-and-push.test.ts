@@ -277,50 +277,6 @@ describe("CookieController 锁粒度优化与短效 access_token 缓存", () => 
   });
 });
 
-describe("NativeConversations 增量拉取与缺口补拉", () => {
-  const incoming = (id: string): Incoming => ({
-    id, text: id, channel: "weixin", account: "bot", chat: "alice", sender: "alice", group: false, context: "ctx-" + id,
-  });
-
-  it("日常仅拉取 limit=40，检测到序号缺口时自动阶梯补拉避免漏消息", async () => {
-    await runInDurableObject(env.MOBILE.getByName("native-incremental-history"), async (_instance, state) => {
-      const store = new ManagedStore(state.storage.sql);
-      const limits: number[] = [];
-      const call = vi.fn(async (path: string) => {
-        if (path === "/session/start") return { session_id: "sess-inc" };
-        if (path.startsWith("/chat/history")) {
-          const limit = Number(new URL("https://x" + path).searchParams.get("limit"));
-          limits.push(limit);
-          if (limit === 40) {
-            // 返回 40 条且最小 seq=30 > cursor(10)+1，触发补拉 limit=200
-            return {
-              chat_events: Array.from({ length: 40 }, (_, i) => ({
-                seq: 30 + i, message_id: "m-" + (30 + i), event_name: "message.assistant",
-                payload: { message_id: "m-" + (30 + i), status: "completed", display_text: "msg-" + (30 + i) },
-              })),
-            };
-          }
-          return {
-            chat_events: [
-              { seq: 11, message_id: "missed", event_name: "message.assistant", payload: { message_id: "missed", status: "completed", display_text: "早先消息" } },
-              { seq: 69, message_id: "latest", event_name: "message.assistant", payload: { message_id: "latest", status: "completed", display_text: "最新消息" } },
-            ],
-          };
-        }
-        return { status: "completed" };
-      });
-      const client = { call, open: vi.fn(async () => 1) } as unknown as MuseRpc;
-      const native = new NativeConversations(store, (op) => op(client, { account: "primary-account", vm: "fixture-vm" }), (op) => state.storage.transactionSync(op), vi.fn(), async () => ["primary-account"]);
-      await native.forward(store.ingest(incoming("hi"))!);
-      state.storage.sql.exec("UPDATE native_sessions SET cursor=10");
-      await native.collect(native.sessions()[0]);
-      expect(limits).toEqual([40, 200]);
-      const texts = state.storage.sql.exec<{ text: string }>("SELECT text FROM outbound ORDER BY id").toArray().map((r) => r.text);
-      expect(texts).toEqual(["早先消息", "最新消息"]);
-    });
-  });
-});
-
 describe("ManagedChannels 主动推送 (/managed/push) 与事件唤醒优化", () => {
   it("支持 DEMO_KEY 鉴权路由、微信自动继承 context_token、幂等去重与白名单校验", async () => {
     const unauthorized = await handleRequest(

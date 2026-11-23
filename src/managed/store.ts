@@ -18,6 +18,7 @@ export class ManagedStore {
     sql.exec("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)");
     sql.exec("CREATE INDEX IF NOT EXISTS tasks_conversation_state ON tasks(conversation,state,id)");
     sql.exec("CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state,id)");
+    sql.exec("CREATE INDEX IF NOT EXISTS tasks_session_state ON tasks(session,state,id)");
     sql.exec("CREATE INDEX IF NOT EXISTS outbound_state ON outbound(state,id)");
   }
   get<T>(key: string): T | null {

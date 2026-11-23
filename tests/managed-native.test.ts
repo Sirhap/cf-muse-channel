@@ -27,7 +27,12 @@ function fixture(state: DurableObjectState) {
   let sessions = 0;
   const call = vi.fn(async (path: string) => {
     if (path === "/session/start") return { session_id: "session-" + (++sessions) };
-    if (path.startsWith("/chat/history")) return { chat_events: history };
+    if (path.startsWith("/chat/history")) {
+      const q = new URL("https://muse.test" + path).searchParams;
+      const limit = Number(q.get("limit"));
+      const events = q.has("after_seq") ? history.filter(event => Number(event.seq) > Number(q.get("after_seq"))) : history;
+      return { chat_events: events.slice(0, limit), has_more: events.length > limit };
+    }
     return { status: "running" };
   });
   const open = vi.fn(async () => 1);
@@ -165,7 +170,7 @@ it("keeps an existing session and its files on its original VM after pool change
         call: async (path: string) => {
           operations.push([owner.account, path.split("?")[0]]);
           if (path === "/session/start") return { session_id: owner.vm };
-          if (path.startsWith("/chat/history")) return { chat_events: [assistant(1, "attachment", "[[FILE:workspace/a.txt]]")] };
+          if (path.startsWith("/chat/history")) return { chat_events: [assistant(1, "attachment", "[[FILE:workspace/a.txt]]")], has_more: false };
           return {};
         },
         open: async (path: string) => { operations.push([owner.account, path]); return 1; },
@@ -207,7 +212,7 @@ it("leaves a legacy session unbound until every candidate returns a definitive r
     const rpc: OwnedRpc = (op, target) => op({
       call: async () => {
         if (target?.account === "primary-account") throw new Error(otherResult);
-        return { chat_events: [] };
+        return { chat_events: [], has_more: false };
       },
     } as unknown as MuseRpc, { account: target!.account, vm: "known-vm" });
     const native = new NativeConversations(store, rpc, op => state.storage.transactionSync(op), vi.fn(), async () => ["primary-account", "secondary"]);

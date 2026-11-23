@@ -112,7 +112,7 @@ describe("微信/企微入站媒体与语音转文字解析 + 沙箱写入", () 
       const streamBodies: Record<string, unknown>[] = [];
       const call = vi.fn(async (path: string, _svc?: number, _m?: string, body?: unknown) => {
         if (path === "/session/start") return { session_id: "sess-media" };
-        if (path.startsWith("/chat/history")) return { chat_events: [] };
+        if (path.startsWith("/chat/history")) return { chat_events: [], has_more: false };
         if (path === "/fs/write") { writes.push(body as Record<string, unknown>); return { ok: true }; }
         return {};
       });

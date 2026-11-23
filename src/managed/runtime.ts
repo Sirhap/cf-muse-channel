@@ -185,7 +185,7 @@ export class ManagedChannels extends DurableObject<Env> {
     }
     if (request.method === "GET" && path === "/admin/managed/status") {
       return json({
-        runtime_version: "managed-20261123-account-ownership",
+        runtime_version: "managed-20261123-history-pagination",
         mode: "native",
         last_alarm_at: this.store.get("last_alarm_at"),
         next_alarm_at: await this.ctx.storage.getAlarm(),
@@ -209,7 +209,11 @@ export class ManagedChannels extends DurableObject<Env> {
         deliveries: this.ctx.storage.sql.exec<{ id: number; task_id: number; state: string }>(
           "SELECT id,task_id,state FROM outbound ORDER BY id DESC LIMIT 10").toArray()
           .map((row) => ({ ...row, error: this.store.get("outbound-error:" + row.id) })),
-        native_sessions: this.ctx.storage.sql.exec("SELECT COUNT(*) count,SUM(awaiting) active,SUM(muse_account IS NULL) owner_unresolved FROM native_sessions").one(),
+        native_sessions: this.ctx.storage.sql.exec(`SELECT COUNT(*) count,COALESCE(SUM(awaiting),0) active,
+          COALESCE(SUM(muse_account IS NULL),0) owner_unresolved,COALESCE(SUM(history_more),0) history_backlog,
+          (SELECT COUNT(*) FROM native_pending_assistant) pending_assistant FROM native_sessions`).one(),
+        last_native_error: this.ctx.storage.sql.exec<{ value: string }>(`SELECT value FROM metadata WHERE key GLOB 'native-error:*'
+          ORDER BY json_extract(value,'$.at') DESC LIMIT 1`).toArray().map(({ value }) => JSON.parse(value))[0] ?? null,
         outbox_offsets: { weixin: this.outbox.offset("weixin"), wecom: this.outbox.offset("wecom") },
         outbox_sync: { weixin: this.outbox.status("weixin"), wecom: this.outbox.status("wecom") },
         primary_approval_subscription_ready: this.primaryApprovalSubscriptionReady(),
@@ -635,7 +639,7 @@ export class ManagedChannels extends DurableObject<Env> {
     const diagnostic = this.store.get<Diagnostic>("diagnostic");
     return Boolean(diagnostic && diagnostic.state !== "succeeded" && diagnostic.state !== "failed")
       || this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) count FROM tasks WHERE state IN ('queued','submitting','running','unknown')").one().count > 0
-      || this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) count FROM native_sessions WHERE awaiting=1").one().count > 0;
+      || this.native.needsHistoryCheck();
   }
 
   private async pollWeixin(config: ChannelConfig, signal: AbortSignal) {
@@ -851,6 +855,7 @@ export class ManagedChannels extends DurableObject<Env> {
             dirty.has(binding.session)
             || uncertainSessions.has(binding.session)
             || Boolean(binding.awaiting)
+            || Boolean(binding.history_more)
             || now - binding.last_checked >= IDLE_HISTORY_SCAN_MS)
         : Array.from(new Set([...dirty, ...uncertainSessions]))
             .map((id) => this.native.session(id))
@@ -858,6 +863,7 @@ export class ManagedChannels extends DurableObject<Env> {
       for (const binding of targets) {
         try {
           const produced = await this.native.collect(binding);
+          this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key=?", "native-error:" + binding.session);
           await this.deliver();
           if (produced || binding.awaiting && Date.now() - binding.last_checked > 15000) {
             // 会话状态刷新仅影响后续补查节拍，放后台异步执行避免阻塞紧随其后的新消息与本地指令。

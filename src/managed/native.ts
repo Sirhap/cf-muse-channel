@@ -8,6 +8,14 @@ type StreamItem =
   | { type: "text"; text: string }
   | { type: "image"; mime_type: string; filename: string; data_base64: string };
 
+const HISTORY_PAGE_SIZE = 100;
+const MAX_HISTORY_PAGES = 3;
+const PENDING_ASSISTANT_CHECKS = 3;
+const FINAL_ASSISTANT_STATES = new Set(["completed", "complete", "succeeded", "failed", "error", "cancelled", "canceled"]);
+type HistoryEvent = Record<string, unknown> & { seq: number };
+interface PendingAssistant extends Record<string, SqlStorageValue> { message: string; seq: number; }
+interface ReceiptInput { task: Task; after: number; }
+
 export interface NativeSession extends Record<string, SqlStorageValue> {
   session: string;
   conversation: string;
@@ -18,6 +26,7 @@ export interface NativeSession extends Record<string, SqlStorageValue> {
   last_checked: number;
   muse_account: string | null;
   muse_vm: string | null;
+  history_more: number;
 }
 type Commit = (operation: () => void) => void;
 
@@ -30,10 +39,17 @@ export class NativeConversations {
     store.sql.exec(`CREATE TABLE IF NOT EXISTS native_sessions(
       session TEXT PRIMARY KEY, conversation TEXT NOT NULL, generation INTEGER NOT NULL,
       route TEXT NOT NULL, cursor INTEGER NOT NULL, awaiting INTEGER NOT NULL DEFAULT 1,
-      last_checked INTEGER NOT NULL DEFAULT 0, muse_account TEXT, muse_vm TEXT, UNIQUE(conversation,generation))`);
+      last_checked INTEGER NOT NULL DEFAULT 0, muse_account TEXT, muse_vm TEXT,
+      history_more INTEGER NOT NULL DEFAULT 0, UNIQUE(conversation,generation))`);
     const columns = store.sql.exec<{ name: string }>("PRAGMA table_info(native_sessions)").toArray();
     if (!columns.some(({ name }) => name === "muse_account")) store.sql.exec("ALTER TABLE native_sessions ADD COLUMN muse_account TEXT");
     if (!columns.some(({ name }) => name === "muse_vm")) store.sql.exec("ALTER TABLE native_sessions ADD COLUMN muse_vm TEXT");
+    if (!columns.some(({ name }) => name === "history_more")) {
+      store.sql.exec("ALTER TABLE native_sessions ADD COLUMN history_more INTEGER NOT NULL DEFAULT 0");
+    }
+    store.sql.exec(`CREATE TABLE IF NOT EXISTS native_pending_assistant (
+      session TEXT NOT NULL, message TEXT NOT NULL, seq INTEGER NOT NULL, checked_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(session,message))`);
   }
 
   private events(response: unknown) {
@@ -47,23 +63,36 @@ export class NativeConversations {
     return "/chat/history?session_id=" + encodeURIComponent(session) + "&limit=" + limit;
   }
 
-  /** 默认仅拉取最近 40 条事件；若检测到游标与最小序号间存在缺口，自动阶梯补拉避免漏消息。 */
-  private async historySince(session: string, cursor: number, owner: MuseOwner) {
-    const history = async (limit: number) => this.events(await this.rpc(
-      (client) => client.call(this.historyPath(session, limit), 0), owner));
-    let events = await history(40);
-    if (cursor > 0 && events.length >= 40 && Number(events[0].seq) > cursor + 1) {
-      events = await history(200);
-      if (events.length >= 200 && Number(events[0].seq) > cursor + 1) {
-        events = await history(500);
-      }
+  private async historyPage(session: string, owner: MuseOwner, after: number, limit = HISTORY_PAGE_SIZE) {
+    const data = object(await this.rpc((client) =>
+      client.call(this.historyPath(session, limit) + "&after_seq=" + after, 0), owner));
+    if (typeof data.has_more !== "boolean" || !Array.isArray(data.chat_events) || data.chat_events.length > limit) {
+      throw new Error("history_page_invalid");
     }
-    return events;
+    const rows = data.chat_events.map(object);
+    const events: HistoryEvent[] = [];
+    for (const row of rows) {
+      const { seq } = row;
+      const eventSession = object(row.payload).session_id;
+      if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0 || !string(row.event_name)
+          || (eventSession !== undefined && eventSession !== session)) throw new Error("history_page_invalid");
+      if (seq > after) events.push({ ...row, seq });
+    }
+    events.sort((a, b) => a.seq - b.seq);
+    if (!events.length && (data.has_more || rows.length)) throw new Error("history_page_no_progress");
+    return { events, more: data.has_more };
   }
 
   sessions() {
     return this.store.sql.exec<NativeSession>(`SELECT n.* FROM native_sessions n JOIN conversations c ON c.id=n.conversation
-      WHERE n.awaiting=1 OR c.generation=n.generation ORDER BY n.last_checked`).toArray();
+      WHERE n.awaiting=1 OR c.generation=n.generation OR n.history_more=1
+        OR EXISTS(SELECT 1 FROM native_pending_assistant p WHERE p.session=n.session)
+        OR EXISTS(SELECT 1 FROM tasks t WHERE t.session=n.session AND t.state='unknown') ORDER BY n.last_checked`).toArray();
+  }
+
+  needsHistoryCheck() {
+    return Boolean(this.store.sql.exec(`SELECT 1 FROM native_sessions WHERE awaiting=1 OR history_more=1
+      UNION ALL SELECT 1 FROM native_pending_assistant LIMIT 1`).toArray().length);
   }
 
   session(id: string): NativeSession | null {
@@ -275,83 +304,143 @@ export class NativeConversations {
     }
   }
 
-  /** Forward each completed native assistant message, including intermediate answers.
-   * The session itself may still be running; it is never a gate on delivery.
-   */
-  async collect(binding: NativeSession): Promise<boolean> {
+  /** Commit each page before requesting the next one. Unfinished replies have their own durable retry position. */
+  async collect(requested: NativeSession): Promise<boolean> {
+    const binding = this.session(requested.session) ?? requested;
     const owner = await this.resolveOwner(binding.session);
     if (binding.awaiting) this.watch(binding.session, owner);
-    const events = await this.historySince(binding.session, binding.cursor, owner);
-    const latest = new Map<string, Record<string, unknown>>();
-    const hasUserEvents = events.some((event) => event.event_name === "message.user");
-    const devices = new Map<string, Task>();
-    if (hasUserEvents) {
-      const inputs = this.store.sql.exec<Task>(
-        `SELECT * FROM tasks WHERE session=? AND state='unknown'
-         UNION ALL
-         SELECT * FROM (SELECT * FROM tasks WHERE session=? AND state='submitted' ORDER BY id DESC LIMIT 20)`,
-        binding.session, binding.session).toArray();
-      for (const task of inputs) {
-        const device = this.store.get<string>("device:" + task.id);
-        if (device) devices.set(device, task);
-      }
-    }
-    for (const event of events) {
-      const payload = object(event.payload);
-      if (payload.session_id !== undefined && payload.session_id !== binding.session) continue;
-      if (event.event_name === "message.user") {
-        const device = string(object(payload.metadata).client_device_id) || string(object(payload.chat_context).device_id);
-        const task = device ? devices.get(device) : undefined;
-        const textMatches = task && (
-          payload.display_text === task.text
-          || payload.content === task.text
-          || (typeof payload.display_text === "string" && payload.display_text.includes(task.text))
-          || (task.text === "[图片]" && typeof payload.display_text === "string" && payload.display_text.includes("[已附图片"))
-        );
-        if (task && textMatches) {
-          const receipt = this.store.get<Record<string, unknown>>("native-input:" + task.id) ?? {};
-          if (!receipt.confirmed_at) {
-            this.store.set("native-input:" + task.id, { ...receipt, confirmed_at: Date.now(), event_seq: event.seq,
-              muse_input_at: typeof payload.display_text_updated_at_ms === "number" ? payload.display_text_updated_at_ms : null });
-          }
-          if (task.state === "unknown") this.store.sql.exec("UPDATE tasks SET state='submitted' WHERE id=?", task.id);
-        }
-      }
-      if (event.event_name !== "message.assistant" || Number(event.seq) <= binding.cursor) continue;
-      const identity = string(event.message_id) || string(payload.message_id);
-      if (!identity) throw new Error("assistant_identity_unavailable");
-      latest.set(identity, event);
-    }
-    let cursor = Math.max(binding.cursor, ...events.map((event) => Number(event.seq)));
+    const pending = this.store.sql.exec<PendingAssistant>(
+      "SELECT message,seq FROM native_pending_assistant WHERE session=? ORDER BY checked_at,seq LIMIT ?",
+      binding.session, PENDING_ASSISTANT_CHECKS).toArray();
+
+    let after = binding.cursor;
     let produced = false;
-    const outputs: { identity: string; text: string; seq: number; completedAt: number | null }[] = [];
-    for (const [identity, event] of latest) {
-      const payload = object(event.payload);
-      const state = string(payload.status);
-      if (!["completed", "complete", "succeeded", "failed", "error", "cancelled", "canceled"].includes(state) || payload.display_text_ready === false) {
-        cursor = Math.min(cursor, Number(event.seq) - 1);
-        continue;
+    for (let index = 0; index < MAX_HISTORY_PAGES; index++) {
+      const { events, more } = await this.historyPage(binding.session, owner, after);
+      const through = events.at(-1)?.seq ?? after;
+      const assistant = new Map<string, HistoryEvent>();
+      for (const event of events) {
+        if (event.event_name !== "message.assistant") continue;
+        const identity = this.assistantIdentity(event);
+        if (!identity) throw new Error("assistant_identity_unavailable");
+        assistant.set(identity, event);
       }
-      const text = string(payload.display_text) || string(payload.content);
-      if (text) outputs.push({ identity, text, seq: Number(event.seq), completedAt: typeof payload.display_text_updated_at_ms === "number" ? payload.display_text_updated_at_ms : null });
-    }
-    this.commit(() => {
-      for (const output of outputs) {
-        const id = "native:" + binding.session + ":" + output.identity;
-        const rows = this.store.sql.exec<Task>(`INSERT OR IGNORE INTO tasks(message_id,route,conversation,generation,text,state,session,baseline,created_at)
-          VALUES (?,?,?,?,?,'queued',?,?,?) RETURNING *`, id, binding.route, binding.conversation, binding.generation, output.text, binding.session, output.seq, Date.now()).toArray();
-        if (rows[0]) {
-          const extracted = extractOutboundFiles(output.text);
-          const replyText = extracted.text ? channelReply(extracted.text) : (extracted.files.length ? "" : channelReply(output.text));
-          this.store.complete(rows[0], replyText);
-          if (extracted.files.length) this.store.setOutboundFiles(rows[0].id, extracted.files, owner);
-          this.store.set("native-output:" + rows[0].id, { message_id: output.identity, muse_completed_at: output.completedAt, captured_at: Date.now() });
-          produced = true;
+
+      this.commit(() => {
+        if (through > after) this.confirmInputs(events, this.receiptInputs(binding.session), after, through);
+        for (const [identity, event] of assistant) {
+          if (this.acceptAssistant(binding, owner, identity, event)) produced = true;
         }
-      }
-      this.store.sql.exec("UPDATE native_sessions SET cursor=?,last_checked=? WHERE session=?", cursor, Date.now(), binding.session);
-    });
+        this.store.sql.exec("UPDATE native_sessions SET cursor=?,history_more=?,last_checked=? WHERE session=?",
+          through, Number(more), Date.now(), binding.session);
+      });
+      after = through;
+      if (!more) break;
+    }
+    if (await this.recheckAssistant(binding, owner, pending)) produced = true;
+    await this.reconcileEarlierInputs(binding, owner, after);
     return produced;
+  }
+
+  private assistantIdentity(event: HistoryEvent) {
+    return string(event.message_id) || string(object(event.payload).message_id);
+  }
+
+  private acceptAssistant(binding: NativeSession, owner: MuseOwner, identity: string, event: HistoryEvent) {
+    const payload = object(event.payload);
+    const id = "native:" + binding.session + ":" + identity;
+    if (!FINAL_ASSISTANT_STATES.has(string(payload.status)) || payload.display_text_ready === false) {
+      this.store.sql.exec(`INSERT INTO native_pending_assistant(session,message,seq)
+        SELECT ?,?,? WHERE NOT EXISTS(SELECT 1 FROM tasks WHERE message_id=? AND conversation=?)
+        ON CONFLICT(session,message) DO UPDATE SET seq=excluded.seq WHERE excluded.seq>seq`,
+        binding.session, identity, event.seq, id, binding.conversation);
+      return false;
+    }
+
+    this.store.sql.exec("DELETE FROM native_pending_assistant WHERE session=? AND message=?", binding.session, identity);
+    const text = string(payload.display_text) || string(payload.content);
+    if (!text) return false;
+    const rows = this.store.sql.exec<Task>(`INSERT OR IGNORE INTO tasks(message_id,route,conversation,generation,text,state,session,baseline,created_at)
+      VALUES (?,?,?,?,?,'queued',?,?,?) RETURNING *`, id, binding.route, binding.conversation, binding.generation, text, binding.session, event.seq, Date.now()).toArray();
+    const [task] = rows;
+    if (!task) return false;
+    const { text: reply, files } = extractOutboundFiles(text);
+    this.store.complete(task, reply ? channelReply(reply) : (files.length ? "" : channelReply(text)));
+    if (files.length) this.store.setOutboundFiles(task.id, files, owner);
+    this.store.set("native-output:" + task.id, { message_id: identity,
+      muse_completed_at: typeof payload.display_text_updated_at_ms === "number" ? payload.display_text_updated_at_ms : null,
+      captured_at: Date.now() });
+    return true;
+  }
+
+  /** Read the original sequence again to catch a reply finalized in place. Other messages can pass it. */
+  private async recheckAssistant(binding: NativeSession, owner: MuseOwner, pending: PendingAssistant[]) {
+    let produced = false;
+    for (const { message, seq } of pending) {
+      const stillPending = () => this.store.sql.exec<PendingAssistant>(
+        "SELECT message,seq FROM native_pending_assistant WHERE session=? AND message=?", binding.session, message).toArray()[0];
+      if (stillPending()?.seq !== seq) continue;
+      this.store.sql.exec("UPDATE native_pending_assistant SET checked_at=? WHERE session=? AND message=?", Date.now(), binding.session, message);
+      const { events } = await this.historyPage(binding.session, owner, seq - 1, 1);
+      const event = events[0];
+      if (!event || event.seq !== seq || event.event_name !== "message.assistant" || this.assistantIdentity(event) !== message) continue;
+      this.commit(() => {
+        if (stillPending()?.seq === seq && this.acceptAssistant(binding, owner, message, event)) produced = true;
+      });
+    }
+    return produced;
+  }
+
+  private receiptInputs(session: string, includeSubmitted = true): Map<string, ReceiptInput> {
+    const unknown = this.store.sql.exec<Task>("SELECT * FROM tasks WHERE session=? AND state='unknown'", session).toArray();
+    const submitted = includeSubmitted ? this.store.sql.exec<Task>(
+      "SELECT * FROM tasks WHERE session=? AND state='submitted' ORDER BY id DESC LIMIT 20", session).toArray() : [];
+    const inputs = new Map<string, ReceiptInput>();
+    for (const task of [...unknown, ...submitted]) {
+      const device = this.store.get<string>("device:" + task.id);
+      if (device) inputs.set(device, { task, after: this.store.get<number>("native-receipt-cursor:" + task.id) ?? task.baseline });
+    }
+    return inputs;
+  }
+
+  private confirmInputs(events: HistoryEvent[], inputs: Map<string, ReceiptInput>, from: number, through: number) {
+    for (const event of events) {
+      if (event.event_name !== "message.user") continue;
+      const payload = object(event.payload);
+      const device = string(object(payload.metadata).client_device_id) || string(object(payload.chat_context).device_id);
+      const input = inputs.get(device);
+      if (!input || event.seq <= input.task.baseline) continue;
+      const { task } = input;
+      const text = string(payload.display_text);
+      if (text !== task.text && payload.content !== task.text && !text.includes(task.text)
+          && !(task.text === "[图片]" && text.includes("[已附图片"))) continue;
+      const receipt = this.store.get<Record<string, unknown>>("native-input:" + task.id) ?? {};
+      if (!receipt.confirmed_at) {
+        this.store.set("native-input:" + task.id, { ...receipt, confirmed_at: Date.now(), event_seq: event.seq,
+          muse_input_at: typeof payload.display_text_updated_at_ms === "number" ? payload.display_text_updated_at_ms : null });
+      }
+      if (task.state === "unknown") {
+        this.store.sql.exec("UPDATE tasks SET state='submitted' WHERE id=?", task.id);
+        this.store.sql.exec("DELETE FROM metadata WHERE key=?", "native-receipt-cursor:" + task.id);
+      }
+      inputs.delete(device);
+    }
+    for (const { task, after } of inputs.values()) {
+      if (task.state === "unknown" && after >= from && after < through) {
+        this.store.set("native-receipt-cursor:" + task.id, through);
+      }
+    }
+  }
+
+  /** Legacy unknown sends may start before the output cursor. Scan that interval without moving the output cursor. */
+  private async reconcileEarlierInputs(binding: NativeSession, owner: MuseOwner, until: number) {
+    const inputs = this.receiptInputs(binding.session, false);
+    let after = until;
+    for (const input of inputs.values()) after = Math.min(after, input.after);
+    if (after >= until) return;
+    const { events, more } = await this.historyPage(binding.session, owner, after);
+    const through = more ? Math.min(until, events.at(-1)!.seq) : until;
+    this.commit(() => this.confirmInputs(events.filter((event) => event.seq <= until), inputs, after, through));
   }
 
   /** This only adjusts the history fallback cadence, after replies are delivered. */

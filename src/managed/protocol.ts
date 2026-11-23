@@ -26,7 +26,7 @@ export function string(value: unknown): string { return typeof value === "string
 /** Persist only our bounded error codes, never upstream messages or credentials. */
 export function failureCode(error: unknown): string {
   if (!(error instanceof Error)) return "unknown_error";
-  return /^(upstream_http_\d{3}|platform_rejected_-?\d+|wecom_upgrade_failed_\d{3}|wecom_not_connected|platform_response_unknown|platform_connection_lost|platform_send_unknown|configuration_changed|invalid_weixin_batch|response_too_large|empty_response|muse_owner_(unresolved|mismatch)|muse_account_(unavailable|unconfigured)|muse_connect_failed|muse_connection_replaced)$/.test(error.message)
+  return /^(upstream_http_\d{3}|platform_rejected_-?\d+|wecom_upgrade_failed_\d{3}|wecom_not_connected|platform_response_unknown|platform_connection_lost|platform_send_unknown|configuration_changed|invalid_weixin_batch|response_too_large|empty_response|muse_owner_(unresolved|mismatch)|muse_account_(unavailable|unconfigured)|muse_connect_failed|muse_connection_replaced|history_page_(invalid|no_progress)|assistant_identity_unavailable)$/.test(error.message)
     ? error.message : error.name;
 }
 export function validConfig(value: unknown): ChannelConfig {

@@ -83,7 +83,7 @@ it("records the durable submission boundary and never sends an uncertain turn tw
       expect(store.task(task.id).state).toBe("submitting");
       throw new Error("socket closed after send");
     });
-    const call = vi.fn(async (path: string) => path === "/session/start" ? { session_id: "test-session" } : { chat_events: [] });
+    const call = vi.fn(async (path: string) => path === "/session/start" ? { session_id: "test-session" } : { chat_events: [], has_more: false });
     const close = vi.fn();
     const rpc = { open, call, close, subscribe: vi.fn(async () => {}) };
     vi.spyOn(MuseRpc, "connect").mockResolvedValue(rpc as unknown as MuseRpc);
