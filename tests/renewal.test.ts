@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import worker from "../src/index";
+import { MuseCredentials } from "../src/credentials";
+import { ManagedChannels } from "../src/managed/runtime";
 import { CookieController, type CredentialState } from "../src/muse";
 import { applySetCookies, cookieHeader, initialCookies } from "../src/cookies";
 
@@ -81,6 +83,30 @@ describe("durable Cookie renewal", () => {
     expect(status.ok).toBe(false);
     expect(status.last_error?.error).toBe("invalid_json");
     expect(cookieHeader(store.load()!.cookies)).toContain("hatch_sess=saved-before-json");
+  });
+
+  it.each([200, 403])("clears the request deadline after a completed auth response (%i)", async (code) => {
+    vi.useFakeTimers();
+    const nativeTimeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), milliseconds);
+      return controller.signal;
+    });
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({ access_token: "test-token" }, { status: code }));
+    vi.stubGlobal("fetch", fetcher);
+    try {
+      const pending = new CookieController(bindings, memory()).refresh();
+      const result = await pending;
+      expect(result.ok).toBe(code === 200);
+      const signal = fetcher.mock.calls[0][1]?.signal;
+      expect(signal).toBeInstanceOf(AbortSignal);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(signal?.aborted).toBe(false);
+    } finally {
+      nativeTimeout.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("keeps credentials on a network error without labeling them expired", async () => {
@@ -171,5 +197,62 @@ describe("durable Cookie renewal", () => {
     await worker.scheduled({} as ScheduledController, cronEnv);
     expect(getByName).toHaveBeenCalledWith("primary-account");
     expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("restores lost approval and channel alarms without starting Cookie renewal", async () => {
+    const approvals = env.CREDENTIALS.getByName("watchdog-approvals");
+    const channels = env.MOBILE.getByName("watchdog-channels");
+    const refresh = vi.fn(async () => ({ ok: true, last_error: null }));
+    const enabled = { ...env, AUTO_APPROVAL_ENABLED: "true", MANAGED_CHANNELS_ENABLED: "true" };
+    const cronEnv = {
+      ...enabled,
+      CREDENTIALS: { getByName: () => ({
+        scheduledRenewal: refresh,
+        ensureAlarm: () => runInDurableObject(approvals, (_instance, state) =>
+          new MuseCredentials(state, enabled).ensureAlarm()),
+      }) },
+      MOBILE: { getByName: () => ({
+        ensureAlarm: () => runInDurableObject(channels, (_instance, state) =>
+          new ManagedChannels(state, enabled).ensureAlarm()),
+      }) },
+    } as unknown as Env;
+
+    const event = { cron: "*/5 * * * *", scheduledTime: Date.now() } as ScheduledController;
+    await runInDurableObject(channels, async (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO config VALUES (?, ?)", "wecom", JSON.stringify({ enabled: true }));
+    });
+    const alarmTimes = () => Promise.all([
+      runInDurableObject(approvals, (_instance, state) => state.storage.getAlarm()),
+      runInDurableObject(channels, (_instance, state) => state.storage.getAlarm()),
+    ]);
+    expect(await alarmTimes()).toEqual([null, null]);
+
+    await worker.scheduled(event, cronEnv);
+    const restored = await alarmTimes();
+    expect(restored.every((value) => value !== null)).toBe(true);
+    expect(refresh).not.toHaveBeenCalled();
+    await worker.scheduled(event, cronEnv);
+    expect(await alarmTimes()).toEqual(restored);
+  });
+
+  it("a failed approval watchdog check does not prevent restoring the channel alarm", async () => {
+    const ensureApprovals = vi.fn(async () => { throw new Error("approval DO unavailable"); });
+    const ensureChannels = vi.fn(async () => true);
+    const refresh = vi.fn(async () => ({ ok: true }));
+    const cronEnv = {
+      ...env, AUTO_APPROVAL_ENABLED: "true", MANAGED_CHANNELS_ENABLED: "true",
+      CREDENTIALS: { getByName: () => ({ ensureAlarm: ensureApprovals, scheduledRenewal: refresh }) },
+      MOBILE: { getByName: () => ({ ensureAlarm: ensureChannels }) },
+    } as unknown as Env;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await worker.scheduled({ cron: "*/5 * * * *" } as ScheduledController, cronEnv);
+      expect(ensureApprovals).toHaveBeenCalledOnce();
+      expect(ensureChannels).toHaveBeenCalledOnce();
+      expect(refresh).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("approval_alarm_watchdog_failed"));
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

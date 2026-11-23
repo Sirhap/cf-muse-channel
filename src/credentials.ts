@@ -714,7 +714,8 @@ export class MuseCredentials extends DurableObject<Env> {
     if (Number.isFinite(raw) && raw >= 15_000 && raw <= 300_000) return Math.floor(raw);
     return 30_000;
   }
-  private async ensureAlarm() {
+  /** Restore approval polling when the Worker watchdog finds the alarm missing. */
+  async ensureAlarm(): Promise<void> {
     if (this.isIsolated()) return;
     if (this.env.AUTO_APPROVAL_ENABLED === "true" && await this.ctx.storage.getAlarm() === null) {
       await this.ctx.storage.setAlarm(Date.now() + 10000);

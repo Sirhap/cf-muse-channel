@@ -449,49 +449,56 @@ function museRequestHeaders(cookieHeaderValue: string, extra?: HeadersInit): Hea
 /** Read bounded auth JSON. Upstream payloads and exception messages never leave this boundary. */
 async function authJson(path: string, session: CookieSession, init: RequestInit = {}): Promise<Record<string, unknown>> {
   const headers = museRequestHeaders(session.header(), init.headers);
-  let response: Response;
+  const controller = new AbortController();
+  // Keep the deadline through the body read and release it when the request is done.
+  const timeout = setTimeout(() => controller.abort(), 20_000);
   try {
-    response = await fetch(`${MUSE_ORIGIN}${path}`, {
-      ...init, headers, redirect: "manual", signal: AbortSignal.timeout(20_000),
-    });
-  } catch {
-    throw new ProbeError(path, "network_failed");
-  }
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw new ProbeError(path, "upstream_http_error", response.status);
-  }
-  // Persist rotation immediately: a later JSON/read failure must not lose a new ticket.
-  session.apply(response.headers.getSetCookie());
-  const reader = response.body?.getReader();
-  if (!reader) throw new ProbeError(path, "empty_response");
-  let size = 0;
-  const chunks: Uint8Array[] = [];
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > MAX_JSON_BYTES) {
-        await reader.cancel();
-        throw new ProbeError(path, "response_too_large");
+    let response: Response;
+    try {
+      response = await fetch(`${MUSE_ORIGIN}${path}`, {
+        ...init, headers, redirect: "manual", signal: controller.signal,
+      });
+    } catch {
+      throw new ProbeError(path, "network_failed");
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new ProbeError(path, "upstream_http_error", response.status);
+    }
+    // Persist rotation immediately: a later JSON/read failure must not lose a new ticket.
+    session.apply(response.headers.getSetCookie());
+    const reader = response.body?.getReader();
+    if (!reader) throw new ProbeError(path, "empty_response");
+    let size = 0;
+    const chunks: Uint8Array[] = [];
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_JSON_BYTES) {
+          await reader.cancel();
+          throw new ProbeError(path, "response_too_large");
+        }
+        chunks.push(value);
       }
-      chunks.push(value);
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+      return parsed as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof ProbeError) throw error;
+      throw new ProbeError(path, "invalid_json");
+    } finally {
+      reader.releaseLock();
     }
-    const bytes = new Uint8Array(size);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
-    return parsed as Record<string, unknown>;
-  } catch (error) {
-    if (error instanceof ProbeError) throw error;
-    throw new ProbeError(path, "invalid_json");
   } finally {
-    reader.releaseLock();
+    clearTimeout(timeout);
   }
 }
 
@@ -536,18 +543,22 @@ async function wakeMuseVm(vmId: string, cookieHeaderValue: string, accessToken?:
   if (!vmId || !cookieHeaderValue) return false;
   const headers = museRequestHeaders(cookieHeaderValue);
   if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
   try {
     const resp = await fetch(`${MUSE_ORIGIN}/api/hatch/vm/wake`, {
       method: "POST",
       headers,
       body: JSON.stringify({ vm_id: vmId }),
       redirect: "manual",
-      signal: AbortSignal.timeout(10_000),
+      signal: controller.signal,
     });
     await resp.body?.cancel();
     return resp.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

@@ -6,6 +6,7 @@ export { MuseCredentials } from "./credentials";
 
 const MUSE_ORIGIN = "https://muse.ai";
 const GATEWAY_ORIGIN = "https://hatch.metaaivm.com";
+const ALARM_WATCHDOG_CRON = "*/5 * * * *";
 
 async function networkProbe(): Promise<Response> {
   const checks = await Promise.all(
@@ -59,6 +60,11 @@ async function dispatchSafely(request: Request, dispatch: (request: Request) => 
   }
 }
 
+async function restoreAlarm(check: () => Promise<unknown>, failureEvent: string): Promise<void> {
+  try { await check(); }
+  catch { console.warn(JSON.stringify({ event: failureEvent })); }
+}
+
 export default {
   fetch(request: Request, env: Env): Promise<Response> {
     const coordinator = env.CREDENTIALS.getByName("primary-account");
@@ -71,10 +77,23 @@ export default {
     }, coordinator);
   },
   async scheduled(event: ScheduledController, env: Env): Promise<void> {
-    const status = await env.CREDENTIALS.getByName("primary-account").scheduledRenewal(event.scheduledTime, event.cron);
-    if (!status.ok) console.warn(JSON.stringify({ event: "cookie_refresh_failed", error: status.last_error }));
-    if (env.MANAGED_CHANNELS_ENABLED === "true" && env.MOBILE) {
-      await env.MOBILE.getByName("channels").ensureAlarm().catch(() => {});
+    const restoreChannelAlarm = () => env.MANAGED_CHANNELS_ENABLED === "true" && env.MOBILE
+      ? restoreAlarm(() => env.MOBILE.getByName("channels").ensureAlarm(), "channel_alarm_watchdog_failed")
+      : Promise.resolve();
+    if (event.cron === ALARM_WATCHDOG_CRON) {
+      await Promise.all([
+        restoreChannelAlarm(),
+        env.AUTO_APPROVAL_ENABLED === "true"
+          ? restoreAlarm(() => env.CREDENTIALS.getByName("primary-account").ensureAlarm(), "approval_alarm_watchdog_failed")
+          : Promise.resolve(),
+      ]);
+      return;
+    }
+    try {
+      const status = await env.CREDENTIALS.getByName("primary-account").scheduledRenewal(event.scheduledTime, event.cron);
+      if (!status.ok) console.warn(JSON.stringify({ event: "cookie_refresh_failed", error: status.last_error }));
+    } finally {
+      await restoreChannelAlarm();
     }
   },
 } satisfies ExportedHandler<Env>;

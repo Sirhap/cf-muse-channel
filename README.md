@@ -93,6 +93,8 @@ export DEMO_KEY
 
 默认 Cron 为 `54 20 * * *`（UTC），即每天北京时间 04:54。连接 Muse 时同样会执行认证和保存轮换；定时任务不创建会话或发送用户消息。`GET /renewal/scheduled-status` 单独记录真正的 Cloudflare scheduled 调用，手动续期不会覆盖该记录；临时分钟级 Cron 成功不能当作每日 04:54 已经触发。有效期遵循服务端返回值，不承诺永久有效。
 
+凭证 Worker 上的 `*/5 * * * *` 每五分钟检查自动审批和托管渠道的 alarm。两个检查独立执行，发现已启用的服务丢失 alarm 时补挂。分开部署时，由凭证 Worker 通过现有的 `MOBILE` 绑定检查渠道 Worker。
+
 ```sh
 .venv/bin/python client/probe.py status --url https://your-worker.example.com
 .venv/bin/python client/probe.py renew --url https://your-worker.example.com
